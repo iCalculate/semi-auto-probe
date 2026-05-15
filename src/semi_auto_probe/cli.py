@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import argparse
 
+from .logging_utils import colorize_hex_frame, configure_logging, print_startup_banner
 from .serial_client import ControllerSerialClient
 
 
 def main() -> None:
+    print_startup_banner()
+    logger = configure_logging()
+
     parser = argparse.ArgumentParser(description="Semi Auto Probe controller utilities.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -17,12 +21,17 @@ def main() -> None:
 
     if args.command == "test":
         client = ControllerSerialClient(port=args.port, timeout=args.timeout)
+        logger.info("Running CLI communication test on %s.", args.port)
         try:
             result = client.communication_test()
         finally:
             client.close()
 
-        print(f"TX: {result.request_hex}")
-        print(f"RX: {result.response_hex or '-'}")
+        print(colorize_hex_frame(result.request_hex, "TX"))
+        print(colorize_hex_frame(result.response_hex or "-", "RX"))
         print(f"OK: {result.ok}")
         print(result.message)
+        if result.ok:
+            logger.info("CLI communication test passed.")
+        else:
+            logger.warning("CLI communication test failed: %s", result.message)

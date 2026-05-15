@@ -29,6 +29,8 @@ Run the app:
 uv run python -m semi_auto_probe
 ```
 
+The command line prints a startup logo and colorized runtime logs with timestamps, levels, and event details.
+
 Run the command-line communication test:
 
 ```powershell

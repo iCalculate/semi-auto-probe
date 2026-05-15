@@ -8,9 +8,21 @@ FRAME_HEAD = 0x3A
 RESPONSE_HEAD = 0xA3
 FRAME_TAIL = bytes((0x0D, 0x0A))
 FRAME_LENGTH = 12
+MULTI_AXIS_FRAME_TAIL = bytes((0xA5, 0xA5))
+MULTI_AXIS_FRAME_LENGTH = 33
 
 COMM_TEST_COMMAND = bytes.fromhex("3A 55 00 00 00 00 00 00 00 8F 0D 0A")
 COMM_TEST_RESPONSE = bytes.fromhex("A3 AA 00 00 00 00 00 00 00 4D 0D 0A")
+
+FUNCTION_READ_POSITION = 0xCB
+FUNCTION_MULTI_AXIS_RELATIVE_MOVE = 0xCC
+FUNCTION_ENABLE_REALTIME_POSITION = 0xD1
+FUNCTION_DISABLE_REALTIME_POSITION = 0xD4
+FUNCTION_RELATIVE_MOVE = 0xFA
+FUNCTION_ABSOLUTE_MOVE = 0xFB
+FUNCTION_STOP = 0xFC
+STOP_MODE_DECELERATE = 0x4A
+STOP_MODE_EMERGENCY = 0x49
 
 
 class Axis(IntEnum):
@@ -58,6 +70,23 @@ class ControllerFrame:
         return self.head == RESPONSE_HEAD
 
 
+@dataclass(frozen=True)
+class AxisPosition:
+    axis: Axis
+    is_running: bool
+    position: int
+    raw: bytes
+
+    @property
+    def axis_name(self) -> str:
+        return {
+            Axis.X: "X",
+            Axis.Y: "Y",
+            Axis.Z: "Z",
+            Axis.AXIS_4: "AXIS_4",
+        }[self.axis]
+
+
 def parse_frame(raw: bytes, expected_head: int | None = None) -> ControllerFrame:
     if len(raw) != FRAME_LENGTH:
         raise ValueError(f"Expected {FRAME_LENGTH} bytes, got {len(raw)}.")
@@ -84,3 +113,87 @@ def parse_frame(raw: bytes, expected_head: int | None = None) -> ControllerFrame
 def validate_comm_test_response(raw: bytes) -> bool:
     parse_frame(raw, expected_head=RESPONSE_HEAD)
     return raw == COMM_TEST_RESPONSE
+
+
+def build_read_position_command(axis: Axis) -> bytes:
+    return build_frame(FUNCTION_READ_POSITION, axis)
+
+
+def build_enable_realtime_position_command() -> bytes:
+    return build_frame(FUNCTION_ENABLE_REALTIME_POSITION)
+
+
+def build_disable_realtime_position_command() -> bytes:
+    return build_frame(FUNCTION_DISABLE_REALTIME_POSITION)
+
+
+def build_relative_move_command(axis: Axis, reverse: bool, pulses: int, speed_percent: int = 100) -> bytes:
+    if pulses < 0 or pulses > 0xFFFFFFFF:
+        raise ValueError("Pulse count must be in range 0..4294967295.")
+    if speed_percent < 0 or speed_percent > 100:
+        raise ValueError("Speed percent must be in range 0..100.")
+
+    direction = 0x01 if reverse else 0x00
+    data = bytes((direction,)) + pulses.to_bytes(4, byteorder="big", signed=False) + bytes((speed_percent,))
+    return build_frame(FUNCTION_RELATIVE_MOVE, axis, data)
+
+
+def build_absolute_move_command(axis: Axis, target_position: int, speed_percent: int = 100) -> bytes:
+    if target_position < 0 or target_position > 0xFFFFFFFF:
+        raise ValueError("Absolute target position must be in range 0..4294967295.")
+    if speed_percent < 0 or speed_percent > 100:
+        raise ValueError("Speed percent must be in range 0..100.")
+
+    data = target_position.to_bytes(4, byteorder="big", signed=False) + bytes((speed_percent, 0x00))
+    return build_frame(FUNCTION_ABSOLUTE_MOVE, axis, data)
+
+
+def build_multi_axis_relative_move_command(
+    axis_params: dict[Axis, tuple[bool, int, int, int]],
+) -> bytes:
+    """Build protocol item 21: 4-axis relative positioning command.
+
+    Each axis parameter is:
+    reverse, pulses, speed_percent, acceleration_10ms_units.
+    Missing axes are encoded as no movement.
+    """
+    payload = bytearray((FRAME_HEAD, FUNCTION_MULTI_AXIS_RELATIVE_MOVE))
+    for axis in (Axis.X, Axis.Y, Axis.Z, Axis.AXIS_4):
+        reverse, pulses, speed_percent, acceleration = axis_params.get(axis, (False, 0, 0, 0))
+        if pulses < 0 or pulses > 0xFFFFFFFF:
+            raise ValueError("Pulse count must be in range 0..4294967295.")
+        if speed_percent < 0 or speed_percent > 100:
+            raise ValueError("Speed percent must be in range 0..100.")
+        if acceleration < 0 or acceleration > 0xFF:
+            raise ValueError("Acceleration must be in range 0..255.")
+
+        payload.extend(
+            bytes((0x01 if reverse else 0x00,))
+            + pulses.to_bytes(4, byteorder="big", signed=False)
+            + bytes((speed_percent, acceleration))
+        )
+
+    payload.append(checksum(bytes(payload)))
+    payload.extend(MULTI_AXIS_FRAME_TAIL)
+    return bytes(payload)
+
+
+def build_stop_command(axis: Axis, emergency: bool = False) -> bytes:
+    stop_mode = STOP_MODE_EMERGENCY if emergency else STOP_MODE_DECELERATE
+    return build_frame(FUNCTION_STOP, axis, bytes((stop_mode,)))
+
+
+def parse_axis_position_response(raw: bytes) -> AxisPosition:
+    frame = parse_frame(raw, expected_head=RESPONSE_HEAD)
+    if frame.function_code != FUNCTION_READ_POSITION:
+        raise ValueError(f"Expected position response CB, got {frame.function_code:02X}.")
+
+    try:
+        axis = Axis(frame.axis)
+    except ValueError as exc:
+        raise ValueError(f"Unexpected axis in position response: {frame.axis:02X}.") from exc
+
+    is_running = raw[3] != 0
+    sign = -1 if raw[4] else 1
+    pulse_count = int.from_bytes(raw[5:9], byteorder="big", signed=False)
+    return AxisPosition(axis=axis, is_running=is_running, position=sign * pulse_count, raw=raw)
