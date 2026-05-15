@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "semi-auto-probe"
+version = "0.1.0"
+description = "RS-232 three-axis motor controller scaffold with USB camera preview."
+requires-python = ">=3.10"
+dependencies = [
+  "pyserial>=3.5",
+  "opencv-python>=4.8",
+]
+
+[project.scripts]
+semi-auto-probe = "semi_auto_probe.app:main"
+semi-auto-probe-test = "semi_auto_probe.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
