@@ -5,6 +5,7 @@ from semi_auto_probe.protocol import (
     COMM_TEST_RESPONSE,
     Axis,
     build_absolute_move_command,
+    build_clear_position_command,
     build_disable_realtime_position_command,
     build_enable_realtime_position_command,
     build_multi_axis_relative_move_command,
@@ -39,6 +40,8 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(build_enable_realtime_position_command(), bytes.fromhex("3A D1 00 00 00 00 00 00 00 0B 0D 0A"))
         self.assertEqual(build_disable_realtime_position_command(), bytes.fromhex("3A D4 00 00 00 00 00 00 00 0E 0D 0A"))
         self.assertEqual(build_read_position_command(Axis.X), bytes.fromhex("3A CB 01 00 00 00 00 00 00 06 0D 0A"))
+        self.assertEqual(build_clear_position_command(Axis.Z), bytes.fromhex("3A D3 04 00 00 00 00 00 00 11 0D 0A"))
+        self.assertEqual(build_clear_position_command(Axis.ALL), bytes.fromhex("3A D3 FF 00 00 00 00 00 00 0C 0D 0A"))
 
     def test_build_motor_commands(self) -> None:
         self.assertEqual(build_relative_move_command(Axis.Z, reverse=True, pulses=0x00002710, speed_percent=0x20), bytes.fromhex("3A FA 04 01 00 00 27 10 20 90 0D 0A"))

@@ -18,6 +18,8 @@ FUNCTION_READ_POSITION = 0xCB
 FUNCTION_MULTI_AXIS_RELATIVE_MOVE = 0xCC
 FUNCTION_ENABLE_REALTIME_POSITION = 0xD1
 FUNCTION_DISABLE_REALTIME_POSITION = 0xD4
+FUNCTION_CLEAR_POSITION = 0xD3
+FUNCTION_REACHED_POSITION = 0xB5
 FUNCTION_RELATIVE_MOVE = 0xFA
 FUNCTION_ABSOLUTE_MOVE = 0xFB
 FUNCTION_STOP = 0xFC
@@ -125,6 +127,10 @@ def build_enable_realtime_position_command() -> bytes:
 
 def build_disable_realtime_position_command() -> bytes:
     return build_frame(FUNCTION_DISABLE_REALTIME_POSITION)
+
+
+def build_clear_position_command(axis: Axis) -> bytes:
+    return build_frame(FUNCTION_CLEAR_POSITION, axis)
 
 
 def build_relative_move_command(axis: Axis, reverse: bool, pulses: int, speed_percent: int = 100) -> bytes:

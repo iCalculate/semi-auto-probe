@@ -9,10 +9,12 @@ from .protocol import (
     COMM_TEST_COMMAND,
     FRAME_LENGTH,
     FUNCTION_READ_POSITION,
+    FUNCTION_REACHED_POSITION,
     RESPONSE_HEAD,
     Axis,
     AxisPosition,
     build_absolute_move_command,
+    build_clear_position_command,
     build_disable_realtime_position_command,
     build_enable_realtime_position_command,
     build_multi_axis_relative_move_command,
@@ -20,6 +22,7 @@ from .protocol import (
     build_read_position_command,
     build_stop_command,
     hex_bytes,
+    parse_frame,
     parse_axis_position_response,
     validate_comm_test_response,
 )
@@ -100,6 +103,20 @@ class ControllerSerialClient:
             assert self._serial is not None
             return self._serial.read(FRAME_LENGTH)
 
+    def send_raw(self, payload: bytes, read_length: int = FRAME_LENGTH, reset_input: bool = True) -> bytes:
+        with self._lock:
+            if not self.is_open:
+                self.open()
+            assert self._serial is not None
+
+            if reset_input:
+                self._serial.reset_input_buffer()
+            self._serial.write(payload)
+            self._serial.flush()
+            if read_length <= 0:
+                return b""
+            return self._serial.read(read_length)
+
     def communication_test(self) -> CommunicationTestResult:
         response = self.send_and_read_frame(COMM_TEST_COMMAND)
         request_hex = hex_bytes(COMM_TEST_COMMAND)
@@ -156,20 +173,79 @@ class ControllerSerialClient:
     def _read_position_response(self, axis: Axis) -> bytes:
         assert self._serial is not None
         deadline = time.monotonic() + self.timeout
-        last_frame = b""
+        last_seen = b""
+        buffer = bytearray()
 
         while time.monotonic() < deadline:
-            frame = self._serial.read(FRAME_LENGTH)
-            if not frame:
+            chunk = self._serial.read(1)
+            if not chunk:
                 continue
-            last_frame = frame
-            if len(frame) != FRAME_LENGTH:
-                continue
-            if frame[0] == RESPONSE_HEAD and frame[1] == FUNCTION_READ_POSITION and frame[2] == axis:
-                return frame
+            buffer.extend(chunk)
+            last_seen = bytes(buffer[-FRAME_LENGTH:])
 
-        detail = f"last frame {hex_bytes(last_frame)}" if last_frame else "no frame"
+            head_index = buffer.find(bytes((RESPONSE_HEAD,)))
+            if head_index < 0:
+                del buffer[:-1]
+                continue
+            if head_index > 0:
+                del buffer[:head_index]
+
+            while len(buffer) >= FRAME_LENGTH:
+                frame = bytes(buffer[:FRAME_LENGTH])
+                try:
+                    parsed = parse_frame(frame, expected_head=RESPONSE_HEAD)
+                except ValueError:
+                    del buffer[0]
+                    break
+                del buffer[:FRAME_LENGTH]
+                last_seen = frame
+                if parsed.function_code == FUNCTION_READ_POSITION and parsed.axis == axis:
+                    return frame
+
+        detail = f"last bytes {hex_bytes(last_seen)}" if last_seen else "no frame"
         raise TimeoutError(f"Timeout waiting for {axis.name} position response ({detail}).")
+
+    def wait_axis_reached(self, axis: Axis, timeout: float = 5.0) -> bytes:
+        with self._lock:
+            if not self.is_open:
+                self.open()
+            assert self._serial is not None
+            return self._read_axis_reached_response(axis, timeout)
+
+    def _read_axis_reached_response(self, axis: Axis, timeout: float) -> bytes:
+        assert self._serial is not None
+        deadline = time.monotonic() + timeout
+        last_seen = b""
+        buffer = bytearray()
+
+        while time.monotonic() < deadline:
+            chunk = self._serial.read(1)
+            if not chunk:
+                continue
+            buffer.extend(chunk)
+            last_seen = bytes(buffer[-FRAME_LENGTH:])
+
+            head_index = buffer.find(bytes((RESPONSE_HEAD,)))
+            if head_index < 0:
+                del buffer[:-1]
+                continue
+            if head_index > 0:
+                del buffer[:head_index]
+
+            while len(buffer) >= FRAME_LENGTH:
+                frame = bytes(buffer[:FRAME_LENGTH])
+                try:
+                    parsed = parse_frame(frame, expected_head=RESPONSE_HEAD)
+                except ValueError:
+                    del buffer[0]
+                    break
+                del buffer[:FRAME_LENGTH]
+                last_seen = frame
+                if parsed.function_code == FUNCTION_REACHED_POSITION and parsed.axis == axis:
+                    return frame
+
+        detail = f"last bytes {hex_bytes(last_seen)}" if last_seen else "no frame"
+        raise TimeoutError(f"Timeout waiting for {axis.name} reached-position response ({detail}).")
 
     def read_xyz_positions(self) -> list[tuple[bytes, bytes, AxisPosition]]:
         return [self.read_axis_position(axis) for axis in (Axis.X, Axis.Y, Axis.Z)]
@@ -222,6 +298,11 @@ class ControllerSerialClient:
     def emergency_stop_all(self) -> bytes:
         command = build_stop_command(axis=Axis.ALL, emergency=True)
         self.write_command(command)
+        return command
+
+    def clear_position(self, axis: Axis) -> bytes:
+        command = build_clear_position_command(axis)
+        self.write_command(command, reset_input=True)
         return command
 
 

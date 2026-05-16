@@ -9,6 +9,7 @@ class CameraFrame:
     width: int
     height: int
     ppm_bytes: bytes
+    focus_scores: dict[str, float]
 
 
 class UsbCamera:
@@ -20,6 +21,8 @@ class UsbCamera:
         self._capture = None
         self._last_frame_time: float | None = None
         self._fps = 0.0
+        self._frame_count = 0
+        self._property_text = "EXP --  GAIN --"
 
     @property
     def is_open(self) -> bool:
@@ -48,6 +51,7 @@ class UsbCamera:
         self._capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self._capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         self._capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self._update_property_text()
 
     def read(self) -> CameraFrame | None:
         if not self.is_open:
@@ -60,11 +64,28 @@ class UsbCamera:
             return None
 
         frame = self._cv2.flip(frame, 0)
+        focus_scores = self._focus_scores(frame)
         self._draw_overlay(frame)
         rgb = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
         height, width = rgb.shape[:2]
         header = f"P6 {width} {height} 255\n".encode("ascii")
-        return CameraFrame(width=width, height=height, ppm_bytes=header + rgb.tobytes())
+        return CameraFrame(width=width, height=height, ppm_bytes=header + rgb.tobytes(), focus_scores=focus_scores)
+
+    def _focus_scores(self, frame) -> dict[str, float]:
+        assert self._cv2 is not None
+        cv2 = self._cv2
+        sample = cv2.resize(frame, (320, 180), interpolation=cv2.INTER_AREA)
+        gray = cv2.cvtColor(sample, cv2.COLOR_BGR2GRAY)
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F).var()
+        sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        tenengrad = float((sobel_x * sobel_x + sobel_y * sobel_y).mean())
+        brenner = float(((gray[:, 2:].astype("float32") - gray[:, :-2].astype("float32")) ** 2).mean())
+        return {
+            "Laplacian": float(laplacian),
+            "Tenengrad": tenengrad,
+            "Brenner": brenner,
+        }
 
     def _draw_overlay(self, frame) -> None:
         assert self._cv2 is not None
@@ -73,6 +94,9 @@ class UsbCamera:
             instant_fps = 1.0 / max(now - self._last_frame_time, 1e-6)
             self._fps = instant_fps if self._fps == 0.0 else self._fps * 0.85 + instant_fps * 0.15
         self._last_frame_time = now
+        self._frame_count += 1
+        if self._frame_count % 30 == 0:
+            self._update_property_text()
 
         cv2 = self._cv2
         height, width = frame.shape[:2]
@@ -84,6 +108,16 @@ class UsbCamera:
             0.72,
             (40, 255, 170),
             2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            self._property_text,
+            (14, 54),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.46,
+            (210, 225, 240),
+            1,
             cv2.LINE_AA,
         )
 
@@ -111,6 +145,25 @@ class UsbCamera:
             cv2.rectangle(frame, (x1, y2), (x2, y1), (80, 170, 255), -1)
 
         cv2.putText(frame, "LUMA", (x0 + 6, y0 + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 230, 240), 1, cv2.LINE_AA)
+
+    def _update_property_text(self) -> None:
+        if not self._capture or self._cv2 is None:
+            self._property_text = "EXP --  GAIN --"
+            return
+
+        cv2 = self._cv2
+        exposure = self._capture.get(cv2.CAP_PROP_EXPOSURE)
+        gain = self._capture.get(cv2.CAP_PROP_GAIN)
+        auto_exposure = self._capture.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+        self._property_text = f"EXP {self._format_property(exposure)}  GAIN {self._format_property(gain)}  AUTO {self._format_property(auto_exposure)}"
+
+    @staticmethod
+    def _format_property(value: float) -> str:
+        if value is None or value <= -10_000:
+            return "--"
+        if abs(value) >= 100:
+            return f"{value:.0f}"
+        return f"{value:.2f}".rstrip("0").rstrip(".")
 
     def close(self) -> None:
         if self._capture:
