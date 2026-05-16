@@ -10,13 +10,16 @@ from .protocol import (
     FRAME_LENGTH,
     FUNCTION_READ_POSITION,
     FUNCTION_REACHED_POSITION,
+    FUNCTION_READ_IO_STATUS,
     RESPONSE_HEAD,
     Axis,
     AxisPosition,
+    IoStatus,
     build_absolute_move_command,
     build_clear_position_command,
     build_disable_realtime_position_command,
     build_enable_realtime_position_command,
+    build_read_io_status_command,
     build_multi_axis_relative_move_command,
     build_relative_move_command,
     build_read_position_command,
@@ -24,6 +27,7 @@ from .protocol import (
     hex_bytes,
     parse_frame,
     parse_axis_position_response,
+    parse_io_status_response,
     validate_comm_test_response,
 )
 
@@ -249,6 +253,54 @@ class ControllerSerialClient:
 
     def read_xyz_positions(self) -> list[tuple[bytes, bytes, AxisPosition]]:
         return [self.read_axis_position(axis) for axis in (Axis.X, Axis.Y, Axis.Z)]
+
+    def read_io_status(self) -> tuple[bytes, bytes, IoStatus]:
+        command = build_read_io_status_command()
+        with self._lock:
+            if not self.is_open:
+                self.open()
+            assert self._serial is not None
+
+            self._serial.reset_input_buffer()
+            self._serial.write(command)
+            self._serial.flush()
+            response = self._read_io_status_response()
+        return command, response, parse_io_status_response(response)
+
+    def _read_io_status_response(self) -> bytes:
+        assert self._serial is not None
+        deadline = time.monotonic() + self.timeout
+        last_seen = b""
+        buffer = bytearray()
+
+        while time.monotonic() < deadline:
+            chunk = self._serial.read(1)
+            if not chunk:
+                continue
+            buffer.extend(chunk)
+            last_seen = bytes(buffer[-FRAME_LENGTH:])
+
+            head_index = buffer.find(bytes((RESPONSE_HEAD,)))
+            if head_index < 0:
+                del buffer[:-1]
+                continue
+            if head_index > 0:
+                del buffer[:head_index]
+
+            while len(buffer) >= FRAME_LENGTH:
+                frame = bytes(buffer[:FRAME_LENGTH])
+                try:
+                    parsed = parse_frame(frame, expected_head=RESPONSE_HEAD)
+                except ValueError:
+                    del buffer[0]
+                    break
+                del buffer[:FRAME_LENGTH]
+                last_seen = frame
+                if parsed.function_code == FUNCTION_READ_IO_STATUS:
+                    return frame
+
+        detail = f"last bytes {hex_bytes(last_seen)}" if last_seen else "no frame"
+        raise TimeoutError(f"Timeout waiting for I/O status response ({detail}).")
 
     def read_stable_xyz_positions(
         self,

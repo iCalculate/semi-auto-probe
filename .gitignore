@@ -27,3 +27,11 @@ Thumbs.db
 
 # Runtime logs
 *.log
+
+# Local probe configuration and runtime outputs
+probe_config.local.json
+last_imgstitch*.png
+last_autofocus_history*.csv
+tmp_check*
+tmp_output*
+*.tmp

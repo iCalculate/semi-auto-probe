@@ -6,12 +6,22 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
 from .camera import UsbCamera
+from .config import (
+    DEFAULT_CONFIG_FILENAME,
+    EYEPIECE_OPTIONS,
+    OBJECTIVE_OPTIONS,
+    ProbeConfig,
+    calibration_distance_px,
+    load_probe_config,
+    pulses_from_um,
+    save_probe_config,
+)
 from .img_stitch import compose_mosaic, estimate_overlap_shift, fit_plane, flat_field_correct, serpentine_indices
 from .logging_utils import colorize_hex_frame, configure_logging, print_startup_banner
-from .protocol import COMM_TEST_COMMAND, FUNCTION_READ_POSITION, RESPONSE_HEAD, Axis, AxisPosition, hex_bytes, parse_axis_position_response
+from .protocol import COMM_TEST_COMMAND, FUNCTION_READ_POSITION, RESPONSE_HEAD, Axis, AxisPosition, IoStatus, hex_bytes, parse_axis_position_response
 from .serial_client import ControllerSerialClient, CommunicationTestResult, list_serial_ports
 
 
@@ -39,6 +49,9 @@ class ProbeApp(tk.Tk):
         self.result_queue: queue.Queue[object] = queue.Queue()
         self.realtime_stop_event = threading.Event()
         self.realtime_thread: threading.Thread | None = None
+        self.home_signal_stop_event = threading.Event()
+        self.home_signal_thread: threading.Thread | None = None
+        self.home_signal_enabled = False
         self.autofocus_stop_event = threading.Event()
         self.autofocus_thread: threading.Thread | None = None
         self.autofocus_running = False
@@ -48,6 +61,12 @@ class ProbeApp(tk.Tk):
         self.imgstitch_running = False
         self.imgstitch_restore_realtime = False
         self.latest_stitch_frame = None
+        self.config_path = Path.cwd() / DEFAULT_CONFIG_FILENAME
+        try:
+            self.probe_config = load_probe_config(self.config_path)
+        except Exception as exc:
+            self.probe_config = ProbeConfig()
+            logger.error("Failed to load probe config from %s: %s", self.config_path, exc)
 
         self.port_var = tk.StringVar()
         self.camera_index_var = tk.StringVar(value="0")
@@ -105,6 +124,7 @@ class ProbeApp(tk.Tk):
         self.motion_mode_var = tk.StringVar(value="Relative")
         self.realtime_enabled = False
         self.realtime_button_var = tk.StringVar(value="Continue")
+        self.home_signal_button_var = tk.StringVar(value="Home Signals")
         self.motion_busy = False
         self.keyboard_motion_busy = False
         self.position_read_pending = False
@@ -122,6 +142,20 @@ class ProbeApp(tk.Tk):
         self.imgstitch_step_y_var = tk.StringVar(value="1000")
         self.imgstitch_plane_af_var = tk.BooleanVar(value=False)
         self.imgstitch_status_var = tk.StringVar(value="Idle")
+        self.last_realtime_ui_update = 0.0
+        self.last_realtime_status_update = 0.0
+        self.axis_indicator_canvases: dict[str, tk.Canvas] = {}
+        self.axis_indicator_items: dict[str, int] = {}
+        self.axis_indicator_colors = {"X": "#60a5fa", "Y": "#34d399", "Z": "#fbbf24"}
+        self.objective_var = tk.StringVar(value=str(self.probe_config.objective))
+        self.eyepiece_var = tk.StringVar(value=f"{self.probe_config.eyepiece:g}")
+        self.microstep_var = tk.StringVar(value=str(self.probe_config.microstep))
+        self.lead_xy_var = tk.StringVar(value=f"{self.probe_config.lead_xy_mm:g}")
+        self.lead_z_var = tk.StringVar(value=f"{self.probe_config.lead_z_mm:g}")
+        self.base_angle_var = tk.StringVar(value=f"{self.probe_config.base_angle_deg:g}")
+        self.calibration_status_var = tk.StringVar(value="")
+        self.motor_conversion_var = tk.StringVar(value="")
+        self.config_status_var = tk.StringVar(value=f"Config: {self.config_path.name}")
 
         self._configure_theme()
         self._build_ui()
@@ -233,7 +267,7 @@ class ProbeApp(tk.Tk):
         self.tab_buttons: dict[str, tk.Label] = {}
         tab_bar = ttk.Frame(content, style="App.TFrame")
         tab_bar.grid(row=0, column=0, sticky="w")
-        for col, name in enumerate(("Main", "Communication", "AutoFocus", "ImgStitch")):
+        for col, name in enumerate(("Main", "Communication", "AutoFocus", "ImgStitch", "Config")):
             tab_bar.columnconfigure(col, weight=1, uniform="top_tabs", minsize=156)
             label = tk.Label(
                 tab_bar,
@@ -263,7 +297,8 @@ class ProbeApp(tk.Tk):
         communication_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         autofocus_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         imgstitch_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
-        self.pages = {"Main": main_page, "Communication": communication_page, "AutoFocus": autofocus_page, "ImgStitch": imgstitch_page}
+        config_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
+        self.pages = {"Main": main_page, "Communication": communication_page, "AutoFocus": autofocus_page, "ImgStitch": imgstitch_page, "Config": config_page}
         for page in self.pages.values():
             page.grid(row=0, column=0, sticky="nsew")
 
@@ -271,6 +306,8 @@ class ProbeApp(tk.Tk):
         self._build_communication_page(communication_page)
         self._build_autofocus_page(autofocus_page)
         self._build_imgstitch_page(imgstitch_page)
+        self._build_config_page(config_page)
+        self._update_config_display()
         self.show_page("Main")
 
     def show_page(self, name: str) -> None:
@@ -381,14 +418,23 @@ class ProbeApp(tk.Tk):
         )):
             self._axis_control_row(axes, row_index + 1, axis, label, color)
 
+        zero_bar = ttk.Frame(axes, style="Panel.TFrame")
+        zero_bar.grid(row=4, column=0, sticky="ew", padx=8, pady=(10, 8))
+        zero_bar.columnconfigure((0, 1), weight=1, uniform="zero_bar")
+        ttk.Button(zero_bar, textvariable=self.home_signal_button_var, command=self.toggle_home_signal_polling).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(zero_bar, text="Set New Zero", style="Accent.TButton", command=self.set_xyz_zero).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
     def _axis_control_row(self, parent: ttk.Frame, row_index: int, axis: str, label: str, color: str) -> None:
         row = ttk.Frame(parent, style="Panel.TFrame", padding=(8, 6))
         row.grid(row=row_index, column=0, sticky="ew", padx=8, pady=(8 if row_index == 0 else 3, 4))
         row.columnconfigure(1, weight=1)
 
         marker = tk.Canvas(row, width=10, height=10, bg=self.colors["surface"], highlightthickness=0)
-        marker.create_oval(1, 1, 9, 9, fill=color, outline=color)
+        marker_item = marker.create_oval(1, 1, 9, 9, fill=self.colors["muted"], outline=self.colors["muted"])
         marker.grid(row=0, column=0, rowspan=2, padx=(0, 8))
+        self.axis_indicator_canvases[axis] = marker
+        self.axis_indicator_items[axis] = marker_item
+        self.axis_indicator_colors[axis] = color
 
         ttk.Label(row, text=label, style="Panel.TLabel").grid(row=0, column=1, sticky="w")
         ttk.Label(row, text="Jog Step", style="Muted.TLabel").grid(row=1, column=1, sticky="w", pady=(4, 0))
@@ -590,8 +636,8 @@ class ProbeApp(tk.Tk):
             ("Cols", self.imgstitch_cols_var),
             ("Overlap X (px)", self.imgstitch_overlap_x_var),
             ("Overlap Y (px)", self.imgstitch_overlap_y_var),
-            ("Step X (pulse)", self.imgstitch_step_x_var),
-            ("Step Y (pulse)", self.imgstitch_step_y_var),
+            ("Step X (um)", self.imgstitch_step_x_var),
+            ("Step Y (um)", self.imgstitch_step_y_var),
         )
         row = 1
         for label, variable in fields:
@@ -603,6 +649,54 @@ class ProbeApp(tk.Tk):
         ttk.Button(control_panel, text="Start Stitch", style="Accent.TButton", command=self.start_imgstitch).grid(row=row + 1, column=0, sticky="ew", pady=(16, 0))
         ttk.Button(control_panel, text="Stop", style="Danger.TButton", command=self.stop_imgstitch).grid(row=row + 2, column=0, sticky="ew", pady=(8, 0))
         ttk.Label(control_panel, textvariable=self.imgstitch_status_var, style="Status.TLabel", wraplength=190, padding=10).grid(row=row + 3, column=0, sticky="ew", pady=(16, 0))
+
+    def _build_config_page(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=1)
+        parent.rowconfigure(0, weight=1)
+
+        optical_panel = ttk.Frame(parent, style="Panel.TFrame", padding=16)
+        optical_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        optical_panel.columnconfigure(0, weight=1)
+        optical_panel.columnconfigure(1, weight=1)
+
+        ttk.Label(optical_panel, text="OPTICAL CALIBRATION", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(optical_panel, text="Objective", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(16, 4))
+        objective_combo = ttk.Combobox(optical_panel, values=[str(value) for value in OBJECTIVE_OPTIONS], textvariable=self.objective_var, state="readonly")
+        objective_combo.grid(row=2, column=0, sticky="ew", padx=(0, 8))
+        ttk.Label(optical_panel, text="Eyepiece", style="Muted.TLabel").grid(row=1, column=1, sticky="w", pady=(16, 4))
+        eyepiece_combo = ttk.Combobox(optical_panel, values=[f"{value:g}" for value in EYEPIECE_OPTIONS], textvariable=self.eyepiece_var, state="readonly")
+        eyepiece_combo.grid(row=2, column=1, sticky="ew", padx=(8, 0))
+        objective_combo.bind("<<ComboboxSelected>>", lambda _event: self.apply_config(save=True))
+        eyepiece_combo.bind("<<ComboboxSelected>>", lambda _event: self.apply_config(save=True))
+
+        ttk.Label(optical_panel, text="CALIBRATION", style="Section.TLabel").grid(row=3, column=0, columnspan=2, sticky="w", pady=(24, 6))
+        ttk.Label(optical_panel, textvariable=self.calibration_status_var, style="Value.TLabel", wraplength=560, padding=10).grid(row=4, column=0, columnspan=2, sticky="ew")
+        ttk.Button(optical_panel, text="Calibrate Pixels", style="Accent.TButton", command=self.open_pixel_calibration).grid(row=5, column=0, sticky="ew", pady=(14, 0), padx=(0, 8))
+        ttk.Button(optical_panel, text="Save Config", command=self.apply_config).grid(row=5, column=1, sticky="ew", pady=(14, 0), padx=(8, 0))
+        ttk.Label(optical_panel, textvariable=self.config_status_var, style="Status.TLabel", wraplength=560, padding=10).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+
+        motor_panel = ttk.Frame(parent, style="Panel.TFrame", padding=16)
+        motor_panel.grid(row=0, column=1, sticky="nsew")
+        motor_panel.columnconfigure(0, weight=1)
+        motor_panel.columnconfigure(1, weight=1)
+        ttk.Label(motor_panel, text="MOTOR MAPPING", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+
+        fields = (
+            ("Microstep", self.microstep_var),
+            ("Base angle (deg)", self.base_angle_var),
+            ("X/Y lead (mm)", self.lead_xy_var),
+            ("Z lead (mm)", self.lead_z_var),
+        )
+        for index, (label, variable) in enumerate(fields, start=1):
+            col = (index - 1) % 2
+            row = 1 + ((index - 1) // 2) * 2
+            ttk.Label(motor_panel, text=label, style="Muted.TLabel").grid(row=row, column=col, sticky="w", pady=(16, 4), padx=(0 if col == 0 else 8, 8 if col == 0 else 0))
+            ttk.Entry(motor_panel, textvariable=variable).grid(row=row + 1, column=col, sticky="ew", padx=(0 if col == 0 else 8, 8 if col == 0 else 0))
+
+        ttk.Label(motor_panel, text="CONVERSION", style="Section.TLabel").grid(row=5, column=0, columnspan=2, sticky="w", pady=(24, 6))
+        ttk.Label(motor_panel, textvariable=self.motor_conversion_var, style="Value.TLabel", wraplength=560, padding=10).grid(row=6, column=0, columnspan=2, sticky="ew")
+        ttk.Button(motor_panel, text="Apply Mapping", style="Accent.TButton", command=self.apply_config).grid(row=7, column=0, columnspan=2, sticky="ew", pady=(18, 0))
 
     def _update_comm_note(self) -> None:
         if self.comm_input_mode_var.get() == "Hex":
@@ -859,6 +953,126 @@ class ProbeApp(tk.Tk):
         ttk.Label(parent, text="STATUS", style="Section.TLabel").grid(row=row, column=0, sticky="w", pady=(16, 6))
         value = ttk.Label(parent, textvariable=self.status_var, style="Status.TLabel", wraplength=300, padding=10)
         value.grid(row=row + 1, column=0, sticky="ew")
+
+    def _ppm_with_scalebar(self, image_bgr) -> bytes:
+        import cv2
+
+        image = image_bgr.copy()
+        height, width = image.shape[:2]
+        um_per_px = self.probe_config.current_um_per_px()
+        bar_color = (245, 245, 245)
+        shadow_color = (0, 0, 0)
+        x0 = 24
+        y0 = height - 32
+        if um_per_px is None or um_per_px <= 0:
+            label = "N/A config"
+            cv2.putText(image, label, (x0 + 1, y0 + 1), cv2.FONT_HERSHEY_SIMPLEX, 0.58, shadow_color, 3, cv2.LINE_AA)
+            cv2.putText(image, label, (x0, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (80, 220, 255), 2, cv2.LINE_AA)
+        else:
+            target_px = width * 0.18
+            candidates_um = (5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000)
+            best_um = min(candidates_um, key=lambda value: abs((value / um_per_px) - target_px))
+            if self.probe_config.objective == 20 and self.probe_config.eyepiece == 1.5:
+                default_px = 100.0 / um_per_px
+                if 50 <= default_px <= width * 0.45:
+                    best_um = 100
+            bar_px = int(round(best_um / um_per_px))
+            bar_px = max(20, min(bar_px, width - 2 * x0))
+            x1 = x0 + bar_px
+            cv2.line(image, (x0, y0), (x1, y0), shadow_color, 6, cv2.LINE_AA)
+            cv2.line(image, (x0, y0), (x1, y0), bar_color, 3, cv2.LINE_AA)
+            cv2.line(image, (x0, y0 - 7), (x0, y0 + 7), bar_color, 2, cv2.LINE_AA)
+            cv2.line(image, (x1, y0 - 7), (x1, y0 + 7), bar_color, 2, cv2.LINE_AA)
+            label = f"{best_um:g} um"
+            cv2.putText(image, label, (x0 + 1, y0 - 13), cv2.FONT_HERSHEY_SIMPLEX, 0.58, shadow_color, 3, cv2.LINE_AA)
+            cv2.putText(image, label, (x0, y0 - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.58, bar_color, 2, cv2.LINE_AA)
+
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        out_height, out_width = rgb.shape[:2]
+        header = f"P6 {out_width} {out_height} 255\n".encode("ascii")
+        return header + rgb.tobytes()
+
+    def apply_config(self, save: bool = True) -> bool:
+        try:
+            updated = ProbeConfig(
+                objective=int(self.objective_var.get()),
+                eyepiece=float(self.eyepiece_var.get()),
+                microstep=int(self.microstep_var.get()),
+                lead_xy_mm=float(self.lead_xy_var.get()),
+                lead_z_mm=float(self.lead_z_var.get()),
+                base_angle_deg=float(self.base_angle_var.get()),
+                calibrations=dict(self.probe_config.calibrations),
+            )
+            updated.validate()
+        except ValueError as exc:
+            self.config_status_var.set(f"Invalid config: {exc}")
+            self.status_var.set(f"Config invalid: {exc}")
+            return False
+
+        self.probe_config = updated
+        self._sync_config_vars_from_config()
+        self._update_config_display()
+        if save:
+            try:
+                save_probe_config(self.probe_config, self.config_path)
+            except Exception as exc:
+                self.config_status_var.set(f"Save failed: {exc}")
+                self.status_var.set(f"Config save failed: {exc}")
+                logger.error("Failed to save probe config: %s", exc)
+                return False
+            self.config_status_var.set(f"Saved {self.config_path.name}")
+            self.status_var.set("Config saved.")
+        return True
+
+    def _sync_config_vars_from_config(self) -> None:
+        self.objective_var.set(str(self.probe_config.objective))
+        self.eyepiece_var.set(f"{self.probe_config.eyepiece:g}")
+        self.microstep_var.set(str(self.probe_config.microstep))
+        self.lead_xy_var.set(f"{self.probe_config.lead_xy_mm:g}")
+        self.lead_z_var.set(f"{self.probe_config.lead_z_mm:g}")
+        self.base_angle_var.set(f"{self.probe_config.base_angle_deg:g}")
+
+    def _update_config_display(self) -> None:
+        um_per_px = self.probe_config.current_um_per_px()
+        lens_text = f"{self.probe_config.objective:g}x objective / {self.probe_config.eyepiece:g}x eyepiece"
+        if um_per_px is None:
+            self.calibration_status_var.set(f"{lens_text}: not calibrated")
+        else:
+            self.calibration_status_var.set(f"{lens_text}: {um_per_px:.6g} um/px")
+        conversion_lines = [
+            f"Steps/rev: {self.probe_config.steps_per_revolution:.6g}",
+            f"X: {self.probe_config.um_per_pulse('X'):.6g} um/pulse, {self.probe_config.pulses_per_um('X'):.6g} pulse/um",
+            f"Y: {self.probe_config.um_per_pulse('Y'):.6g} um/pulse, {self.probe_config.pulses_per_um('Y'):.6g} pulse/um",
+            f"Z: {self.probe_config.um_per_pulse('Z'):.6g} um/pulse, {self.probe_config.pulses_per_um('Z'):.6g} pulse/um",
+        ]
+        self.motor_conversion_var.set("\n".join(conversion_lines))
+
+    def open_pixel_calibration(self) -> None:
+        if not self.apply_config(save=True):
+            return
+        with self.camera_lock:
+            image_bgr = None if self.latest_stitch_frame is None else self.latest_stitch_frame.copy()
+        if image_bgr is None:
+            self.config_status_var.set("No camera frame available for calibration.")
+            self.status_var.set("No camera frame available for calibration.")
+            return
+
+        dialog = PixelCalibrationDialog(self, image_bgr, self.colors)
+        self.wait_window(dialog)
+        if dialog.result_um_per_px is None:
+            return
+
+        try:
+            self.probe_config.set_calibration(self.probe_config.objective, self.probe_config.eyepiece, dialog.result_um_per_px)
+            save_probe_config(self.probe_config, self.config_path)
+        except Exception as exc:
+            self.config_status_var.set(f"Calibration save failed: {exc}")
+            self.status_var.set(f"Calibration save failed: {exc}")
+            logger.error("Failed to save calibration: %s", exc)
+            return
+        self._update_config_display()
+        self.config_status_var.set(f"Calibration saved: {dialog.result_um_per_px:.6g} um/px")
+        self.status_var.set("Pixel calibration saved.")
 
     def _append_hex_history(self, direction: str, message: str) -> None:
         if not hasattr(self, "hex_history"):
@@ -1136,6 +1350,35 @@ class ProbeApp(tk.Tk):
             logger.info("Set Z=0 command sent: %s", colorize_hex_frame(hex_bytes(command), "TX"))
         except Exception as exc:
             self.result_queue.put(("motor_error", "ZERO_Z", exc))
+        finally:
+            self.result_queue.put(("motor_done",))
+
+    def set_xyz_zero(self) -> None:
+        if self.motion_busy:
+            self.status_var.set("Motion is busy; Set New Zero skipped.")
+            logger.warning("Set New Zero skipped because motion is busy.")
+            return
+        if not self.serial_client:
+            self.connect_serial()
+        if not self.serial_client:
+            return
+
+        self.motion_busy = True
+        self.clear_position_edits()
+        self.status_var.set("Setting current X/Y/Z position to zero.")
+        threading.Thread(target=self._set_xyz_zero_worker, daemon=True).start()
+
+    def _set_xyz_zero_worker(self) -> None:
+        assert self.serial_client is not None
+        try:
+            command = self.serial_client.clear_position(Axis.ALL)
+            self.result_queue.put(("zero_xyz_command", command))
+            time.sleep(0.1)
+            entries = self.serial_client.read_stable_xyz_positions()
+            self.result_queue.put(("read_positions", entries, "zero_xyz"))
+            logger.info("Set XYZ=0 command sent: %s", colorize_hex_frame(hex_bytes(command), "TX"))
+        except Exception as exc:
+            self.result_queue.put(("motor_error", "ZERO_XYZ", exc))
         finally:
             self.result_queue.put(("motor_done",))
 
@@ -1439,12 +1682,14 @@ class ProbeApp(tk.Tk):
             cols = int(self.imgstitch_cols_var.get())
             overlap_x = int(self.imgstitch_overlap_x_var.get())
             overlap_y = int(self.imgstitch_overlap_y_var.get())
-            step_x = int(self.imgstitch_step_x_var.get())
-            step_y = int(self.imgstitch_step_y_var.get())
+            step_x_um = float(self.imgstitch_step_x_var.get())
+            step_y_um = float(self.imgstitch_step_y_var.get())
+            step_x = pulses_from_um(step_x_um, self.probe_config, "X")
+            step_y = pulses_from_um(step_y_um, self.probe_config, "Y")
         except ValueError:
-            self.imgstitch_status_var.set("Stitch settings must be integers.")
+            self.imgstitch_status_var.set("Stitch settings must be valid positive numbers.")
             return
-        if min(rows, cols, overlap_x, overlap_y, step_x, step_y) <= 0:
+        if min(rows, cols, overlap_x, overlap_y, step_x, step_y, step_x_um, step_y_um) <= 0:
             self.imgstitch_status_var.set("Stitch settings must be positive.")
             return
         if self.imgstitch_plane_af_var.get() and (rows < 2 or cols < 2):
@@ -1458,11 +1703,11 @@ class ProbeApp(tk.Tk):
         self.imgstitch_running = True
         self.motion_busy = True
         self.imgstitch_stop_event.clear()
-        self.imgstitch_status_var.set("Running")
-        self.status_var.set("ImgStitch running.")
+        self.imgstitch_status_var.set(f"Running: X {step_x_um:g} um -> {step_x} pulse, Y {step_y_um:g} um -> {step_y} pulse")
+        self.status_var.set(f"ImgStitch running: X {step_x_um:g} um -> {step_x} pulse, Y {step_y_um:g} um -> {step_y} pulse.")
         self.imgstitch_thread = threading.Thread(
             target=self._imgstitch_worker,
-            args=(rows, cols, overlap_x, overlap_y, step_x, step_y, self.imgstitch_plane_af_var.get()),
+            args=(rows, cols, overlap_x, overlap_y, step_x, step_y, self.imgstitch_plane_af_var.get(), step_x_um, step_y_um),
             daemon=True,
         )
         self.imgstitch_thread.start()
@@ -1481,6 +1726,8 @@ class ProbeApp(tk.Tk):
         step_x: int,
         step_y: int,
         use_plane_af: bool,
+        step_x_um: float,
+        step_y_um: float,
     ) -> None:
         assert self.serial_client is not None
         try:
@@ -1521,7 +1768,7 @@ class ProbeApp(tk.Tk):
                     dx, dy, response = estimate_overlap_shift(tiles[previous_key], corrected, direction, overlap_x, overlap_y)
                     previous_x, previous_y = positions[previous_key]
                     positions[key] = (previous_x + dx, previous_y + dy)
-                    self.result_queue.put(("imgstitch_status", f"Tile {index}/{rows * cols}, phase response {response:.3f}"))
+                    self.result_queue.put(("imgstitch_status", f"Tile {index}/{rows * cols}, phase response {response:.3f}, step X {step_x_um:g} um/{step_x} pulse Y {step_y_um:g} um/{step_y} pulse"))
                 previous_key = key
                 mosaic = compose_mosaic(tiles, positions)
                 self.result_queue.put(("imgstitch_preview", mosaic))
@@ -1688,6 +1935,52 @@ class ProbeApp(tk.Tk):
         self.status_var.set("Realtime position display disabled.")
         logger.info("Realtime position display disabled.")
 
+    def toggle_home_signal_polling(self) -> None:
+        if self.home_signal_enabled:
+            self.disable_home_signal_polling()
+            return
+
+        if not self.serial_client:
+            self.connect_serial()
+        if not self.serial_client:
+            return
+
+        self.home_signal_enabled = True
+        self.home_signal_stop_event.clear()
+        self.home_signal_button_var.set("Stop Home Signals")
+        self.status_var.set("Home signal polling enabled.")
+        self.home_signal_thread = threading.Thread(target=self._home_signal_worker, daemon=True)
+        self.home_signal_thread.start()
+        logger.info("Home signal polling enabled.")
+
+    def disable_home_signal_polling(self) -> None:
+        self.home_signal_stop_event.set()
+        self.home_signal_enabled = False
+        self.home_signal_button_var.set("Home Signals")
+        self.status_var.set("Home signal polling disabled.")
+        logger.info("Home signal polling disabled.")
+
+    def _home_signal_worker(self) -> None:
+        assert self.serial_client is not None
+        while not self.home_signal_stop_event.is_set():
+            try:
+                command, response, status = self.serial_client.read_io_status()
+                self.result_queue.put(("home_signals", command, response, status))
+            except Exception as exc:
+                self.result_queue.put(("home_signal_error", exc))
+                return
+            self.home_signal_stop_event.wait(0.3)
+
+    def _update_home_indicators(self, status: IoStatus | None) -> None:
+        for axis_name, axis in (("X", Axis.X), ("Y", Axis.Y), ("Z", Axis.Z)):
+            canvas = self.axis_indicator_canvases.get(axis_name)
+            item = self.axis_indicator_items.get(axis_name)
+            if canvas is None or item is None:
+                continue
+            active = bool(status and status.home_triggered(axis))
+            color = self.axis_indicator_colors[axis_name] if active else self.colors["muted"]
+            canvas.itemconfigure(item, fill=color, outline=color)
+
     def _realtime_position_worker(self) -> None:
         assert self.serial_client is not None
         while not self.realtime_stop_event.is_set():
@@ -1696,10 +1989,8 @@ class ProbeApp(tk.Tk):
                 if not response:
                     continue
                 if len(response) != 12:
-                    self.result_queue.put(("realtime_raw", response, f"incomplete frame: {len(response)} byte(s)"))
                     continue
                 if response[0] != RESPONSE_HEAD or response[1] != FUNCTION_READ_POSITION:
-                    self.result_queue.put(("realtime_raw", response, "non-position frame ignored"))
                     continue
                 position = parse_axis_position_response(response)
                 self.result_queue.put(("realtime_position", response, position))
@@ -1716,13 +2007,13 @@ class ProbeApp(tk.Tk):
         self.clear_position_edits()
         self.status_var.set("Reading current X/Y/Z positions...")
         logger.info("Reading current X/Y/Z positions.")
-        threading.Thread(target=self._read_current_position_worker, daemon=True).start()
+        threading.Thread(target=self._read_current_position_worker, args=("button",), daemon=True).start()
 
-    def _read_current_position_worker(self) -> None:
+    def _read_current_position_worker(self, source: str) -> None:
         assert self.serial_client is not None
         try:
             entries = self.serial_client.read_stable_xyz_positions()
-            self.result_queue.put(("read_positions", entries, "button"))
+            self.result_queue.put(("read_positions", entries, source))
         except Exception as exc:
             self.result_queue.put(("read_position_error", exc))
 
@@ -2044,6 +2335,9 @@ class ProbeApp(tk.Tk):
         logger.info("Connected to %s at 115200,N,8,1.", port)
 
     def disconnect_serial(self) -> None:
+        self.home_signal_stop_event.set()
+        self.home_signal_enabled = False
+        self.home_signal_button_var.set("Home Signals")
         if self.serial_client:
             logger.info("Disconnecting serial port %s.", self.serial_client.port)
             self.serial_client.close()
@@ -2086,6 +2380,9 @@ class ProbeApp(tk.Tk):
                 self._append_hex_history("RX", result.response_hex or "-")
                 if result.ok:
                     logger.info("Communication test passed. %s %s", colorize_hex_frame(result.request_hex, "TX"), colorize_hex_frame(result.response_hex, "RX"))
+                    self.clear_position_edits()
+                    self.status_var.set("Communication test passed. Reading current X/Y/Z positions...")
+                    threading.Thread(target=self._read_current_position_worker, args=("comm_test",), daemon=True).start()
                 else:
                     logger.warning("Communication test did not pass. %s %s Detail=%s", colorize_hex_frame(result.request_hex, "TX"), colorize_hex_frame(result.response_hex or "-", "RX"), result.message)
         except queue.Empty:
@@ -2117,6 +2414,9 @@ class ProbeApp(tk.Tk):
             elif source == "zero_z":
                 self.autofocus_status_var.set("Z set to 0")
                 self.status_var.set("Z position set to 0.")
+            elif source == "zero_xyz":
+                self.autofocus_z_var.set("0")
+                self.status_var.set("X/Y/Z positions set to 0.")
             logger.info(
                 "Position read: X=%s Y=%s Z=%s.",
                 positions.get("X", "-"),
@@ -2135,11 +2435,36 @@ class ProbeApp(tk.Tk):
             logger.info("Set Z=0 command sent: %s No response expected.", colorize_hex_frame(command_hex, "TX"))
             return
 
+        if event_type == "zero_xyz_command":
+            _, command = event
+            command_hex = hex_bytes(command)
+            self.tx_var.set(command_hex)
+            self._append_hex_history("TX", command_hex)
+            self.status_var.set("Set New Zero command sent.")
+            logger.info("Set XYZ=0 command sent: %s No response expected.", colorize_hex_frame(command_hex, "TX"))
+            return
+
         if event_type == "read_position_error":
             _, exc = event
             self.position_read_pending = False
             self.status_var.set(f"Read current position failed: {exc}")
             logger.error("Read current position failed: %s", exc)
+            return
+
+        if event_type == "home_signals":
+            _, command, response, io_status = event
+            self.tx_var.set(hex_bytes(command))
+            self.rx_var.set(hex_bytes(response))
+            self._update_home_indicators(io_status)
+            self.status_var.set("Home signal status updated.")
+            return
+
+        if event_type == "home_signal_error":
+            _, exc = event
+            self.home_signal_enabled = False
+            self.home_signal_button_var.set("Home Signals")
+            self.status_var.set(f"Home signal polling stopped: {exc}")
+            logger.error("Home signal polling stopped: %s", exc)
             return
 
         if event_type == "moving":
@@ -2172,18 +2497,14 @@ class ProbeApp(tk.Tk):
 
         if event_type == "realtime_position":
             _, response, position = event
-            self.rx_var.set(hex_bytes(response))
-            self._append_hex_history("RX", hex_bytes(response))
             self._update_axis_position(position)
-            self.status_var.set("Realtime position updated.")
+            now = time.monotonic()
+            if now - self.last_realtime_ui_update >= 0.5:
+                self.rx_var.set(hex_bytes(response))
+                self.last_realtime_ui_update = now
             return
 
         if event_type == "realtime_raw":
-            _, response, detail = event
-            self.rx_var.set(hex_bytes(response))
-            self._append_hex_history("RX", hex_bytes(response))
-            self.status_var.set(f"Realtime position frame ignored: {detail}")
-            logger.warning("Realtime frame ignored: %s", detail)
             return
 
         if event_type == "realtime_error":
@@ -2376,7 +2697,7 @@ class ProbeApp(tk.Tk):
             self.latest_camera_frame = None
 
         if frame:
-            self.camera_image = tk.PhotoImage(data=frame.ppm_bytes, format="PPM")
+            self.camera_image = tk.PhotoImage(data=self._ppm_with_scalebar(frame.image_bgr), format="PPM")
             self.video_label.configure(image=self.camera_image, text="")
             with self.focus_lock:
                 self.latest_focus_frame_ppm = frame.ppm_bytes
@@ -2396,6 +2717,7 @@ class ProbeApp(tk.Tk):
         self.autofocus_stop_event.set()
         self.imgstitch_stop_event.set()
         self.realtime_stop_event.set()
+        self.home_signal_stop_event.set()
         if self.realtime_enabled and self.serial_client:
             try:
                 self.serial_client.disable_realtime_position()
@@ -2405,6 +2727,127 @@ class ProbeApp(tk.Tk):
         if self.serial_client:
             self.serial_client.close()
         super().destroy()
+
+
+class PixelCalibrationDialog(tk.Toplevel):
+    def __init__(self, parent: ProbeApp, image_bgr, colors: dict[str, str]) -> None:
+        super().__init__(parent)
+        self.title("Pixel Calibration")
+        self.configure(bg=colors["bg"])
+        self.transient(parent)
+        self.grab_set()
+        self.result_um_per_px: float | None = None
+        self.colors = colors
+        self.points_display: list[tuple[float, float]] = []
+        self.points_original: list[tuple[float, float]] = []
+        self.known_um_var = tk.StringVar(value="100")
+        self.result_var = tk.StringVar(value="Click three points: first two define a line, third measures perpendicular distance.")
+
+        import cv2
+
+        rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        original_height, original_width = rgb.shape[:2]
+        max_width, max_height = 820, 520
+        self.scale = min(max_width / original_width, max_height / original_height, 1.0)
+        if self.scale < 1.0:
+            display_width = max(1, int(original_width * self.scale))
+            display_height = max(1, int(original_height * self.scale))
+            rgb = cv2.resize(rgb, (display_width, display_height), interpolation=cv2.INTER_AREA)
+        else:
+            display_height, display_width = original_height, original_width
+        header = f"P6 {display_width} {display_height} 255\n".encode("ascii")
+        self.photo = tk.PhotoImage(data=header + rgb.tobytes(), format="PPM")
+
+        container = ttk.Frame(self, style="Panel.TFrame", padding=14)
+        container.grid(row=0, column=0, sticky="nsew")
+        container.columnconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        toolbar = ttk.Frame(container, style="Panel.TFrame")
+        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        toolbar.columnconfigure(4, weight=1)
+        ttk.Label(toolbar, text="Known distance (um)", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(toolbar, textvariable=self.known_um_var, width=12).grid(row=0, column=1, sticky="w", padx=(0, 12))
+        ttk.Button(toolbar, text="Reset", command=self.reset_points).grid(row=0, column=2, sticky="w", padx=(0, 8))
+        self.save_button = ttk.Button(toolbar, text="Save Calibration", style="Accent.TButton", command=self.save_result, state="disabled")
+        self.save_button.grid(row=0, column=3, sticky="w")
+
+        self.canvas = tk.Canvas(container, width=display_width, height=display_height, bg="#05070a", highlightthickness=1, highlightbackground=colors["border"])
+        self.canvas.grid(row=1, column=0, sticky="nsew")
+        self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
+        self.canvas.bind("<Button-1>", self.on_click)
+
+        ttk.Label(container, textvariable=self.result_var, style="Status.TLabel", wraplength=820, padding=10).grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        ttk.Button(container, text="Cancel", command=self.destroy).grid(row=3, column=0, sticky="e", pady=(10, 0))
+
+    def on_click(self, event: tk.Event) -> None:
+        if len(self.points_display) >= 3:
+            return
+        x = float(event.x)
+        y = float(event.y)
+        self.points_display.append((x, y))
+        self.points_original.append((x / self.scale, y / self.scale))
+        self.draw_overlay()
+        if len(self.points_display) == 3:
+            self.update_result()
+        else:
+            self.result_var.set(f"Point {len(self.points_display)} recorded. Click {3 - len(self.points_display)} more.")
+
+    def reset_points(self) -> None:
+        self.points_display.clear()
+        self.points_original.clear()
+        self.save_button.configure(state="disabled")
+        self.result_var.set("Click three points: first two define a line, third measures perpendicular distance.")
+        self.draw_overlay()
+
+    def draw_overlay(self) -> None:
+        self.canvas.delete("overlay")
+        if len(self.points_display) >= 2:
+            self.canvas.create_line(*self.points_display[0], *self.points_display[1], fill="#34d399", width=2, tags="overlay")
+        if len(self.points_display) >= 3:
+            p1, p2, p3 = self.points_display
+            foot = self._projection_foot(p1, p2, p3)
+            self.canvas.create_line(*p3, *foot, fill="#fbbf24", width=2, dash=(4, 3), tags="overlay")
+        for index, (x, y) in enumerate(self.points_display, start=1):
+            self.canvas.create_oval(x - 5, y - 5, x + 5, y + 5, fill="#60a5fa", outline="#dbeafe", width=1, tags="overlay")
+            self.canvas.create_text(x + 8, y - 8, text=str(index), fill="#e5edf5", anchor="sw", font=("Segoe UI Semibold", 10), tags="overlay")
+
+    def update_result(self) -> None:
+        try:
+            known_um = float(self.known_um_var.get())
+            if known_um <= 0:
+                raise ValueError("Known distance must be positive.")
+            distance_px = calibration_distance_px(*self.points_original)
+            if distance_px <= 0:
+                raise ValueError("Pixel distance must be positive.")
+        except ValueError as exc:
+            self.result_var.set(str(exc))
+            self.save_button.configure(state="disabled")
+            return
+
+        self.result_um_per_px = known_um / distance_px
+        self.result_var.set(f"Distance: {distance_px:.3f} px, calibration: {self.result_um_per_px:.6g} um/px")
+        self.save_button.configure(state="normal")
+
+    def save_result(self) -> None:
+        if self.result_um_per_px is None:
+            messagebox.showerror("Pixel Calibration", "Complete three-point calibration before saving.", parent=self)
+            return
+        self.destroy()
+
+    @staticmethod
+    def _projection_foot(p1: tuple[float, float], p2: tuple[float, float], p3: tuple[float, float]) -> tuple[float, float]:
+        x1, y1 = p1
+        x2, y2 = p2
+        x3, y3 = p3
+        dx = x2 - x1
+        dy = y2 - y1
+        length_sq = dx * dx + dy * dy
+        if length_sq <= 0:
+            return p1
+        t = ((x3 - x1) * dx + (y3 - y1) * dy) / length_sq
+        return x1 + t * dx, y1 + t * dy
 
 
 def main() -> None:

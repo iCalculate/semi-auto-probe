@@ -9,6 +9,7 @@ from semi_auto_probe.protocol import (
     build_disable_realtime_position_command,
     build_enable_realtime_position_command,
     build_multi_axis_relative_move_command,
+    build_read_io_status_command,
     build_relative_move_command,
     build_frame,
     build_read_position_command,
@@ -16,6 +17,7 @@ from semi_auto_probe.protocol import (
     checksum,
     parse_axis_position_response,
     parse_frame,
+    parse_io_status_response,
     validate_comm_test_response,
 )
 
@@ -40,6 +42,7 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(build_enable_realtime_position_command(), bytes.fromhex("3A D1 00 00 00 00 00 00 00 0B 0D 0A"))
         self.assertEqual(build_disable_realtime_position_command(), bytes.fromhex("3A D4 00 00 00 00 00 00 00 0E 0D 0A"))
         self.assertEqual(build_read_position_command(Axis.X), bytes.fromhex("3A CB 01 00 00 00 00 00 00 06 0D 0A"))
+        self.assertEqual(build_read_io_status_command(), bytes.fromhex("3A D7 00 00 00 00 00 00 00 11 0D 0A"))
         self.assertEqual(build_clear_position_command(Axis.Z), bytes.fromhex("3A D3 04 00 00 00 00 00 00 11 0D 0A"))
         self.assertEqual(build_clear_position_command(Axis.ALL), bytes.fromhex("3A D3 FF 00 00 00 00 00 00 0C 0D 0A"))
 
@@ -70,6 +73,15 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(position.axis, Axis.X)
         self.assertTrue(position.is_running)
         self.assertEqual(position.position, 55700)
+
+    def test_parse_io_status_response(self) -> None:
+        status = parse_io_status_response(bytes.fromhex("A3 D7 02 00 10 81 04 00 00 11 0D 0A"))
+        self.assertFalse(status.home_triggered(Axis.X))
+        self.assertTrue(status.home_triggered(Axis.Y))
+        self.assertFalse(status.home_triggered(Axis.Z))
+        self.assertEqual(status.limit_mask, 0x0010)
+        self.assertEqual(status.input_mask, 0x81)
+        self.assertEqual(status.output_mask, 0x04)
 
 
 if __name__ == "__main__":

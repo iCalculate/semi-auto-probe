@@ -20,6 +20,7 @@ FUNCTION_ENABLE_REALTIME_POSITION = 0xD1
 FUNCTION_DISABLE_REALTIME_POSITION = 0xD4
 FUNCTION_CLEAR_POSITION = 0xD3
 FUNCTION_REACHED_POSITION = 0xB5
+FUNCTION_READ_IO_STATUS = 0xD7
 FUNCTION_RELATIVE_MOVE = 0xFA
 FUNCTION_ABSOLUTE_MOVE = 0xFB
 FUNCTION_STOP = 0xFC
@@ -89,6 +90,18 @@ class AxisPosition:
         }[self.axis]
 
 
+@dataclass(frozen=True)
+class IoStatus:
+    home_mask: int
+    limit_mask: int
+    input_mask: int
+    output_mask: int
+    raw: bytes
+
+    def home_triggered(self, axis: Axis) -> bool:
+        return bool(self.home_mask & int(axis))
+
+
 def parse_frame(raw: bytes, expected_head: int | None = None) -> ControllerFrame:
     if len(raw) != FRAME_LENGTH:
         raise ValueError(f"Expected {FRAME_LENGTH} bytes, got {len(raw)}.")
@@ -131,6 +144,10 @@ def build_disable_realtime_position_command() -> bytes:
 
 def build_clear_position_command(axis: Axis) -> bytes:
     return build_frame(FUNCTION_CLEAR_POSITION, axis)
+
+
+def build_read_io_status_command() -> bytes:
+    return build_frame(FUNCTION_READ_IO_STATUS)
 
 
 def build_relative_move_command(axis: Axis, reverse: bool, pulses: int, speed_percent: int = 100) -> bytes:
@@ -203,3 +220,16 @@ def parse_axis_position_response(raw: bytes) -> AxisPosition:
     sign = -1 if raw[4] else 1
     pulse_count = int.from_bytes(raw[5:9], byteorder="big", signed=False)
     return AxisPosition(axis=axis, is_running=is_running, position=sign * pulse_count, raw=raw)
+
+
+def parse_io_status_response(raw: bytes) -> IoStatus:
+    frame = parse_frame(raw, expected_head=RESPONSE_HEAD)
+    if frame.function_code != FUNCTION_READ_IO_STATUS:
+        raise ValueError(f"Expected I/O status response D7, got {frame.function_code:02X}.")
+    return IoStatus(
+        home_mask=raw[2],
+        limit_mask=int.from_bytes(raw[3:5], byteorder="big", signed=False),
+        input_mask=raw[5],
+        output_mask=raw[6],
+        raw=raw,
+    )
