@@ -10,6 +10,7 @@ from .protocol import (
     FRAME_LENGTH,
     FUNCTION_READ_POSITION,
     FUNCTION_REACHED_POSITION,
+    FUNCTION_MULTI_AXIS_COMPLETED,
     FUNCTION_READ_IO_STATUS,
     RESPONSE_HEAD,
     Axis,
@@ -341,6 +342,79 @@ class ControllerSerialClient:
         command = build_multi_axis_relative_move_command(axis_params)
         self.write_command(command)
         return command
+
+    def move_multi_axis_relative_and_wait(self, axis_params: dict[Axis, tuple[bool, int, int, int]], timeout: float = 10.0) -> tuple[bytes, bytes]:
+        command = build_multi_axis_relative_move_command(axis_params)
+        moving_axes = {axis for axis, (_reverse, pulses, _speed, _acceleration) in axis_params.items() if pulses > 0}
+        with self._lock:
+            if not self.is_open:
+                self.open()
+            assert self._serial is not None
+
+            self._serial.reset_input_buffer()
+            self._serial.write(command)
+            self._serial.flush()
+            completed = self._read_multi_axis_completed_response(timeout, moving_axes)
+        return command, completed
+
+    def _read_multi_axis_completed_response(self, timeout: float, moving_axes: set[Axis] | None = None) -> bytes:
+        assert self._serial is not None
+        deadline = time.monotonic() + timeout
+        last_seen = b""
+        buffer = bytearray()
+        reached_axes: set[Axis] = set()
+        reached_frames: list[bytes] = []
+        expected_axes = moving_axes or set()
+
+        while time.monotonic() < deadline:
+            chunk = self._serial.read(1)
+            if not chunk:
+                continue
+            buffer.extend(chunk)
+            last_seen = bytes(buffer[-FRAME_LENGTH:])
+
+            if chunk == b"\xA5" and not buffer.startswith(bytes((RESPONSE_HEAD,))):
+                return chunk
+
+            head_index = buffer.find(bytes((RESPONSE_HEAD,)))
+            if head_index < 0:
+                del buffer[:-1]
+                continue
+            if head_index > 0:
+                del buffer[:head_index]
+
+            while len(buffer) >= FRAME_LENGTH:
+                frame = bytes(buffer[:FRAME_LENGTH])
+                try:
+                    parsed = parse_frame(frame, expected_head=RESPONSE_HEAD)
+                except ValueError:
+                    del buffer[0]
+                    break
+                del buffer[:FRAME_LENGTH]
+                last_seen = frame
+                if parsed.function_code == FUNCTION_MULTI_AXIS_COMPLETED:
+                    return frame
+                if parsed.function_code != FUNCTION_REACHED_POSITION:
+                    continue
+                reached_frames.append(frame)
+                frame_axes = self._axes_from_reached_mask(parsed.axis, expected_axes)
+                reached_axes.update(frame_axes)
+                if not expected_axes or expected_axes.issubset(reached_axes):
+                    return b"".join(reached_frames)
+
+        detail = f"last bytes {hex_bytes(last_seen)}" if last_seen else "no response"
+        expected = ",".join(axis.name for axis in sorted(expected_axes, key=int)) or "A5/B5"
+        raise TimeoutError(f"Timeout waiting for CC completed response for {expected} ({detail}).")
+
+    @staticmethod
+    def _axes_from_reached_mask(axis_mask: int, expected_axes: set[Axis]) -> set[Axis]:
+        matched = {axis for axis in expected_axes if axis_mask & int(axis)}
+        if matched:
+            return matched
+        try:
+            return {Axis(axis_mask)}
+        except ValueError:
+            return set()
 
     def stop_axis(self, axis: Axis, emergency: bool = False) -> bytes:
         command = build_stop_command(axis=axis, emergency=emergency)

@@ -46,6 +46,8 @@ class ProbeConfig:
     lead_xy_mm: float = 1.0
     lead_z_mm: float = 0.5
     base_angle_deg: float = 0.72
+    cc_speed_percent: int = 100
+    cc_accel_time_s: float = 0.1
     calibrations: dict[str, float] = field(default_factory=dict)
 
     def validate(self) -> None:
@@ -59,9 +61,16 @@ class ProbeConfig:
             raise ValueError("Lead values must be positive.")
         if self.base_angle_deg <= 0:
             raise ValueError("Base angle must be positive.")
+        if self.cc_speed_percent < 0 or self.cc_speed_percent > 100:
+            raise ValueError("CC speed percent must be in range 0..100.")
+        if self.cc_accel_time_s < 0 or self.cc_accel_time_s > 2.55:
+            raise ValueError("CC acceleration time must be in range 0..2.55 seconds.")
         for value in self.calibrations.values():
             if value <= 0:
                 raise ValueError("Calibration values must be positive.")
+
+    def cc_acceleration_units(self) -> int:
+        return int(round(self.cc_accel_time_s * 100.0))
 
     @property
     def steps_per_revolution(self) -> float:
@@ -104,6 +113,8 @@ class ProbeConfig:
             "lead_xy_mm": self.lead_xy_mm,
             "lead_z_mm": self.lead_z_mm,
             "base_angle_deg": self.base_angle_deg,
+            "cc_speed_percent": self.cc_speed_percent,
+            "cc_accel_time_s": self.cc_accel_time_s,
             "calibrations": dict(sorted(self.calibrations.items())),
         }
 
@@ -116,6 +127,8 @@ class ProbeConfig:
             lead_xy_mm=float(data.get("lead_xy_mm", cls.lead_xy_mm)),
             lead_z_mm=float(data.get("lead_z_mm", cls.lead_z_mm)),
             base_angle_deg=float(data.get("base_angle_deg", cls.base_angle_deg)),
+            cc_speed_percent=int(data.get("cc_speed_percent", cls.cc_speed_percent)),
+            cc_accel_time_s=float(data.get("cc_accel_time_s", cls.cc_accel_time_s)),
             calibrations={str(key): float(value) for key, value in data.get("calibrations", {}).items()},
         )
         config.validate()

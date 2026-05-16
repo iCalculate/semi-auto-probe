@@ -14,7 +14,6 @@ from .config import (
     EYEPIECE_OPTIONS,
     OBJECTIVE_OPTIONS,
     ProbeConfig,
-    calibration_distance_px,
     load_probe_config,
     pulses_from_um,
     save_probe_config,
@@ -23,6 +22,8 @@ from .img_stitch import compose_mosaic, estimate_overlap_shift, fit_plane, flat_
 from .logging_utils import colorize_hex_frame, configure_logging, print_startup_banner
 from .protocol import COMM_TEST_COMMAND, FUNCTION_READ_POSITION, RESPONSE_HEAD, Axis, AxisPosition, IoStatus, hex_bytes, parse_axis_position_response
 from .serial_client import ControllerSerialClient, CommunicationTestResult, list_serial_ports
+from .ui.calibration_dialog import PixelCalibrationDialog
+from .ui.vision import VisionPanel
 
 
 logger = configure_logging()
@@ -32,7 +33,7 @@ class ProbeApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Semi Auto Probe")
-        self.geometry("1303x818")
+        self.geometry("1400x880")
         self.minsize(1040, 600)
         self.configure(bg="#0b0f14")
 
@@ -41,6 +42,7 @@ class ProbeApp(tk.Tk):
         self.camera_running = False
         self.camera_rendering = False
         self.camera_image: tk.PhotoImage | None = None
+        self.vision_panel: VisionPanel | None = None
         self.latest_camera_frame = None
         self.camera_lock = threading.Lock()
         self.focus_lock = threading.Lock()
@@ -153,6 +155,8 @@ class ProbeApp(tk.Tk):
         self.lead_xy_var = tk.StringVar(value=f"{self.probe_config.lead_xy_mm:g}")
         self.lead_z_var = tk.StringVar(value=f"{self.probe_config.lead_z_mm:g}")
         self.base_angle_var = tk.StringVar(value=f"{self.probe_config.base_angle_deg:g}")
+        self.cc_speed_percent_var = tk.StringVar(value=str(self.probe_config.cc_speed_percent))
+        self.cc_accel_time_var = tk.StringVar(value=f"{self.probe_config.cc_accel_time_s:g}")
         self.calibration_status_var = tk.StringVar(value="")
         self.motor_conversion_var = tk.StringVar(value="")
         self.config_status_var = tk.StringVar(value=f"Config: {self.config_path.name}")
@@ -205,6 +209,12 @@ class ProbeApp(tk.Tk):
         style.map("Danger.TButton", background=[("active", "#881337"), ("pressed", "#4c0519")])
         style.configure("Ghost.TButton", background=self.colors["surface"], foreground=self.colors["muted"], bordercolor=self.colors["border"], padding=(8, 6))
         style.map("Ghost.TButton", background=[("active", self.colors["surface_2"])], foreground=[("active", self.colors["text"])])
+        style.configure("TEntry", fieldbackground=self.colors["surface_2"], background=self.colors["surface_2"], foreground=self.colors["text"], bordercolor=self.colors["border"], insertcolor=self.colors["text"], padding=5)
+        style.map(
+            "TEntry",
+            fieldbackground=[("focus", self.colors["surface_2"]), ("!disabled", self.colors["surface_2"])],
+            foreground=[("focus", self.colors["text"]), ("!disabled", self.colors["text"])],
+        )
         style.configure("TCombobox", fieldbackground=self.colors["surface_2"], background=self.colors["surface_2"], foreground=self.colors["text"], bordercolor=self.colors["border"], arrowcolor=self.colors["muted"], padding=5)
         style.map("TCombobox", fieldbackground=[("readonly", self.colors["surface_2"])], foreground=[("readonly", self.colors["text"])])
         style.configure("TSpinbox", fieldbackground=self.colors["surface_2"], background=self.colors["surface_2"], foreground=self.colors["text"], bordercolor=self.colors["border"], arrowcolor=self.colors["muted"], padding=5)
@@ -337,8 +347,13 @@ class ProbeApp(tk.Tk):
         ttk.Label(camera_header, text="LIVE VISION", style="Section.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(camera_header, text="USB camera preview", style="Muted.TLabel").grid(row=0, column=1, sticky="e")
 
-        self.video_label = ttk.Label(camera_panel, anchor="center", text="Camera preview", style="Video.TLabel")
-        self.video_label.grid(row=1, column=0, sticky="nsew")
+        self.vision_panel = VisionPanel(
+            camera_panel,
+            self.colors,
+            get_um_per_px=self.probe_config.current_um_per_px,
+            move_point_to_center=self.move_image_point_to_center,
+            get_centering_preview=self.image_centering_preview,
+        )
 
         controls_panel = ttk.Frame(self.main_pane, style="Panel.TFrame", padding=10)
         controls_panel.columnconfigure(0, weight=1)
@@ -359,6 +374,146 @@ class ProbeApp(tk.Tk):
                 self.main_pane.sashpos(0, max(width - 380, 520))
         except tk.TclError:
             pass
+
+    def move_image_point_to_center(self, point_x: float, point_y: float, image_width: int, image_height: int) -> None:
+        if self.motion_busy:
+            self.status_var.set("Motion is busy; image-center move skipped.")
+            return
+        if not self.camera_image:
+            if self.vision_panel:
+                self.vision_panel.status_var.set("No camera image is available.")
+            return
+        um_per_px = self.probe_config.current_um_per_px()
+        if um_per_px is None or um_per_px <= 0:
+            if self.vision_panel:
+                self.vision_panel.status_var.set("Pixel calibration is required before image-center move.")
+            return
+        if not self.serial_client:
+            self.connect_serial()
+        if not self.serial_client:
+            return
+
+        try:
+            plan = self._image_centering_cc_plan(point_x, point_y, image_width, image_height, um_per_px)
+        except ValueError as exc:
+            if self.vision_panel:
+                self.vision_panel.status_var.set(str(exc))
+            return
+        if not plan["has_motion"]:
+            if self.vision_panel:
+                self.vision_panel.status_var.set("Selected point is within less than 0.5 pulse of image center.")
+            return
+
+        self.motion_busy = True
+        self._show_target_positions(plan["target_positions"])
+        self.status_var.set(
+            "Moving image point to center by CC: "
+            f"{plan['preview_text'].replace(chr(10), '; ')}"
+        )
+        if self.vision_panel:
+            self.vision_panel.status_var.set(f"CC move running: {plan['preview_text'].replace(chr(10), '; ')}")
+        threading.Thread(target=self._move_vision_center_worker, args=(plan["axis_params"], plan["target_positions"]), daemon=True).start()
+
+    def _image_centering_move(
+        self,
+        point_x: float,
+        point_y: float,
+        image_width: int,
+        image_height: int,
+        um_per_px: float,
+    ) -> dict[str, tuple[float, int, bool] | float]:
+        if image_width <= 0 or image_height <= 0:
+            raise ValueError("Camera image size is invalid.")
+        if um_per_px <= 0:
+            raise ValueError("Pixel calibration must be positive.")
+
+        image_dx_px = point_x - image_width / 2.0
+        image_dy_px = point_y - image_height / 2.0
+        stage_x_um = image_dx_px * um_per_px
+        stage_y_um = -image_dy_px * um_per_px
+        return {
+            "image_dx_px": image_dx_px,
+            "image_dy_px": image_dy_px,
+            "X": self._signed_stage_um_to_pulses(stage_x_um, "X"),
+            "Y": self._signed_stage_um_to_pulses(stage_y_um, "Y"),
+        }
+
+    def _signed_stage_um_to_pulses(self, stage_um: float, axis: str) -> tuple[float, int, bool]:
+        pulses_per_um = self.probe_config.pulses_per_um(axis)
+        if pulses_per_um <= 0:
+            raise ValueError(f"{axis} pulse-per-um must be positive.")
+        pulses = int(round(abs(stage_um) * pulses_per_um))
+        return stage_um, pulses, stage_um < 0
+
+    def _cc_axis_param(self, reverse: bool, pulses: int) -> tuple[bool, int, int, int]:
+        speed = self.probe_config.cc_speed_percent if pulses else 0
+        return reverse, pulses, speed, self.probe_config.cc_acceleration_units()
+
+    def _image_centering_cc_plan(
+        self,
+        point_x: float,
+        point_y: float,
+        image_width: int,
+        image_height: int,
+        um_per_px: float,
+    ) -> dict[str, object]:
+        move = self._image_centering_move(point_x, point_y, image_width, image_height, um_per_px)
+        axis_params: dict[Axis, tuple[bool, int, int, int]] = {}
+        target_positions: dict[str, int] = {}
+        signed_pulses: dict[str, int] = {}
+        has_motion = False
+
+        for axis_name, controller_axis in (("X", Axis.X), ("Y", Axis.Y)):
+            _stage_um, pulses, reverse = move[axis_name]
+            signed_pulses[axis_name] = -pulses if reverse else pulses
+            axis_params[controller_axis] = self._cc_axis_param(reverse, pulses)
+            if pulses:
+                has_motion = True
+                target_positions[axis_name] = self.current_position_values[axis_name] + signed_pulses[axis_name]
+
+        preview_text = self._format_image_centering_preview(move, signed_pulses)
+        return {
+            "move": move,
+            "axis_params": axis_params,
+            "target_positions": target_positions,
+            "signed_pulses": signed_pulses,
+            "has_motion": has_motion,
+            "preview_text": preview_text,
+        }
+
+    def _format_image_centering_preview(self, move: dict[str, tuple[float, int, bool] | float], signed_pulses: dict[str, int]) -> str:
+        x_um, _x_pulses, _x_reverse = move["X"]
+        y_um, _y_pulses, _y_reverse = move["Y"]
+        return (
+            f"dX {move['image_dx_px']:+.1f}px  X {x_um:+.2f}um  CC {signed_pulses['X']:+d}p\n"
+            f"dY {move['image_dy_px']:+.1f}px  Y {y_um:+.2f}um  CC {signed_pulses['Y']:+d}p"
+        )
+
+    def image_centering_preview(self, point_x: float, point_y: float, image_width: int, image_height: int) -> str:
+        um_per_px = self.probe_config.current_um_per_px()
+        if um_per_px is None or um_per_px <= 0:
+            image_dx_px = point_x - image_width / 2.0
+            image_dy_px = point_y - image_height / 2.0
+            return f"dX {image_dx_px:+.1f}px\n" f"dY {image_dy_px:+.1f}px\nNo calibration"
+        try:
+            plan = self._image_centering_cc_plan(point_x, point_y, image_width, image_height, um_per_px)
+        except ValueError as exc:
+            return str(exc)
+        return str(plan["preview_text"])
+
+    def _move_vision_center_worker(self, axis_params: dict[Axis, tuple[bool, int, int, int]], expected_targets: dict[str, int]) -> None:
+        assert self.serial_client is not None
+        try:
+            command, completed = self.serial_client.move_multi_axis_relative_and_wait(axis_params, timeout=self._cc_move_timeout(axis_params))
+            self.result_queue.put(("motor_command", "XY", "cc image center", command, "vision"))
+            self.result_queue.put(("cc_done", completed, "vision"))
+            self.result_queue.put(("moving",))
+            entries = self.serial_client.read_xyz_positions()
+            self.result_queue.put(("read_positions", entries, "vision", expected_targets))
+        except Exception as exc:
+            self.result_queue.put(("motor_error", "XY", exc))
+        finally:
+            self.result_queue.put(("motor_done",))
 
     def _build_position_panel(self, parent: ttk.Frame) -> None:
         panel = ttk.Frame(parent, style="Panel.TFrame")
@@ -687,16 +842,29 @@ class ProbeApp(tk.Tk):
             ("Base angle (deg)", self.base_angle_var),
             ("X/Y lead (mm)", self.lead_xy_var),
             ("Z lead (mm)", self.lead_z_var),
+            ("CC speed (%)", self.cc_speed_percent_var),
+            ("CC accel/decel (s)", self.cc_accel_time_var),
         )
         for index, (label, variable) in enumerate(fields, start=1):
             col = (index - 1) % 2
             row = 1 + ((index - 1) // 2) * 2
             ttk.Label(motor_panel, text=label, style="Muted.TLabel").grid(row=row, column=col, sticky="w", pady=(16, 4), padx=(0 if col == 0 else 8, 8 if col == 0 else 0))
-            ttk.Entry(motor_panel, textvariable=variable).grid(row=row + 1, column=col, sticky="ew", padx=(0 if col == 0 else 8, 8 if col == 0 else 0))
+            entry = tk.Entry(
+                motor_panel,
+                textvariable=variable,
+                relief="flat",
+                bd=0,
+                bg=self.colors["surface_2"],
+                fg=self.colors["text"],
+                insertbackground=self.colors["text"],
+                selectbackground=self.colors["surface_3"],
+                font=("Segoe UI", 10),
+            )
+            entry.grid(row=row + 1, column=col, sticky="ew", padx=(0 if col == 0 else 8, 8 if col == 0 else 0), ipady=6)
 
-        ttk.Label(motor_panel, text="CONVERSION", style="Section.TLabel").grid(row=5, column=0, columnspan=2, sticky="w", pady=(24, 6))
-        ttk.Label(motor_panel, textvariable=self.motor_conversion_var, style="Value.TLabel", wraplength=560, padding=10).grid(row=6, column=0, columnspan=2, sticky="ew")
-        ttk.Button(motor_panel, text="Apply Mapping", style="Accent.TButton", command=self.apply_config).grid(row=7, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        ttk.Label(motor_panel, text="CONVERSION", style="Section.TLabel").grid(row=7, column=0, columnspan=2, sticky="w", pady=(24, 6))
+        ttk.Label(motor_panel, textvariable=self.motor_conversion_var, style="Value.TLabel", wraplength=560, padding=10).grid(row=8, column=0, columnspan=2, sticky="ew")
+        ttk.Button(motor_panel, text="Apply Mapping", style="Accent.TButton", command=self.apply_config).grid(row=9, column=0, columnspan=2, sticky="ew", pady=(18, 0))
 
     def _update_comm_note(self) -> None:
         if self.comm_input_mode_var.get() == "Hex":
@@ -767,13 +935,23 @@ class ProbeApp(tk.Tk):
         if event.widget is not self:
             return
         if self.resize_log_job is not None:
-            self.after_cancel(self.resize_log_job)
-        self.resize_log_job = self.after(250, self._log_window_layout)
+            try:
+                self.after_cancel(self.resize_log_job)
+            except tk.TclError:
+                pass
+        try:
+            self.resize_log_job = self.after(250, self._log_window_layout)
+        except tk.TclError:
+            self.resize_log_job = None
 
     def _log_window_layout(self) -> None:
         self.resize_log_job = None
-        window_size = (self.winfo_width(), self.winfo_height())
-        control_width = getattr(self, "controls_panel", None).winfo_width() if hasattr(self, "controls_panel") else None
+        try:
+            window_size = (self.winfo_width(), self.winfo_height())
+            controls_panel = getattr(self, "controls_panel", None)
+            control_width = controls_panel.winfo_width() if controls_panel is not None and controls_panel.winfo_exists() else None
+        except tk.TclError:
+            return
 
         if window_size != self.last_logged_window_size:
             logger.info("Window resized: %sx%s.", window_size[0], window_size[1])
@@ -1001,6 +1179,8 @@ class ProbeApp(tk.Tk):
                 lead_xy_mm=float(self.lead_xy_var.get()),
                 lead_z_mm=float(self.lead_z_var.get()),
                 base_angle_deg=float(self.base_angle_var.get()),
+                cc_speed_percent=int(self.cc_speed_percent_var.get()),
+                cc_accel_time_s=float(self.cc_accel_time_var.get()),
                 calibrations=dict(self.probe_config.calibrations),
             )
             updated.validate()
@@ -1031,6 +1211,8 @@ class ProbeApp(tk.Tk):
         self.lead_xy_var.set(f"{self.probe_config.lead_xy_mm:g}")
         self.lead_z_var.set(f"{self.probe_config.lead_z_mm:g}")
         self.base_angle_var.set(f"{self.probe_config.base_angle_deg:g}")
+        self.cc_speed_percent_var.set(str(self.probe_config.cc_speed_percent))
+        self.cc_accel_time_var.set(f"{self.probe_config.cc_accel_time_s:g}")
 
     def _update_config_display(self) -> None:
         um_per_px = self.probe_config.current_um_per_px()
@@ -1044,6 +1226,7 @@ class ProbeApp(tk.Tk):
             f"X: {self.probe_config.um_per_pulse('X'):.6g} um/pulse, {self.probe_config.pulses_per_um('X'):.6g} pulse/um",
             f"Y: {self.probe_config.um_per_pulse('Y'):.6g} um/pulse, {self.probe_config.pulses_per_um('Y'):.6g} pulse/um",
             f"Z: {self.probe_config.um_per_pulse('Z'):.6g} um/pulse, {self.probe_config.pulses_per_um('Z'):.6g} pulse/um",
+            f"CC: speed {self.probe_config.cc_speed_percent}%, accel/decel {self.probe_config.cc_accel_time_s:.3g}s ({self.probe_config.cc_acceleration_units()} units)",
         ]
         self.motor_conversion_var.set("\n".join(conversion_lines))
 
@@ -1320,7 +1503,7 @@ class ProbeApp(tk.Tk):
         self.autofocus_status_var.set(f"Manual {direction}: {pulses} pulses")
         self.status_var.set(f"AutoFocus manual {direction}: {pulses} pulses.")
         logger.info("AutoFocus manual %s requested: %s pulses.", direction, pulses)
-        threading.Thread(target=self._move_axis_worker, args=("Z", Axis.Z, reverse, pulses, "autofocus manual", "Relative"), daemon=True).start()
+        threading.Thread(target=self._move_axis_worker, args=("Z", Axis.Z, reverse, pulses, "autofocus manual", "Relative", {"Z": target}), daemon=True).start()
 
     def set_autofocus_z_zero(self) -> None:
         if self.motion_busy:
@@ -1509,7 +1692,7 @@ class ProbeApp(tk.Tk):
         best_z = self.current_position_values["Z"]
         reached_threshold = False
         try:
-            entries = self.serial_client.read_stable_xyz_positions()
+            entries = self.serial_client.read_xyz_positions()
             self.result_queue.put(("read_positions", entries, "autofocus"))
             initial_sample_after = time.monotonic()
             center_z = self._z_from_position_entries(entries)
@@ -1660,9 +1843,8 @@ class ProbeApp(tk.Tk):
             reached = self.serial_client.wait_axis_reached(Axis.Z, timeout=max(5.0, abs(delta) / 100.0))
             reached_hex = hex_bytes(reached)
             logger.info("AutoFocus Z reached feedback: %s", colorize_hex_frame(reached_hex, "RX"))
-            time.sleep(0.1)
-            entries = self.serial_client.read_stable_xyz_positions()
-            self.result_queue.put(("read_positions", entries, "autofocus"))
+            entries = self.serial_client.read_xyz_positions()
+            self.result_queue.put(("read_positions", entries, "autofocus", {"Z": target_z}))
             current_z = self._z_from_position_entries(entries)
         sample_after = time.monotonic()
         scores = self._sample_focus_scores(after_time=sample_after, settle_delay=0.1, duration=0.36)
@@ -1810,7 +1992,7 @@ class ProbeApp(tk.Tk):
         initial_step = max(1, int(self.autofocus_step_var.get()))
         min_step = max(1, int(self.autofocus_min_step_var.get()))
         search_range = max(initial_step, int(self.autofocus_max_moves_var.get()))
-        entries = self.serial_client.read_stable_xyz_positions()
+        entries = self.serial_client.read_xyz_positions()
         center_z = self._z_from_position_entries(entries)
         current_z = center_z
         best_z = center_z
@@ -2099,7 +2281,7 @@ class ProbeApp(tk.Tk):
             self.position_edit_modes[axis] = None
             self.position_inputs[axis].configure(fg=self.colors["accent"], state="readonly", readonlybackground=self.colors["surface_2"])
         self._show_target_positions(targets)
-        threading.Thread(target=self._move_edited_positions_worker, args=(axes, modes, values), daemon=True).start()
+        threading.Thread(target=self._move_edited_positions_worker, args=(axes, modes, values, targets), daemon=True).start()
 
     def move_xyz_cc(self) -> None:
         if self.motion_busy:
@@ -2124,9 +2306,10 @@ class ProbeApp(tk.Tk):
             return
 
         self.motion_busy = True
+        targets = {axis: self.current_position_values[axis] + steps[axis] for axis in ("X", "Y", "Z") if steps[axis]}
         self.status_var.set(f"Running CC multi-axis relative move: X={steps['X']} Y={steps['Y']} Z={steps['Z']}.")
-        self._show_target_positions({axis: self.current_position_values[axis] + steps[axis] for axis in ("X", "Y", "Z")})
-        threading.Thread(target=self._move_xyz_cc_worker, args=(steps,), daemon=True).start()
+        self._show_target_positions(targets)
+        threading.Thread(target=self._move_xyz_cc_worker, args=(steps, targets), daemon=True).start()
 
     def emergency_stop(self) -> None:
         self.realtime_stop_event.set()
@@ -2181,9 +2364,9 @@ class ProbeApp(tk.Tk):
         else:
             self.motion_busy = True
         self.status_var.set(f"Moving {axis} {action_text}.")
-        threading.Thread(target=self._move_axis_worker, args=(axis, controller_axis, reverse, pulses, source, normalized_mode), daemon=True).start()
+        threading.Thread(target=self._move_axis_worker, args=(axis, controller_axis, reverse, pulses, source, normalized_mode, {axis: target}), daemon=True).start()
 
-    def _move_axis_worker(self, axis: str, controller_axis: Axis, reverse: bool, pulses: int, source: str, mode: str) -> None:
+    def _move_axis_worker(self, axis: str, controller_axis: Axis, reverse: bool, pulses: int, source: str, mode: str, expected_targets: dict[str, int]) -> None:
         assert self.serial_client is not None
         try:
             if mode == "Absolute":
@@ -2193,12 +2376,11 @@ class ProbeApp(tk.Tk):
                 command = self.serial_client.move_relative(axis=controller_axis, reverse=reverse, pulses=pulses, speed_percent=100)
                 action = "reverse" if reverse else "forward"
             self.result_queue.put(("motor_command", axis, action, command, source))
-            if source == "keyboard":
-                self.result_queue.put(("schedule_position_read", source))
-            else:
-                self.result_queue.put(("moving",))
-                entries = self.serial_client.read_stable_xyz_positions()
-                self.result_queue.put(("read_positions", entries, source))
+            reached = self.serial_client.wait_axis_reached(controller_axis, timeout=max(5.0, pulses / 100.0))
+            self.result_queue.put(("axis_done", axis, reached, source))
+            self.result_queue.put(("moving",))
+            entries = self.serial_client.read_xyz_positions()
+            self.result_queue.put(("read_positions", entries, source, expected_targets))
         except Exception as exc:
             self.result_queue.put(("motor_error", axis, exc))
         finally:
@@ -2210,14 +2392,14 @@ class ProbeApp(tk.Tk):
             command = self.serial_client.stop_axis(axis=controller_axis)
             self.result_queue.put(("motor_command", axis, "stop", command, "button"))
             self.result_queue.put(("moving",))
-            entries = self.serial_client.read_stable_xyz_positions()
-            self.result_queue.put(("read_positions", entries, "button"))
+            entries = self.serial_client.read_xyz_positions()
+            self.result_queue.put(("read_positions", entries, "button", expected_targets))
         except Exception as exc:
             self.result_queue.put(("motor_error", axis, exc))
         finally:
             self.result_queue.put(("motor_done",))
 
-    def _move_edited_positions_worker(self, axes: tuple[str, ...], modes: dict[str, str], values: dict[str, int]) -> None:
+    def _move_edited_positions_worker(self, axes: tuple[str, ...], modes: dict[str, str], values: dict[str, int], expected_targets: dict[str, int]) -> None:
         assert self.serial_client is not None
         try:
             if len(axes) == 1:
@@ -2235,6 +2417,9 @@ class ProbeApp(tk.Tk):
                     command = self.serial_client.move_relative(axis=controller_axis, reverse=value < 0, pulses=abs(value), speed_percent=100)
                     action = "relative"
                 self.result_queue.put(("motor_command", axis_name, action, command, "button"))
+                wait_pulses = abs(value) if modes[axis_name] == "Relative" else abs(value - self.current_position_values[axis_name])
+                reached = self.serial_client.wait_axis_reached(controller_axis, timeout=max(5.0, wait_pulses / 100.0))
+                self.result_queue.put(("axis_done", axis_name, reached, "button"))
             else:
                 axis_params: dict[Axis, tuple[bool, int, int, int]] = {}
                 for axis_name in axes:
@@ -2245,38 +2430,44 @@ class ProbeApp(tk.Tk):
                         delta = values[axis_name] - self.current_position_values[axis_name]
                     else:
                         delta = values[axis_name]
-                    axis_params[controller_axis] = (delta < 0, abs(delta), 100 if delta else 0, 0)
+                    axis_params[controller_axis] = self._cc_axis_param(delta < 0, abs(delta))
                 if not any(params[1] for params in axis_params.values()):
                     raise ValueError("CC move requires at least one non-zero relative delta.")
-                command = self.serial_client.move_multi_axis_relative(axis_params)
+                command, completed = self.serial_client.move_multi_axis_relative_and_wait(axis_params, timeout=self._cc_move_timeout(axis_params))
                 self.result_queue.put(("motor_command", "XYZ", "cc relative", command, "button"))
+                self.result_queue.put(("cc_done", completed, "button"))
 
             self.result_queue.put(("moving",))
-            entries = self.serial_client.read_stable_xyz_positions()
-            self.result_queue.put(("read_positions", entries, "button"))
+            entries = self.serial_client.read_xyz_positions()
+            self.result_queue.put(("read_positions", entries, "button", expected_targets))
         except Exception as exc:
             self.result_queue.put(("motor_error", "MOVE", exc))
         finally:
             self.result_queue.put(("motor_done",))
 
-    def _move_xyz_cc_worker(self, steps: dict[str, int]) -> None:
+    def _move_xyz_cc_worker(self, steps: dict[str, int], expected_targets: dict[str, int]) -> None:
         assert self.serial_client is not None
         try:
-            command = self.serial_client.move_multi_axis_relative(
-                {
-                    Axis.X: (False, steps["X"], 100, 0),
-                    Axis.Y: (False, steps["Y"], 100, 0),
-                    Axis.Z: (False, steps["Z"], 100, 0),
-                }
-            )
+            axis_params = {
+                Axis.X: self._cc_axis_param(False, steps["X"]),
+                Axis.Y: self._cc_axis_param(False, steps["Y"]),
+                Axis.Z: self._cc_axis_param(False, steps["Z"]),
+            }
+            command, completed = self.serial_client.move_multi_axis_relative_and_wait(axis_params, timeout=self._cc_move_timeout(axis_params))
             self.result_queue.put(("motor_command", "XYZ", "cc relative", command, "button"))
+            self.result_queue.put(("cc_done", completed, "button"))
             self.result_queue.put(("moving",))
-            entries = self.serial_client.read_stable_xyz_positions()
-            self.result_queue.put(("read_positions", entries, "button"))
+            entries = self.serial_client.read_xyz_positions()
+            self.result_queue.put(("read_positions", entries, "button", expected_targets))
         except Exception as exc:
             self.result_queue.put(("motor_error", "XYZ", exc))
         finally:
             self.result_queue.put(("motor_done",))
+
+    @staticmethod
+    def _cc_move_timeout(axis_params: dict[Axis, tuple[bool, int, int, int]]) -> float:
+        max_pulses = max((pulses for _reverse, pulses, _speed, _acceleration in axis_params.values()), default=0)
+        return max(5.0, max_pulses / 100.0)
 
     def _emergency_stop_worker(self) -> None:
         assert self.serial_client is not None
@@ -2392,7 +2583,8 @@ class ProbeApp(tk.Tk):
     def _handle_worker_event(self, event: tuple) -> None:
         event_type = event[0]
         if event_type == "read_positions":
-            _, entries, source = event
+            _, entries, source, *rest = event
+            expected_targets = rest[0] if rest else None
             self.position_read_pending = False
             positions: dict[str, int] = {}
             for command, response, position in entries:
@@ -2417,6 +2609,16 @@ class ProbeApp(tk.Tk):
             elif source == "zero_xyz":
                 self.autofocus_z_var.set("0")
                 self.status_var.set("X/Y/Z positions set to 0.")
+            if expected_targets:
+                mismatches = {
+                    axis: (expected, positions.get(axis))
+                    for axis, expected in expected_targets.items()
+                    if positions.get(axis) != expected
+                }
+                if mismatches:
+                    details = ", ".join(f"{axis} expected {expected} read {actual}" for axis, (expected, actual) in mismatches.items())
+                    self.status_var.set(f"Position mismatch after move: {details}")
+                    logger.warning("Position mismatch after %s move: %s.", source, details)
             logger.info(
                 "Position read: X=%s Y=%s Z=%s.",
                 positions.get("X", "-"),
@@ -2481,7 +2683,8 @@ class ProbeApp(tk.Tk):
             if session_id != self.camera_session_id:
                 return
             self._set_camera_index_error(True)
-            self.video_label.configure(text=f"Camera unavailable: {exc}", image="")
+            if self.vision_panel:
+                self.vision_panel.show_message(f"Camera unavailable: {exc}")
             self.status_var.set(str(exc))
             self.camera_running = False
             self.camera_rendering = False
@@ -2624,6 +2827,30 @@ class ProbeApp(tk.Tk):
             )
             return
 
+        if event_type == "axis_done":
+            _, axis, response, source = event
+            response_hex = hex_bytes(response)
+            self.rx_var.set(response_hex)
+            self._append_hex_history("RX", response_hex)
+            self.status_var.set(f"{axis} reached-position feedback received.")
+            logger.info(
+                "%s reached-position feedback from %s: %s",
+                axis,
+                source,
+                colorize_hex_frame(response_hex, "RX"),
+                extra={"repeat_key": "keyboard_motion"} if source == "keyboard" else None,
+            )
+            return
+
+        if event_type == "cc_done":
+            _, response, source = event
+            response_hex = hex_bytes(response)
+            self.rx_var.set(response_hex)
+            self._append_hex_history("RX", response_hex)
+            self.status_var.set("CC multi-axis move completed.")
+            logger.info("CC completed feedback from %s: %s", source, colorize_hex_frame(response_hex, "RX"))
+            return
+
         if event_type == "motor_error":
             _, axis, exc = event
             self.status_var.set(f"{axis} motor command failed: {exc}")
@@ -2698,7 +2925,8 @@ class ProbeApp(tk.Tk):
 
         if frame:
             self.camera_image = tk.PhotoImage(data=self._ppm_with_scalebar(frame.image_bgr), format="PPM")
-            self.video_label.configure(image=self.camera_image, text="")
+            if self.vision_panel:
+                self.vision_panel.set_image(self.camera_image)
             with self.focus_lock:
                 self.latest_focus_frame_ppm = frame.ppm_bytes
             with self.camera_lock:
@@ -2727,127 +2955,6 @@ class ProbeApp(tk.Tk):
         if self.serial_client:
             self.serial_client.close()
         super().destroy()
-
-
-class PixelCalibrationDialog(tk.Toplevel):
-    def __init__(self, parent: ProbeApp, image_bgr, colors: dict[str, str]) -> None:
-        super().__init__(parent)
-        self.title("Pixel Calibration")
-        self.configure(bg=colors["bg"])
-        self.transient(parent)
-        self.grab_set()
-        self.result_um_per_px: float | None = None
-        self.colors = colors
-        self.points_display: list[tuple[float, float]] = []
-        self.points_original: list[tuple[float, float]] = []
-        self.known_um_var = tk.StringVar(value="100")
-        self.result_var = tk.StringVar(value="Click three points: first two define a line, third measures perpendicular distance.")
-
-        import cv2
-
-        rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        original_height, original_width = rgb.shape[:2]
-        max_width, max_height = 820, 520
-        self.scale = min(max_width / original_width, max_height / original_height, 1.0)
-        if self.scale < 1.0:
-            display_width = max(1, int(original_width * self.scale))
-            display_height = max(1, int(original_height * self.scale))
-            rgb = cv2.resize(rgb, (display_width, display_height), interpolation=cv2.INTER_AREA)
-        else:
-            display_height, display_width = original_height, original_width
-        header = f"P6 {display_width} {display_height} 255\n".encode("ascii")
-        self.photo = tk.PhotoImage(data=header + rgb.tobytes(), format="PPM")
-
-        container = ttk.Frame(self, style="Panel.TFrame", padding=14)
-        container.grid(row=0, column=0, sticky="nsew")
-        container.columnconfigure(0, weight=1)
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
-
-        toolbar = ttk.Frame(container, style="Panel.TFrame")
-        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        toolbar.columnconfigure(4, weight=1)
-        ttk.Label(toolbar, text="Known distance (um)", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Entry(toolbar, textvariable=self.known_um_var, width=12).grid(row=0, column=1, sticky="w", padx=(0, 12))
-        ttk.Button(toolbar, text="Reset", command=self.reset_points).grid(row=0, column=2, sticky="w", padx=(0, 8))
-        self.save_button = ttk.Button(toolbar, text="Save Calibration", style="Accent.TButton", command=self.save_result, state="disabled")
-        self.save_button.grid(row=0, column=3, sticky="w")
-
-        self.canvas = tk.Canvas(container, width=display_width, height=display_height, bg="#05070a", highlightthickness=1, highlightbackground=colors["border"])
-        self.canvas.grid(row=1, column=0, sticky="nsew")
-        self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
-        self.canvas.bind("<Button-1>", self.on_click)
-
-        ttk.Label(container, textvariable=self.result_var, style="Status.TLabel", wraplength=820, padding=10).grid(row=2, column=0, sticky="ew", pady=(10, 0))
-        ttk.Button(container, text="Cancel", command=self.destroy).grid(row=3, column=0, sticky="e", pady=(10, 0))
-
-    def on_click(self, event: tk.Event) -> None:
-        if len(self.points_display) >= 3:
-            return
-        x = float(event.x)
-        y = float(event.y)
-        self.points_display.append((x, y))
-        self.points_original.append((x / self.scale, y / self.scale))
-        self.draw_overlay()
-        if len(self.points_display) == 3:
-            self.update_result()
-        else:
-            self.result_var.set(f"Point {len(self.points_display)} recorded. Click {3 - len(self.points_display)} more.")
-
-    def reset_points(self) -> None:
-        self.points_display.clear()
-        self.points_original.clear()
-        self.save_button.configure(state="disabled")
-        self.result_var.set("Click three points: first two define a line, third measures perpendicular distance.")
-        self.draw_overlay()
-
-    def draw_overlay(self) -> None:
-        self.canvas.delete("overlay")
-        if len(self.points_display) >= 2:
-            self.canvas.create_line(*self.points_display[0], *self.points_display[1], fill="#34d399", width=2, tags="overlay")
-        if len(self.points_display) >= 3:
-            p1, p2, p3 = self.points_display
-            foot = self._projection_foot(p1, p2, p3)
-            self.canvas.create_line(*p3, *foot, fill="#fbbf24", width=2, dash=(4, 3), tags="overlay")
-        for index, (x, y) in enumerate(self.points_display, start=1):
-            self.canvas.create_oval(x - 5, y - 5, x + 5, y + 5, fill="#60a5fa", outline="#dbeafe", width=1, tags="overlay")
-            self.canvas.create_text(x + 8, y - 8, text=str(index), fill="#e5edf5", anchor="sw", font=("Segoe UI Semibold", 10), tags="overlay")
-
-    def update_result(self) -> None:
-        try:
-            known_um = float(self.known_um_var.get())
-            if known_um <= 0:
-                raise ValueError("Known distance must be positive.")
-            distance_px = calibration_distance_px(*self.points_original)
-            if distance_px <= 0:
-                raise ValueError("Pixel distance must be positive.")
-        except ValueError as exc:
-            self.result_var.set(str(exc))
-            self.save_button.configure(state="disabled")
-            return
-
-        self.result_um_per_px = known_um / distance_px
-        self.result_var.set(f"Distance: {distance_px:.3f} px, calibration: {self.result_um_per_px:.6g} um/px")
-        self.save_button.configure(state="normal")
-
-    def save_result(self) -> None:
-        if self.result_um_per_px is None:
-            messagebox.showerror("Pixel Calibration", "Complete three-point calibration before saving.", parent=self)
-            return
-        self.destroy()
-
-    @staticmethod
-    def _projection_foot(p1: tuple[float, float], p2: tuple[float, float], p3: tuple[float, float]) -> tuple[float, float]:
-        x1, y1 = p1
-        x2, y2 = p2
-        x3, y3 = p3
-        dx = x2 - x1
-        dy = y2 - y1
-        length_sq = dx * dx + dy * dy
-        if length_sq <= 0:
-            return p1
-        t = ((x3 - x1) * dx + (y3 - y1) * dy) / length_sq
-        return x1 + t * dx, y1 + t * dy
 
 
 def main() -> None:

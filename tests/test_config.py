@@ -23,6 +23,9 @@ class ProbeConfigTest(unittest.TestCase):
         self.assertEqual(pulses_from_um(1000.0, config, "X"), 1000)
         self.assertEqual(pulses_from_um(1000.0, config, "Y"), 1000)
         self.assertEqual(pulses_from_um(1000.0, config, "Z"), 2000)
+        self.assertEqual(config.cc_speed_percent, 100)
+        self.assertAlmostEqual(config.cc_accel_time_s, 0.1)
+        self.assertEqual(config.cc_acceleration_units(), 10)
 
     def test_calibration_lookup_is_per_lens_combination(self) -> None:
         config = ProbeConfig()
@@ -39,7 +42,7 @@ class ProbeConfigTest(unittest.TestCase):
     def test_json_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / DEFAULT_CONFIG_FILENAME
-            config = ProbeConfig(objective=5, eyepiece=2.5, microstep=4, lead_xy_mm=2.0, lead_z_mm=1.0)
+            config = ProbeConfig(objective=5, eyepiece=2.5, microstep=4, lead_xy_mm=2.0, lead_z_mm=1.0, cc_speed_percent=80, cc_accel_time_s=0.2)
             config.set_calibration(5, 2.5, 1.25)
 
             save_probe_config(config, path)
@@ -50,6 +53,8 @@ class ProbeConfigTest(unittest.TestCase):
             self.assertEqual(loaded.microstep, 4)
             self.assertEqual(loaded.lead_xy_mm, 2.0)
             self.assertEqual(loaded.lead_z_mm, 1.0)
+            self.assertEqual(loaded.cc_speed_percent, 80)
+            self.assertAlmostEqual(loaded.cc_accel_time_s, 0.2)
             self.assertAlmostEqual(loaded.current_um_per_px(), 1.25)
 
     def test_three_point_distance(self) -> None:
