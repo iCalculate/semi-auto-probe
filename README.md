@@ -14,6 +14,8 @@ Python control software scaffold for a 4-axis RS-232 controller used as a 3-axis
   - connect/disconnect
   - communication test button
   - live USB camera preview
+  - autofocus workspace
+  - image stitching workspace with serpentine traversal, phase-correlation registration, flat-field correction, and optional four-corner plane compensation
 
 ## Setup
 

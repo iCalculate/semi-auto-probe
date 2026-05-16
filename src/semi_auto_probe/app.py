@@ -9,6 +9,7 @@ from pathlib import Path
 from tkinter import ttk
 
 from .camera import UsbCamera
+from .img_stitch import compose_mosaic, estimate_overlap_shift, fit_plane, flat_field_correct, serpentine_indices
 from .logging_utils import colorize_hex_frame, configure_logging, print_startup_banner
 from .protocol import COMM_TEST_COMMAND, FUNCTION_READ_POSITION, RESPONSE_HEAD, Axis, AxisPosition, hex_bytes, parse_axis_position_response
 from .serial_client import ControllerSerialClient, CommunicationTestResult, list_serial_ports
@@ -41,6 +42,12 @@ class ProbeApp(tk.Tk):
         self.autofocus_stop_event = threading.Event()
         self.autofocus_thread: threading.Thread | None = None
         self.autofocus_running = False
+        self.autofocus_restore_realtime = False
+        self.imgstitch_stop_event = threading.Event()
+        self.imgstitch_thread: threading.Thread | None = None
+        self.imgstitch_running = False
+        self.imgstitch_restore_realtime = False
+        self.latest_stitch_frame = None
 
         self.port_var = tk.StringVar()
         self.camera_index_var = tk.StringVar(value="0")
@@ -73,6 +80,8 @@ class ProbeApp(tk.Tk):
         self.autofocus_run_start_time: float | None = None
         self.autofocus_run_end_time: float | None = None
         self.autofocus_camera_image: tk.PhotoImage | None = None
+        self.imgstitch_camera_image: tk.PhotoImage | None = None
+        self.imgstitch_preview_image: tk.PhotoImage | None = None
         self.position_vars = {
             "X": tk.StringVar(value="0"),
             "Y": tk.StringVar(value="0"),
@@ -105,6 +114,14 @@ class ProbeApp(tk.Tk):
         self.resize_log_job: str | None = None
         self.last_logged_window_size: tuple[int, int] | None = None
         self.last_logged_control_width: int | None = None
+        self.imgstitch_rows_var = tk.StringVar(value="3")
+        self.imgstitch_cols_var = tk.StringVar(value="3")
+        self.imgstitch_overlap_x_var = tk.StringVar(value="120")
+        self.imgstitch_overlap_y_var = tk.StringVar(value="90")
+        self.imgstitch_step_x_var = tk.StringVar(value="1000")
+        self.imgstitch_step_y_var = tk.StringVar(value="1000")
+        self.imgstitch_plane_af_var = tk.BooleanVar(value=False)
+        self.imgstitch_status_var = tk.StringVar(value="Idle")
 
         self._configure_theme()
         self._build_ui()
@@ -216,7 +233,7 @@ class ProbeApp(tk.Tk):
         self.tab_buttons: dict[str, tk.Label] = {}
         tab_bar = ttk.Frame(content, style="App.TFrame")
         tab_bar.grid(row=0, column=0, sticky="w")
-        for col, name in enumerate(("Main", "Communication", "AutoFocus")):
+        for col, name in enumerate(("Main", "Communication", "AutoFocus", "ImgStitch")):
             tab_bar.columnconfigure(col, weight=1, uniform="top_tabs", minsize=156)
             label = tk.Label(
                 tab_bar,
@@ -245,13 +262,15 @@ class ProbeApp(tk.Tk):
         main_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         communication_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         autofocus_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
-        self.pages = {"Main": main_page, "Communication": communication_page, "AutoFocus": autofocus_page}
+        imgstitch_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
+        self.pages = {"Main": main_page, "Communication": communication_page, "AutoFocus": autofocus_page, "ImgStitch": imgstitch_page}
         for page in self.pages.values():
             page.grid(row=0, column=0, sticky="nsew")
 
         self._build_main_page(main_page)
         self._build_communication_page(communication_page)
         self._build_autofocus_page(autofocus_page)
+        self._build_imgstitch_page(imgstitch_page)
         self.show_page("Main")
 
     def show_page(self, name: str) -> None:
@@ -542,6 +561,48 @@ class ProbeApp(tk.Tk):
         ttk.Button(control_panel, text="Set Z=0", command=self.set_autofocus_z_zero).grid(row=13, column=0, sticky="ew", pady=(8, 0))
         ttk.Button(control_panel, text="Stop", style="Danger.TButton", command=self.stop_autofocus).grid(row=14, column=0, sticky="ew", pady=(8, 0))
         ttk.Label(control_panel, textvariable=self.autofocus_status_var, style="Status.TLabel", wraplength=190, padding=10).grid(row=15, column=0, sticky="ew", pady=(16, 0))
+
+    def _build_imgstitch_page(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=0)
+        parent.rowconfigure(0, weight=1)
+
+        preview_panel = ttk.Frame(parent, style="Panel.TFrame", padding=14)
+        preview_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        preview_panel.columnconfigure(0, weight=1)
+        preview_panel.rowconfigure(1, weight=1)
+        preview_panel.rowconfigure(3, weight=1)
+
+        ttk.Label(preview_panel, text="IMG STITCH", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 10))
+        self.imgstitch_live_label = ttk.Label(preview_panel, anchor="center", text="Camera preview", style="Video.TLabel")
+        self.imgstitch_live_label.grid(row=1, column=0, sticky="nsew")
+        ttk.Label(preview_panel, text="MOSAIC PREVIEW", style="Section.TLabel").grid(row=2, column=0, sticky="w", pady=(12, 10))
+        self.imgstitch_mosaic_label = ttk.Label(preview_panel, anchor="center", text="No mosaic yet", style="Video.TLabel")
+        self.imgstitch_mosaic_label.grid(row=3, column=0, sticky="nsew")
+
+        control_panel = ttk.Frame(parent, style="Panel.TFrame", padding=14)
+        control_panel.grid(row=0, column=1, sticky="ns")
+        control_panel.columnconfigure(0, weight=1)
+        ttk.Label(control_panel, text="GRID", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+
+        fields = (
+            ("Rows", self.imgstitch_rows_var),
+            ("Cols", self.imgstitch_cols_var),
+            ("Overlap X (px)", self.imgstitch_overlap_x_var),
+            ("Overlap Y (px)", self.imgstitch_overlap_y_var),
+            ("Step X (pulse)", self.imgstitch_step_x_var),
+            ("Step Y (pulse)", self.imgstitch_step_y_var),
+        )
+        row = 1
+        for label, variable in fields:
+            ttk.Label(control_panel, text=label, style="Muted.TLabel").grid(row=row, column=0, sticky="w", pady=(12, 4))
+            ttk.Spinbox(control_panel, from_=1, to=1_000_000, increment=1, textvariable=variable, width=14).grid(row=row + 1, column=0, sticky="ew")
+            row += 2
+
+        ttk.Checkbutton(control_panel, text="Four-corner plane AF", variable=self.imgstitch_plane_af_var).grid(row=row, column=0, sticky="w", pady=(16, 0))
+        ttk.Button(control_panel, text="Start Stitch", style="Accent.TButton", command=self.start_imgstitch).grid(row=row + 1, column=0, sticky="ew", pady=(16, 0))
+        ttk.Button(control_panel, text="Stop", style="Danger.TButton", command=self.stop_imgstitch).grid(row=row + 2, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(control_panel, textvariable=self.imgstitch_status_var, style="Status.TLabel", wraplength=190, padding=10).grid(row=row + 3, column=0, sticky="ew", pady=(16, 0))
 
     def _update_comm_note(self) -> None:
         if self.comm_input_mode_var.get() == "Hex":
@@ -1098,6 +1159,10 @@ class ProbeApp(tk.Tk):
             self.autofocus_status_var.set("AutoFocus settings must be positive.")
             return
 
+        self.autofocus_restore_realtime = self.realtime_enabled
+        if self.realtime_enabled:
+            self.disable_realtime_position()
+
         self.autofocus_running = True
         run_start = time.monotonic()
         with self.focus_lock:
@@ -1361,6 +1426,221 @@ class ProbeApp(tk.Tk):
         score = scores.get(metric, 0.0)
         self._record_autofocus_sample(metric, current_z, score, 1 if delta >= 0 else -1, command_hex=command_hex, reached_hex=reached_hex, stage=stage, scores=scores)
         return score, current_z
+
+    def start_imgstitch(self) -> None:
+        if self.imgstitch_running or self.motion_busy:
+            return
+        if not self.serial_client:
+            self.connect_serial()
+        if not self.serial_client:
+            return
+        try:
+            rows = int(self.imgstitch_rows_var.get())
+            cols = int(self.imgstitch_cols_var.get())
+            overlap_x = int(self.imgstitch_overlap_x_var.get())
+            overlap_y = int(self.imgstitch_overlap_y_var.get())
+            step_x = int(self.imgstitch_step_x_var.get())
+            step_y = int(self.imgstitch_step_y_var.get())
+        except ValueError:
+            self.imgstitch_status_var.set("Stitch settings must be integers.")
+            return
+        if min(rows, cols, overlap_x, overlap_y, step_x, step_y) <= 0:
+            self.imgstitch_status_var.set("Stitch settings must be positive.")
+            return
+        if self.imgstitch_plane_af_var.get() and (rows < 2 or cols < 2):
+            self.imgstitch_status_var.set("Plane AF requires at least a 2x2 grid.")
+            return
+
+        self.imgstitch_restore_realtime = self.realtime_enabled
+        if self.realtime_enabled:
+            self.disable_realtime_position()
+        self.autofocus_stop_event.clear()
+        self.imgstitch_running = True
+        self.motion_busy = True
+        self.imgstitch_stop_event.clear()
+        self.imgstitch_status_var.set("Running")
+        self.status_var.set("ImgStitch running.")
+        self.imgstitch_thread = threading.Thread(
+            target=self._imgstitch_worker,
+            args=(rows, cols, overlap_x, overlap_y, step_x, step_y, self.imgstitch_plane_af_var.get()),
+            daemon=True,
+        )
+        self.imgstitch_thread.start()
+
+    def stop_imgstitch(self) -> None:
+        self.imgstitch_stop_event.set()
+        self.autofocus_stop_event.set()
+        self.imgstitch_status_var.set("Stopping")
+
+    def _imgstitch_worker(
+        self,
+        rows: int,
+        cols: int,
+        overlap_x: int,
+        overlap_y: int,
+        step_x: int,
+        step_y: int,
+        use_plane_af: bool,
+    ) -> None:
+        assert self.serial_client is not None
+        try:
+            entries = self.serial_client.read_stable_xyz_positions()
+            origin_x = self._axis_from_position_entries(entries, Axis.X)
+            origin_y = self._axis_from_position_entries(entries, Axis.Y)
+            origin_z = self._axis_from_position_entries(entries, Axis.Z)
+            plane = None
+            if use_plane_af:
+                self.result_queue.put(("imgstitch_status", "Running four-corner AF"))
+                plane = self._fit_imgstitch_plane(origin_x, origin_y, origin_z, rows, cols, step_x, step_y)
+                self._move_absolute_stage(origin_x, origin_y, origin_z)
+
+            tiles: dict[tuple[int, int], object] = {}
+            positions: dict[tuple[int, int], tuple[float, float]] = {}
+            previous_key: tuple[int, int] | None = None
+            for index, key in enumerate(serpentine_indices(rows, cols), start=1):
+                if self.imgstitch_stop_event.is_set():
+                    break
+                row, col = key
+                target_x = origin_x + col * step_x
+                target_y = origin_y + row * step_y
+                target_z = round(plane.z_at(target_x, target_y)) if plane else origin_z
+                self._move_absolute_stage(target_x, target_y, target_z)
+                image = self._capture_stitch_frame()
+                corrected = flat_field_correct(image)
+                tiles[key] = corrected
+                if previous_key is None:
+                    positions[key] = (0.0, 0.0)
+                else:
+                    previous_row, previous_col = previous_key
+                    if row == previous_row and col > previous_col:
+                        direction = "right"
+                    elif row == previous_row and col < previous_col:
+                        direction = "left"
+                    else:
+                        direction = "down"
+                    dx, dy, response = estimate_overlap_shift(tiles[previous_key], corrected, direction, overlap_x, overlap_y)
+                    previous_x, previous_y = positions[previous_key]
+                    positions[key] = (previous_x + dx, previous_y + dy)
+                    self.result_queue.put(("imgstitch_status", f"Tile {index}/{rows * cols}, phase response {response:.3f}"))
+                previous_key = key
+                mosaic = compose_mosaic(tiles, positions)
+                self.result_queue.put(("imgstitch_preview", mosaic))
+            if tiles and not self.imgstitch_stop_event.is_set():
+                mosaic = compose_mosaic(tiles, positions)
+                output_path = Path.cwd() / "last_imgstitch.png"
+                import cv2
+
+                cv2.imwrite(str(output_path), mosaic)
+                self.result_queue.put(("imgstitch_done", output_path))
+            elif self.imgstitch_stop_event.is_set():
+                self.result_queue.put(("imgstitch_status", "Stopped"))
+        except Exception as exc:
+            self.result_queue.put(("imgstitch_error", exc))
+        finally:
+            self.result_queue.put(("imgstitch_finished",))
+
+    def _fit_imgstitch_plane(self, origin_x: int, origin_y: int, origin_z: int, rows: int, cols: int, step_x: int, step_y: int):
+        corners = (
+            (origin_x, origin_y),
+            (origin_x + (cols - 1) * step_x, origin_y),
+            (origin_x, origin_y + (rows - 1) * step_y),
+            (origin_x + (cols - 1) * step_x, origin_y + (rows - 1) * step_y),
+        )
+        samples: list[tuple[float, float, float]] = []
+        for index, (x_value, y_value) in enumerate(corners, start=1):
+            if self.imgstitch_stop_event.is_set():
+                break
+            self.result_queue.put(("imgstitch_status", f"Plane AF corner {index}/4"))
+            self._move_absolute_stage(x_value, y_value, origin_z)
+            best_z = self._quick_autofocus_at_current_xy()
+            samples.append((x_value, y_value, best_z))
+        if len(samples) < 3:
+            raise RuntimeError("Plane AF stopped before enough samples were collected.")
+        return fit_plane(samples)
+
+    def _quick_autofocus_at_current_xy(self) -> int:
+        metric = self.focus_metric_var.get()
+        initial_step = max(1, int(self.autofocus_step_var.get()))
+        min_step = max(1, int(self.autofocus_min_step_var.get()))
+        search_range = max(initial_step, int(self.autofocus_max_moves_var.get()))
+        entries = self.serial_client.read_stable_xyz_positions()
+        center_z = self._z_from_position_entries(entries)
+        current_z = center_z
+        best_z = center_z
+        best_score = self._sample_focus_score(metric)
+        sampled_positions = {center_z}
+        step = initial_step
+        for offset in range(step, search_range + 1, step):
+            for signed_offset in (offset, -offset):
+                if self.imgstitch_stop_event.is_set():
+                    return best_z
+                target_z = center_z + signed_offset
+                if target_z in sampled_positions:
+                    continue
+                score, current_z = self._autofocus_move_to_z(target_z, current_z, metric, stage="plane_af")
+                sampled_positions.add(current_z)
+                if score > best_score:
+                    best_score = score
+                    best_z = current_z
+        refine_step = max(initial_step // 2, min_step)
+        while refine_step >= min_step and not self.imgstitch_stop_event.is_set():
+            for target_z in (best_z + refine_step, best_z - refine_step):
+                if target_z in sampled_positions:
+                    continue
+                score, current_z = self._autofocus_move_to_z(target_z, current_z, metric, stage="plane_af")
+                sampled_positions.add(current_z)
+                if score > best_score:
+                    best_score = score
+                    best_z = current_z
+            refine_step //= 2
+        if current_z != best_z:
+            _, current_z = self._autofocus_move_to_z(best_z, current_z, metric, stage="plane_af_final")
+        return best_z
+
+    def _move_absolute_stage(self, x_value: int, y_value: int, z_value: int) -> None:
+        assert self.serial_client is not None
+        entries = self.serial_client.read_stable_xyz_positions()
+        current_x = self._axis_from_position_entries(entries, Axis.X)
+        current_y = self._axis_from_position_entries(entries, Axis.Y)
+        current_z = self._axis_from_position_entries(entries, Axis.Z)
+        for axis, target, current in ((Axis.X, x_value, current_x), (Axis.Y, y_value, current_y), (Axis.Z, z_value, current_z)):
+            delta = target - current
+            if not delta:
+                continue
+            self.serial_client.move_relative(axis=axis, reverse=delta < 0, pulses=abs(delta), speed_percent=100)
+            self.serial_client.wait_axis_reached(axis, timeout=max(5.0, abs(delta) / 100.0))
+        entries = self.serial_client.read_stable_xyz_positions()
+        self.result_queue.put(("read_positions", entries, "imgstitch"))
+
+    def _capture_stitch_frame(self):
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and not self.imgstitch_stop_event.is_set():
+            with self.camera_lock:
+                frame = self.latest_stitch_frame
+            if frame is not None:
+                return frame.copy()
+            time.sleep(0.03)
+        raise RuntimeError("No camera frame available for stitching.")
+
+    def _axis_from_position_entries(self, entries: list[tuple[bytes, bytes, AxisPosition]], axis: Axis) -> int:
+        for _command, _response, position in entries:
+            if position.axis == axis:
+                return position.position
+        return self.current_position_values[axis.name]
+
+    def _show_imgstitch_preview(self, image_bgr) -> None:
+        import cv2
+
+        rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        max_width = 700
+        max_height = 280
+        scale = min(max_width / rgb.shape[1], max_height / rgb.shape[0], 1.0)
+        if scale < 1.0:
+            rgb = cv2.resize(rgb, (int(rgb.shape[1] * scale), int(rgb.shape[0] * scale)), interpolation=cv2.INTER_AREA)
+        height, width = rgb.shape[:2]
+        header = f"P6 {width} {height} 255\n".encode("ascii")
+        self.imgstitch_preview_image = tk.PhotoImage(data=header + rgb.tobytes(), format="PPM")
+        self.imgstitch_mosaic_label.configure(image=self.imgstitch_preview_image, text="")
 
     def toggle_realtime_position(self) -> None:
         if self.realtime_enabled:
@@ -1832,6 +2112,8 @@ class ProbeApp(tk.Tk):
                 self.autofocus_status_var.set("Moving, score sampling")
             elif source == "autofocus manual":
                 self.autofocus_status_var.set("Manual Z move completed")
+            elif source == "imgstitch":
+                self.imgstitch_status_var.set("Stage moved")
             elif source == "zero_z":
                 self.autofocus_status_var.set("Z set to 0")
                 self.status_var.set("Z position set to 0.")
@@ -1961,7 +2243,46 @@ class ProbeApp(tk.Tk):
                 self.autofocus_run_end_time = time.monotonic()
             if self.autofocus_status_var.get() == "Stopping":
                 self.autofocus_status_var.set("Stopped")
+            if self.autofocus_restore_realtime and not self.realtime_enabled and self.serial_client:
+                self.autofocus_restore_realtime = False
+                self.toggle_realtime_position()
             logger.info("AutoFocus stopped.")
+            return
+
+        if event_type == "imgstitch_status":
+            _, message = event
+            self.imgstitch_status_var.set(str(message))
+            self.status_var.set(str(message))
+            logger.info("ImgStitch: %s", message)
+            return
+
+        if event_type == "imgstitch_preview":
+            _, mosaic = event
+            self._show_imgstitch_preview(mosaic)
+            return
+
+        if event_type == "imgstitch_done":
+            _, output_path = event
+            self.imgstitch_status_var.set(f"Saved {output_path.name}")
+            self.status_var.set(f"ImgStitch saved: {output_path}")
+            logger.info("ImgStitch saved to %s.", output_path)
+            return
+
+        if event_type == "imgstitch_error":
+            _, exc = event
+            self.imgstitch_status_var.set(f"Failed: {exc}")
+            self.status_var.set(f"ImgStitch failed: {exc}")
+            logger.error("ImgStitch failed: %s", exc)
+            return
+
+        if event_type == "imgstitch_finished":
+            self.imgstitch_running = False
+            self.motion_busy = False
+            if self.imgstitch_status_var.get() == "Stopping":
+                self.imgstitch_status_var.set("Stopped")
+            if self.imgstitch_restore_realtime and not self.realtime_enabled and self.serial_client:
+                self.imgstitch_restore_realtime = False
+                self.toggle_realtime_position()
             return
 
         if event_type == "motor_command":
@@ -2059,15 +2380,21 @@ class ProbeApp(tk.Tk):
             self.video_label.configure(image=self.camera_image, text="")
             with self.focus_lock:
                 self.latest_focus_frame_ppm = frame.ppm_bytes
+            with self.camera_lock:
+                self.latest_stitch_frame = frame.image_bgr
             if hasattr(self, "autofocus_video_label") and not self.autofocus_running:
                 self.autofocus_camera_image = tk.PhotoImage(data=frame.ppm_bytes, format="PPM")
                 self.autofocus_video_label.configure(image=self.autofocus_camera_image, text="")
+            if hasattr(self, "imgstitch_live_label") and not self.imgstitch_running:
+                self.imgstitch_camera_image = tk.PhotoImage(data=frame.ppm_bytes, format="PPM")
+                self.imgstitch_live_label.configure(image=self.imgstitch_camera_image, text="")
             self._update_focus_scores(frame.focus_scores)
 
         self.after(15, self._update_camera_frame)
 
     def destroy(self) -> None:
         self.autofocus_stop_event.set()
+        self.imgstitch_stop_event.set()
         self.realtime_stop_event.set()
         if self.realtime_enabled and self.serial_client:
             try:
