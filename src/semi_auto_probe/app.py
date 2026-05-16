@@ -30,6 +30,7 @@ class ProbeApp(tk.Tk):
         self.latest_camera_frame = None
         self.camera_lock = threading.Lock()
         self.camera_thread: threading.Thread | None = None
+        self.camera_session_id = 0
         self.result_queue: queue.Queue[object] = queue.Queue()
         self.realtime_stop_event = threading.Event()
         self.realtime_thread: threading.Thread | None = None
@@ -117,6 +118,7 @@ class ProbeApp(tk.Tk):
         style.configure("TCombobox", fieldbackground=self.colors["surface_2"], background=self.colors["surface_2"], foreground=self.colors["text"], bordercolor=self.colors["border"], arrowcolor=self.colors["muted"], padding=5)
         style.map("TCombobox", fieldbackground=[("readonly", self.colors["surface_2"])], foreground=[("readonly", self.colors["text"])])
         style.configure("TSpinbox", fieldbackground=self.colors["surface_2"], background=self.colors["surface_2"], foreground=self.colors["text"], bordercolor=self.colors["border"], arrowcolor=self.colors["muted"], padding=5)
+        style.configure("Error.TSpinbox", fieldbackground="#3f1018", background="#3f1018", foreground="#fecdd3", bordercolor="#be123c", arrowcolor="#fecdd3", padding=5)
         style.configure("TNotebook", background=self.colors["bg"], borderwidth=0)
         style.configure("TNotebook.Tab", background=self.colors["surface"], foreground=self.colors["muted"], padding=(18, 9), borderwidth=0)
         style.map("TNotebook.Tab", background=[("selected", self.colors["surface_2"]), ("active", self.colors["surface_3"])], foreground=[("selected", self.colors["text"]), ("active", self.colors["text"])])
@@ -148,7 +150,8 @@ class ProbeApp(tk.Tk):
         ttk.Button(toolbar, text="Test", command=self.run_comm_test).grid(row=0, column=4, padx=(0, 12))
 
         ttk.Label(toolbar, text="CAM", style="Muted.TLabel").grid(row=0, column=5, padx=(0, 6))
-        ttk.Spinbox(toolbar, from_=0, to=8, textvariable=self.camera_index_var, width=3).grid(row=0, column=6, padx=(0, 6), ipady=1)
+        self.camera_index_spinbox = ttk.Spinbox(toolbar, from_=0, to=8, textvariable=self.camera_index_var, width=3)
+        self.camera_index_spinbox.grid(row=0, column=6, padx=(0, 6), ipady=1)
         ttk.Button(toolbar, text="Restart", command=self.restart_camera).grid(row=0, column=7, padx=(0, 10))
         ttk.Button(toolbar, text="EMERGENCY STOP", style="Danger.TButton", command=self.emergency_stop).grid(row=0, column=8)
 
@@ -977,12 +980,22 @@ class ProbeApp(tk.Tk):
             return
 
         if event_type == "camera_error":
-            _, exc = event
+            _, session_id, exc = event
+            if session_id != self.camera_session_id:
+                return
+            self._set_camera_index_error(True)
             self.video_label.configure(text=f"Camera unavailable: {exc}", image="")
             self.status_var.set(str(exc))
             self.camera_running = False
             self.camera_rendering = False
             logger.error("Camera unavailable: %s", exc)
+            return
+
+        if event_type == "camera_ready":
+            _, session_id = event
+            if session_id != self.camera_session_id:
+                return
+            self._set_camera_index_error(False)
             return
 
         if event_type == "realtime_position":
@@ -1040,14 +1053,20 @@ class ProbeApp(tk.Tk):
             index = int(self.camera_index_var.get())
         except ValueError:
             self.status_var.set("Camera index must be an integer.")
+            self._set_camera_index_error(True)
             logger.warning("Camera start skipped because index is not an integer: %s", self.camera_index_var.get())
             return
 
+        self.camera_session_id += 1
+        session_id = self.camera_session_id
+        self._set_camera_index_error(False)
+        with self.camera_lock:
+            self.latest_camera_frame = None
         self.camera = UsbCamera(index=index, width=800, height=450)
         self.camera_running = True
         self.camera_rendering = True
         logger.info("Starting USB camera preview on index %s.", index)
-        self.camera_thread = threading.Thread(target=self._camera_worker, daemon=True)
+        self.camera_thread = threading.Thread(target=self._camera_worker, args=(session_id, self.camera), daemon=True)
         self.camera_thread.start()
         self._update_camera_frame()
 
@@ -1057,23 +1076,32 @@ class ProbeApp(tk.Tk):
         self.start_camera()
 
     def stop_camera(self) -> None:
+        self.camera_session_id += 1
         self.camera_running = False
         self.camera_rendering = False
         if self.camera:
             self.camera.close()
         self.camera = None
 
-    def _camera_worker(self) -> None:
-        assert self.camera is not None
-        while self.camera_running and self.camera:
+    def _camera_worker(self, session_id: int, camera: UsbCamera) -> None:
+        reported_ready = False
+        while self.camera_running and session_id == self.camera_session_id:
             try:
-                frame = self.camera.read()
+                frame = camera.read()
             except Exception as exc:
-                self.result_queue.put(("camera_error", exc))
+                self.result_queue.put(("camera_error", session_id, exc))
                 return
             if frame:
+                if not reported_ready:
+                    self.result_queue.put(("camera_ready", session_id))
+                    reported_ready = True
                 with self.camera_lock:
                     self.latest_camera_frame = frame
+        camera.close()
+
+    def _set_camera_index_error(self, is_error: bool) -> None:
+        if hasattr(self, "camera_index_spinbox"):
+            self.camera_index_spinbox.configure(style="Error.TSpinbox" if is_error else "TSpinbox")
 
     def _update_camera_frame(self) -> None:
         if not self.camera_rendering:

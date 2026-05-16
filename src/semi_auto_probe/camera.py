@@ -31,6 +31,9 @@ class UsbCamera:
         except ImportError as exc:
             raise RuntimeError("Missing dependency: install opencv-python with `pip install -r requirements.txt`.") from exc
 
+        if hasattr(cv2, "setLogLevel"):
+            cv2.setLogLevel(0)
+
         if self.is_open:
             return
 
