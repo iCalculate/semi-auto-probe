@@ -11,11 +11,17 @@ dependencies = [
   "pyserial>=3.5",
   "opencv-python>=4.8",
   "numpy>=1.26",
+  "fastapi>=0.111",
+  "uvicorn[standard]>=0.30",
 ]
 
 [project.scripts]
 semi-auto-probe = "semi_auto_probe.app:main"
 semi-auto-probe-test = "semi_auto_probe.cli:main"
+semi-auto-probe-web = "semi_auto_probe.web_app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+semi_auto_probe = ["web/static/*"]

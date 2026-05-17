@@ -31,7 +31,9 @@ Thumbs.db
 # Local probe configuration and runtime outputs
 probe_config.local.json
 last_imgstitch*.png
+imgstitch_session/
 last_autofocus_history*.csv
 tmp_check*
 tmp_output*
 *.tmp
+.runtime/

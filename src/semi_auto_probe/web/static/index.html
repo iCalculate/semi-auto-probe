@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Semi Auto Probe Monitor</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>Semi Auto Probe</h1>
+          <p>Remote monitoring dashboard</p>
+        </div>
+        <time id="clock">--:--:--</time>
+      </header>
+
+      <section class="statusGrid">
+        <article class="metric">
+          <span>Desktop App</span>
+          <strong id="desktopState">Unknown</strong>
+        </article>
+        <article class="metric">
+          <span>Camera Feed</span>
+          <strong id="cameraState">Unknown</strong>
+        </article>
+        <article class="metric">
+          <span>Serial Link</span>
+          <strong id="serialState">Unknown</strong>
+        </article>
+        <article class="metric">
+          <span>Monitor Rate</span>
+          <strong id="rateState">1 FPS</strong>
+        </article>
+      </section>
+
+      <section class="mainGrid">
+        <section class="panel visionPanel">
+          <div class="panelHead">
+            <h2>Optical View</h2>
+            <span class="pill" id="feedPill">Standby</span>
+          </div>
+          <div class="videoBox" id="videoBox">
+            <img id="cameraFeed" alt="" />
+            <div class="emptyState" id="cameraEmpty">
+              <strong>Camera stream is starting</strong>
+              <span>The dashboard will use the local desktop feed when available, otherwise it opens the camera directly.</span>
+            </div>
+          </div>
+        </section>
+
+        <aside class="sideStack">
+          <section class="panel">
+            <h2>Camera Source</h2>
+            <div class="sourceRow">
+              <select id="cameraSource"></select>
+              <button id="applySource">Apply</button>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panelHead">
+              <h2>Stage Position</h2>
+              <span class="pill" id="positionPill">Idle</span>
+            </div>
+            <div class="axisGrid">
+              <div><span>X</span><strong id="posX">-</strong></div>
+              <div><span>Y</span><strong id="posY">-</strong></div>
+              <div><span>Z</span><strong id="posZ">-</strong></div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <h2>Access</h2>
+            <label>Access Token</label>
+            <div class="tokenRow">
+              <input id="token" type="password" autocomplete="current-password" placeholder="Optional" />
+              <button id="saveToken">Save</button>
+            </div>
+          </section>
+
+          <section class="panel">
+            <h2>System Log</h2>
+            <pre id="log"></pre>
+          </section>
+        </aside>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

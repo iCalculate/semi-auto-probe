@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import re
+import shutil
 import threading
 import time
 import tkinter as tk
@@ -14,12 +15,24 @@ from .config import (
     EYEPIECE_OPTIONS,
     OBJECTIVE_OPTIONS,
     ProbeConfig,
+    derive_missing_calibrations,
     load_probe_config,
     pulses_from_um,
     save_probe_config,
 )
-from .img_stitch import compose_mosaic, estimate_overlap_shift, fit_plane, flat_field_correct, serpentine_indices
+from .img_stitch import (
+    StitchEdgeQuality,
+    StitchSession,
+    StitchSettings,
+    TileRecord,
+    build_seam_quality_overlay,
+    fit_plane,
+    flat_field_correct,
+    recompose_session,
+    serpentine_indices,
+)
 from .logging_utils import colorize_hex_frame, configure_logging, print_startup_banner
+from .monitor_feed import publish_camera_frame, request_web_fallback_camera_release, start_frame_publisher
 from .protocol import COMM_TEST_COMMAND, FUNCTION_READ_POSITION, RESPONSE_HEAD, Axis, AxisPosition, IoStatus, hex_bytes, parse_axis_position_response
 from .serial_client import ControllerSerialClient, CommunicationTestResult, list_serial_ports
 from .ui.calibration_dialog import PixelCalibrationDialog
@@ -58,10 +71,12 @@ class ProbeApp(tk.Tk):
         self.autofocus_thread: threading.Thread | None = None
         self.autofocus_running = False
         self.autofocus_restore_realtime = False
+        self.autofocus_restore_home_signal = False
         self.imgstitch_stop_event = threading.Event()
         self.imgstitch_thread: threading.Thread | None = None
         self.imgstitch_running = False
         self.imgstitch_restore_realtime = False
+        self.imgstitch_restore_home_signal = False
         self.latest_stitch_frame = None
         self.config_path = Path.cwd() / DEFAULT_CONFIG_FILENAME
         try:
@@ -103,6 +118,13 @@ class ProbeApp(tk.Tk):
         self.autofocus_camera_image: tk.PhotoImage | None = None
         self.imgstitch_camera_image: tk.PhotoImage | None = None
         self.imgstitch_preview_image: tk.PhotoImage | None = None
+        self.imgstitch_session: StitchSession | None = None
+        self.imgstitch_tile_images: dict[tuple[int, int], object] = {}
+        self.imgstitch_latest_positions: dict[tuple[int, int], tuple[float, float]] = {}
+        self.imgstitch_latest_edges: list[StitchEdgeQuality] = []
+        self.imgstitch_point1: tuple[int, int] | None = None
+        self.imgstitch_point2: tuple[int, int] | None = None
+        self.imgstitch_session_dir = Path.cwd() / "imgstitch_session"
         self.position_vars = {
             "X": tk.StringVar(value="0"),
             "Y": tk.StringVar(value="0"),
@@ -142,6 +164,14 @@ class ProbeApp(tk.Tk):
         self.imgstitch_overlap_y_var = tk.StringVar(value="90")
         self.imgstitch_step_x_var = tk.StringVar(value="1000")
         self.imgstitch_step_y_var = tk.StringVar(value="1000")
+        self.imgstitch_range_mode_var = tk.StringVar(value="Array")
+        self.imgstitch_width_um_var = tk.StringVar(value="2000")
+        self.imgstitch_height_um_var = tk.StringVar(value="2000")
+        self.imgstitch_max_correction_um_var = tk.StringVar(value="20")
+        self.imgstitch_registration_weight_var = tk.StringVar(value="0")
+        self.imgstitch_show_seams_var = tk.BooleanVar(value=True)
+        self.imgstitch_quality_var = tk.StringVar(value="No seam data")
+        self.imgstitch_point_status_var = tk.StringVar(value="No rectangle points")
         self.imgstitch_plane_af_var = tk.BooleanVar(value=False)
         self.imgstitch_status_var = tk.StringVar(value="Idle")
         self.last_realtime_ui_update = 0.0
@@ -164,6 +194,7 @@ class ProbeApp(tk.Tk):
         self._configure_theme()
         self._build_ui()
         self._bind_keyboard_controls()
+        start_frame_publisher()
         self.bind("<Configure>", self._on_window_configure)
         self.refresh_ports()
         self.start_camera()
@@ -772,38 +803,70 @@ class ProbeApp(tk.Tk):
         preview_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
         preview_panel.columnconfigure(0, weight=1)
         preview_panel.rowconfigure(1, weight=1)
-        preview_panel.rowconfigure(3, weight=1)
 
-        ttk.Label(preview_panel, text="IMG STITCH", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 10))
-        self.imgstitch_live_label = ttk.Label(preview_panel, anchor="center", text="Camera preview", style="Video.TLabel")
-        self.imgstitch_live_label.grid(row=1, column=0, sticky="nsew")
-        ttk.Label(preview_panel, text="MOSAIC PREVIEW", style="Section.TLabel").grid(row=2, column=0, sticky="w", pady=(12, 10))
+        header = ttk.Frame(preview_panel, style="Panel.TFrame")
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="IMG STITCH MOSAIC", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(header, textvariable=self.imgstitch_quality_var, style="Status.TLabel", padding=(10, 4)).grid(row=0, column=1, sticky="e")
         self.imgstitch_mosaic_label = ttk.Label(preview_panel, anchor="center", text="No mosaic yet", style="Video.TLabel")
-        self.imgstitch_mosaic_label.grid(row=3, column=0, sticky="nsew")
+        self.imgstitch_mosaic_label.grid(row=1, column=0, sticky="nsew")
+
+        lower_panel = ttk.Frame(preview_panel, style="Panel.TFrame")
+        lower_panel.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        lower_panel.columnconfigure(0, weight=1)
+        lower_panel.columnconfigure(1, weight=0)
+        ttk.Label(lower_panel, textvariable=self.imgstitch_point_status_var, style="Value.TLabel", wraplength=460, padding=8).grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.imgstitch_live_label = ttk.Label(lower_panel, anchor="center", text="Camera", style="Video.TLabel", width=22)
+        self.imgstitch_live_label.grid(row=0, column=1, sticky="e")
 
         control_panel = ttk.Frame(parent, style="Panel.TFrame", padding=14)
         control_panel.grid(row=0, column=1, sticky="ns")
         control_panel.columnconfigure(0, weight=1)
-        ttk.Label(control_panel, text="GRID", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(control_panel, text="RANGE", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        mode_combo = ttk.Combobox(control_panel, textvariable=self.imgstitch_range_mode_var, values=("Array", "Space", "Two Points"), state="readonly", width=16)
+        mode_combo.grid(row=1, column=0, sticky="ew", pady=(8, 0))
 
         fields = (
             ("Rows", self.imgstitch_rows_var),
             ("Cols", self.imgstitch_cols_var),
+            ("Width (um)", self.imgstitch_width_um_var),
+            ("Height (um)", self.imgstitch_height_um_var),
             ("Overlap X (px)", self.imgstitch_overlap_x_var),
             ("Overlap Y (px)", self.imgstitch_overlap_y_var),
             ("Step X (um)", self.imgstitch_step_x_var),
             ("Step Y (um)", self.imgstitch_step_y_var),
         )
-        row = 1
+        row = 2
         for label, variable in fields:
             ttk.Label(control_panel, text=label, style="Muted.TLabel").grid(row=row, column=0, sticky="w", pady=(12, 4))
             ttk.Spinbox(control_panel, from_=1, to=1_000_000, increment=1, textvariable=variable, width=14).grid(row=row + 1, column=0, sticky="ew")
             row += 2
 
+        point_buttons = ttk.Frame(control_panel, style="Panel.TFrame")
+        point_buttons.grid(row=row, column=0, sticky="ew", pady=(12, 0))
+        point_buttons.columnconfigure((0, 1), weight=1, uniform="points")
+        ttk.Button(point_buttons, text="Point 1", command=lambda: self.record_imgstitch_point(1)).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(point_buttons, text="Point 2", command=lambda: self.record_imgstitch_point(2)).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        row += 1
+
+        ttk.Label(control_panel, text="RECOMPOSE", style="Section.TLabel").grid(row=row, column=0, sticky="w", pady=(18, 4))
+        row += 1
+        for label, variable in (
+            ("Max correction (um)", self.imgstitch_max_correction_um_var),
+            ("Registration weight", self.imgstitch_registration_weight_var),
+        ):
+            ttk.Label(control_panel, text=label, style="Muted.TLabel").grid(row=row, column=0, sticky="w", pady=(10, 4))
+            ttk.Spinbox(control_panel, from_=0, to=100000, increment=0.1, textvariable=variable, width=14, command=self.recompose_imgstitch_session).grid(row=row + 1, column=0, sticky="ew")
+            row += 2
+        ttk.Checkbutton(control_panel, text="Show seam quality", variable=self.imgstitch_show_seams_var, command=self.recompose_imgstitch_session).grid(row=row, column=0, sticky="w", pady=(10, 0))
+        row += 1
+
         ttk.Checkbutton(control_panel, text="Four-corner plane AF", variable=self.imgstitch_plane_af_var).grid(row=row, column=0, sticky="w", pady=(16, 0))
         ttk.Button(control_panel, text="Start Stitch", style="Accent.TButton", command=self.start_imgstitch).grid(row=row + 1, column=0, sticky="ew", pady=(16, 0))
-        ttk.Button(control_panel, text="Stop", style="Danger.TButton", command=self.stop_imgstitch).grid(row=row + 2, column=0, sticky="ew", pady=(8, 0))
-        ttk.Label(control_panel, textvariable=self.imgstitch_status_var, style="Status.TLabel", wraplength=190, padding=10).grid(row=row + 3, column=0, sticky="ew", pady=(16, 0))
+        ttk.Button(control_panel, text="Recompose", command=self.recompose_imgstitch_session).grid(row=row + 2, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(control_panel, text="Stop", style="Danger.TButton", command=self.stop_imgstitch).grid(row=row + 3, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(control_panel, textvariable=self.imgstitch_status_var, style="Status.TLabel", wraplength=190, padding=10).grid(row=row + 4, column=0, sticky="ew", pady=(16, 0))
 
     def _build_config_page(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -1190,6 +1253,7 @@ class ProbeApp(tk.Tk):
             return False
 
         self.probe_config = updated
+        derive_missing_calibrations(self.probe_config)
         self._sync_config_vars_from_config()
         self._update_config_display()
         if save:
@@ -1247,6 +1311,7 @@ class ProbeApp(tk.Tk):
 
         try:
             self.probe_config.set_calibration(self.probe_config.objective, self.probe_config.eyepiece, dialog.result_um_per_px)
+            derive_missing_calibrations(self.probe_config)
             save_probe_config(self.probe_config, self.config_path)
         except Exception as exc:
             self.config_status_var.set(f"Calibration save failed: {exc}")
@@ -1588,6 +1653,9 @@ class ProbeApp(tk.Tk):
         self.autofocus_restore_realtime = self.realtime_enabled
         if self.realtime_enabled:
             self.disable_realtime_position()
+        self.autofocus_restore_home_signal = self.home_signal_enabled
+        if self.home_signal_enabled:
+            self.disable_home_signal_polling()
 
         self.autofocus_running = True
         run_start = time.monotonic()
@@ -1852,6 +1920,103 @@ class ProbeApp(tk.Tk):
         self._record_autofocus_sample(metric, current_z, score, 1 if delta >= 0 else -1, command_hex=command_hex, reached_hex=reached_hex, stage=stage, scores=scores)
         return score, current_z
 
+    def record_imgstitch_point(self, point_index: int) -> None:
+        point = (self.current_position_values["X"], self.current_position_values["Y"])
+        if point_index == 1:
+            self.imgstitch_point1 = point
+        else:
+            self.imgstitch_point2 = point
+        self._update_imgstitch_point_status()
+
+    def _update_imgstitch_point_status(self) -> None:
+        parts = []
+        if self.imgstitch_point1 is not None:
+            parts.append(f"P1 X={self.imgstitch_point1[0]} Y={self.imgstitch_point1[1]}")
+        if self.imgstitch_point2 is not None:
+            parts.append(f"P2 X={self.imgstitch_point2[0]} Y={self.imgstitch_point2[1]}")
+        self.imgstitch_point_status_var.set(" | ".join(parts) if parts else "No rectangle points")
+
+    def _imgstitch_settings_from_ui(self) -> StitchSettings:
+        return StitchSettings(
+            overlap_x=int(float(self.imgstitch_overlap_x_var.get())),
+            overlap_y=int(float(self.imgstitch_overlap_y_var.get())),
+            max_correction_um=float(self.imgstitch_max_correction_um_var.get()),
+            registration_weight=float(self.imgstitch_registration_weight_var.get()),
+            show_seams=self.imgstitch_show_seams_var.get(),
+        ).normalized()
+
+    def _resolve_imgstitch_range(self) -> tuple[int, int, float, float, str]:
+        mode = self.imgstitch_range_mode_var.get()
+        step_x_um = float(self.imgstitch_step_x_var.get())
+        step_y_um = float(self.imgstitch_step_y_var.get())
+        if step_x_um <= 0 or step_y_um <= 0:
+            raise ValueError("Step X/Y must be positive.")
+        if mode == "Array":
+            rows = int(self.imgstitch_rows_var.get())
+            cols = int(self.imgstitch_cols_var.get())
+        elif mode == "Space":
+            width_um = float(self.imgstitch_width_um_var.get())
+            height_um = float(self.imgstitch_height_um_var.get())
+            if width_um <= 0 or height_um <= 0:
+                raise ValueError("Space width/height must be positive.")
+            cols = max(1, int((width_um + step_x_um - 1) // step_x_um) + 1)
+            rows = max(1, int((height_um + step_y_um - 1) // step_y_um) + 1)
+        elif mode == "Two Points":
+            if self.imgstitch_point1 is None or self.imgstitch_point2 is None:
+                raise ValueError("Record both rectangle points before using Two Points mode.")
+            width_um = abs(self.imgstitch_point2[0] - self.imgstitch_point1[0]) * self.probe_config.um_per_pulse("X")
+            height_um = abs(self.imgstitch_point2[1] - self.imgstitch_point1[1]) * self.probe_config.um_per_pulse("Y")
+            cols = max(1, int((width_um + step_x_um - 1) // step_x_um) + 1)
+            rows = max(1, int((height_um + step_y_um - 1) // step_y_um) + 1)
+        else:
+            raise ValueError(f"Unsupported range mode: {mode}")
+        if rows <= 0 or cols <= 0:
+            raise ValueError("Rows and columns must be positive.")
+        return rows, cols, step_x_um, step_y_um, mode
+
+    def _imgstitch_scan_origin_override(self) -> tuple[int, int] | None:
+        if self.imgstitch_range_mode_var.get() != "Two Points" or self.imgstitch_point1 is None or self.imgstitch_point2 is None:
+            return None
+        return min(self.imgstitch_point1[0], self.imgstitch_point2[0]), min(self.imgstitch_point1[1], self.imgstitch_point2[1])
+
+    def _prepare_imgstitch_session_dir(self) -> None:
+        resolved = self.imgstitch_session_dir.resolve()
+        root = Path.cwd().resolve()
+        if root not in (resolved, *resolved.parents):
+            raise RuntimeError(f"Refusing to clear session directory outside workspace: {resolved}")
+        if self.imgstitch_session_dir.exists():
+            shutil.rmtree(self.imgstitch_session_dir)
+        (self.imgstitch_session_dir / "tiles").mkdir(parents=True, exist_ok=True)
+
+    def _imgstitch_quality_summary(self, edges: list[StitchEdgeQuality]) -> str:
+        if not edges:
+            return "No seam data"
+        avg_response = sum(edge.response for edge in edges) / len(edges)
+        max_correction = max(edge.correction_um for edge in edges)
+        warning_count = sum(1 for edge in edges if edge.quality != "good")
+        return f"Seams {len(edges)} | response {avg_response:.3f} | max {max_correction:.2f} um | warn {warning_count}"
+
+    def recompose_imgstitch_session(self) -> None:
+        if self.imgstitch_session is None:
+            self.imgstitch_status_var.set("No captured session to recompose.")
+            return
+        try:
+            settings = self._imgstitch_settings_from_ui()
+            mosaic, positions, edges = recompose_session(self.imgstitch_session, settings, self.imgstitch_tile_images)
+            if settings.show_seams:
+                mosaic = build_seam_quality_overlay(mosaic, positions, edges, (self.imgstitch_session.tile_width, self.imgstitch_session.tile_height))
+            import cv2
+
+            cv2.imwrite(str(self.imgstitch_session_dir / "recomposed_imgstitch.png"), mosaic)
+            self.imgstitch_latest_positions = positions
+            self.imgstitch_latest_edges = edges
+            self._show_imgstitch_preview(mosaic)
+            self.imgstitch_quality_var.set(self._imgstitch_quality_summary(edges))
+            self.imgstitch_status_var.set("Recomposed from captured tiles.")
+        except Exception as exc:
+            self.imgstitch_status_var.set(f"Recompose failed: {exc}")
+            self.status_var.set(f"ImgStitch recompose failed: {exc}")
+
     def start_imgstitch(self) -> None:
         if self.imgstitch_running or self.motion_busy:
             return
@@ -1860,18 +2025,20 @@ class ProbeApp(tk.Tk):
         if not self.serial_client:
             return
         try:
-            rows = int(self.imgstitch_rows_var.get())
-            cols = int(self.imgstitch_cols_var.get())
-            overlap_x = int(self.imgstitch_overlap_x_var.get())
-            overlap_y = int(self.imgstitch_overlap_y_var.get())
-            step_x_um = float(self.imgstitch_step_x_var.get())
-            step_y_um = float(self.imgstitch_step_y_var.get())
+            derive_missing_calibrations(self.probe_config)
+            um_per_px = self.probe_config.current_um_per_px()
+            if um_per_px is None or um_per_px <= 0:
+                raise ValueError("Current optical configuration must have a positive um/px calibration.")
+            rows, cols, step_x_um, step_y_um, range_mode = self._resolve_imgstitch_range()
+            settings = self._imgstitch_settings_from_ui()
+            scan_origin_override = self._imgstitch_scan_origin_override()
             step_x = pulses_from_um(step_x_um, self.probe_config, "X")
             step_y = pulses_from_um(step_y_um, self.probe_config, "Y")
-        except ValueError:
-            self.imgstitch_status_var.set("Stitch settings must be valid positive numbers.")
+            self._prepare_imgstitch_session_dir()
+        except Exception as exc:
+            self.imgstitch_status_var.set(f"Invalid stitch settings: {exc}")
             return
-        if min(rows, cols, overlap_x, overlap_y, step_x, step_y, step_x_um, step_y_um) <= 0:
+        if min(rows, cols, settings.overlap_x, settings.overlap_y, step_x, step_y, step_x_um, step_y_um) <= 0:
             self.imgstitch_status_var.set("Stitch settings must be positive.")
             return
         if self.imgstitch_plane_af_var.get() and (rows < 2 or cols < 2):
@@ -1881,15 +2048,23 @@ class ProbeApp(tk.Tk):
         self.imgstitch_restore_realtime = self.realtime_enabled
         if self.realtime_enabled:
             self.disable_realtime_position()
+        self.imgstitch_restore_home_signal = self.home_signal_enabled
+        if self.home_signal_enabled:
+            self.disable_home_signal_polling()
         self.autofocus_stop_event.clear()
         self.imgstitch_running = True
         self.motion_busy = True
         self.imgstitch_stop_event.clear()
+        self.imgstitch_session = None
+        self.imgstitch_tile_images = {}
+        self.imgstitch_latest_positions = {}
+        self.imgstitch_latest_edges = []
+        self.imgstitch_quality_var.set("No seam data")
         self.imgstitch_status_var.set(f"Running: X {step_x_um:g} um -> {step_x} pulse, Y {step_y_um:g} um -> {step_y} pulse")
         self.status_var.set(f"ImgStitch running: X {step_x_um:g} um -> {step_x} pulse, Y {step_y_um:g} um -> {step_y} pulse.")
         self.imgstitch_thread = threading.Thread(
             target=self._imgstitch_worker,
-            args=(rows, cols, overlap_x, overlap_y, step_x, step_y, self.imgstitch_plane_af_var.get(), step_x_um, step_y_um),
+            args=(rows, cols, settings, step_x, step_y, self.imgstitch_plane_af_var.get(), step_x_um, step_y_um, um_per_px, range_mode, scan_origin_override),
             daemon=True,
         )
         self.imgstitch_thread.start()
@@ -1903,20 +2078,28 @@ class ProbeApp(tk.Tk):
         self,
         rows: int,
         cols: int,
-        overlap_x: int,
-        overlap_y: int,
+        settings: StitchSettings,
         step_x: int,
         step_y: int,
         use_plane_af: bool,
         step_x_um: float,
         step_y_um: float,
+        um_per_px: float,
+        range_mode: str,
+        scan_origin_override: tuple[int, int] | None,
     ) -> None:
         assert self.serial_client is not None
+        origin: tuple[int, int, int] | None = None
         try:
+            import cv2
+
             entries = self.serial_client.read_stable_xyz_positions()
             origin_x = self._axis_from_position_entries(entries, Axis.X)
             origin_y = self._axis_from_position_entries(entries, Axis.Y)
             origin_z = self._axis_from_position_entries(entries, Axis.Z)
+            if scan_origin_override is not None:
+                origin_x, origin_y = scan_origin_override
+            origin = (origin_x, origin_y, origin_z)
             plane = None
             if use_plane_af:
                 self.result_queue.put(("imgstitch_status", "Running four-corner AF"))
@@ -1924,8 +2107,8 @@ class ProbeApp(tk.Tk):
                 self._move_absolute_stage(origin_x, origin_y, origin_z)
 
             tiles: dict[tuple[int, int], object] = {}
-            positions: dict[tuple[int, int], tuple[float, float]] = {}
-            previous_key: tuple[int, int] | None = None
+            records: list[TileRecord] = []
+            session: StitchSession | None = None
             for index, key in enumerate(serpentine_indices(rows, cols), start=1):
                 if self.imgstitch_stop_event.is_set():
                     break
@@ -1933,39 +2116,69 @@ class ProbeApp(tk.Tk):
                 target_x = origin_x + col * step_x
                 target_y = origin_y + row * step_y
                 target_z = round(plane.z_at(target_x, target_y)) if plane else origin_z
-                self._move_absolute_stage(target_x, target_y, target_z)
+                moved_entries = self._move_absolute_stage(target_x, target_y, target_z)
+                actual_x = self._axis_from_position_entries(moved_entries, Axis.X)
+                actual_y = self._axis_from_position_entries(moved_entries, Axis.Y)
+                actual_z = self._axis_from_position_entries(moved_entries, Axis.Z)
                 image = self._capture_stitch_frame()
                 corrected = flat_field_correct(image)
                 tiles[key] = corrected
-                if previous_key is None:
-                    positions[key] = (0.0, 0.0)
-                else:
-                    previous_row, previous_col = previous_key
-                    if row == previous_row and col > previous_col:
-                        direction = "right"
-                    elif row == previous_row and col < previous_col:
-                        direction = "left"
-                    else:
-                        direction = "down"
-                    dx, dy, response = estimate_overlap_shift(tiles[previous_key], corrected, direction, overlap_x, overlap_y)
-                    previous_x, previous_y = positions[previous_key]
-                    positions[key] = (previous_x + dx, previous_y + dy)
-                    self.result_queue.put(("imgstitch_status", f"Tile {index}/{rows * cols}, phase response {response:.3f}, step X {step_x_um:g} um/{step_x} pulse Y {step_y_um:g} um/{step_y} pulse"))
-                previous_key = key
-                mosaic = compose_mosaic(tiles, positions)
-                self.result_queue.put(("imgstitch_preview", mosaic))
+                tile_path = self.imgstitch_session_dir / "tiles" / f"tile_r{row:03d}_c{col:03d}.png"
+                cv2.imwrite(str(tile_path), corrected)
+                records.append(
+                    TileRecord(
+                        row=row,
+                        col=col,
+                        order=index,
+                        image_path=str(tile_path),
+                        stage_x=actual_x,
+                        stage_y=actual_y,
+                        stage_z=actual_z,
+                        stage_x_um=(actual_x - origin_x) * self.probe_config.um_per_pulse("X"),
+                        stage_y_um=(actual_y - origin_y) * self.probe_config.um_per_pulse("Y"),
+                    )
+                )
+                session = StitchSession(
+                    rows=rows,
+                    cols=cols,
+                    tile_width=corrected.shape[1],
+                    tile_height=corrected.shape[0],
+                    um_per_px=um_per_px,
+                    objective=self.probe_config.objective,
+                    eyepiece=self.probe_config.eyepiece,
+                    range_mode=range_mode,
+                    step_x_um=step_x_um,
+                    step_y_um=step_y_um,
+                    origin_stage_x=origin_x,
+                    origin_stage_y=origin_y,
+                    origin_stage_z=origin_z,
+                    settings=settings,
+                    tiles=tuple(records),
+                )
+                session.save(self.imgstitch_session_dir / "session.json")
+                mosaic, positions, edges = recompose_session(session, settings, tiles)
+                display = build_seam_quality_overlay(mosaic, positions, edges, (session.tile_width, session.tile_height)) if settings.show_seams else mosaic
+                self.result_queue.put(("imgstitch_preview", display, session, dict(tiles), positions, edges))
+                self.result_queue.put(("imgstitch_status", f"Tile {index}/{rows * cols}, step X {step_x_um:g} um/{step_x} pulse Y {step_y_um:g} um/{step_y} pulse"))
             if tiles and not self.imgstitch_stop_event.is_set():
-                mosaic = compose_mosaic(tiles, positions)
+                assert session is not None
+                mosaic, positions, edges = recompose_session(session, settings, tiles)
                 output_path = Path.cwd() / "last_imgstitch.png"
-                import cv2
 
                 cv2.imwrite(str(output_path), mosaic)
+                cv2.imwrite(str(self.imgstitch_session_dir / "last_imgstitch.png"), mosaic)
                 self.result_queue.put(("imgstitch_done", output_path))
             elif self.imgstitch_stop_event.is_set():
                 self.result_queue.put(("imgstitch_status", "Stopped"))
         except Exception as exc:
             self.result_queue.put(("imgstitch_error", exc))
         finally:
+            if origin is not None and self.serial_client is not None:
+                try:
+                    self._move_absolute_stage(*origin)
+                    self.result_queue.put(("imgstitch_status", "Returned to stitch origin"))
+                except Exception as exc:
+                    self.result_queue.put(("imgstitch_status", f"Return to origin failed: {exc}"))
             self.result_queue.put(("imgstitch_finished",))
 
     def _fit_imgstitch_plane(self, origin_x: int, origin_y: int, origin_z: int, rows: int, cols: int, step_x: int, step_y: int):
@@ -2026,7 +2239,7 @@ class ProbeApp(tk.Tk):
             _, current_z = self._autofocus_move_to_z(best_z, current_z, metric, stage="plane_af_final")
         return best_z
 
-    def _move_absolute_stage(self, x_value: int, y_value: int, z_value: int) -> None:
+    def _move_absolute_stage(self, x_value: int, y_value: int, z_value: int):
         assert self.serial_client is not None
         entries = self.serial_client.read_stable_xyz_positions()
         current_x = self._axis_from_position_entries(entries, Axis.X)
@@ -2040,6 +2253,7 @@ class ProbeApp(tk.Tk):
             self.serial_client.wait_axis_reached(axis, timeout=max(5.0, abs(delta) / 100.0))
         entries = self.serial_client.read_stable_xyz_positions()
         self.result_queue.put(("read_positions", entries, "imgstitch"))
+        return entries
 
     def _capture_stitch_frame(self):
         deadline = time.monotonic() + 2.0
@@ -2061,8 +2275,8 @@ class ProbeApp(tk.Tk):
         import cv2
 
         rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        max_width = 700
-        max_height = 280
+        max_width = 980
+        max_height = 620
         scale = min(max_width / rgb.shape[1], max_height / rgb.shape[0], 1.0)
         if scale < 1.0:
             rgb = cv2.resize(rgb, (int(rgb.shape[1] * scale), int(rgb.shape[0] * scale)), interpolation=cv2.INTER_AREA)
@@ -2137,6 +2351,11 @@ class ProbeApp(tk.Tk):
 
     def disable_home_signal_polling(self) -> None:
         self.home_signal_stop_event.set()
+        current_thread = threading.current_thread()
+        if self.home_signal_thread is not None and self.home_signal_thread is not current_thread:
+            self.home_signal_thread.join(timeout=1.0)
+            if not self.home_signal_thread.is_alive():
+                self.home_signal_thread = None
         self.home_signal_enabled = False
         self.home_signal_button_var.set("Home Signals")
         self.status_var.set("Home signal polling disabled.")
@@ -2770,6 +2989,9 @@ class ProbeApp(tk.Tk):
             if self.autofocus_restore_realtime and not self.realtime_enabled and self.serial_client:
                 self.autofocus_restore_realtime = False
                 self.toggle_realtime_position()
+            if self.autofocus_restore_home_signal and not self.home_signal_enabled and self.serial_client:
+                self.autofocus_restore_home_signal = False
+                self.toggle_home_signal_polling()
             logger.info("AutoFocus stopped.")
             return
 
@@ -2781,7 +3003,13 @@ class ProbeApp(tk.Tk):
             return
 
         if event_type == "imgstitch_preview":
-            _, mosaic = event
+            mosaic = event[1]
+            if len(event) >= 6:
+                self.imgstitch_session = event[2]
+                self.imgstitch_tile_images = event[3]
+                self.imgstitch_latest_positions = event[4]
+                self.imgstitch_latest_edges = event[5]
+                self.imgstitch_quality_var.set(self._imgstitch_quality_summary(self.imgstitch_latest_edges))
             self._show_imgstitch_preview(mosaic)
             return
 
@@ -2807,6 +3035,9 @@ class ProbeApp(tk.Tk):
             if self.imgstitch_restore_realtime and not self.realtime_enabled and self.serial_client:
                 self.imgstitch_restore_realtime = False
                 self.toggle_realtime_position()
+            if self.imgstitch_restore_home_signal and not self.home_signal_enabled and self.serial_client:
+                self.imgstitch_restore_home_signal = False
+                self.toggle_home_signal_polling()
             return
 
         if event_type == "motor_command":
@@ -2898,10 +3129,16 @@ class ProbeApp(tk.Tk):
 
     def _camera_worker(self, session_id: int, camera: UsbCamera) -> None:
         reported_ready = False
+        release_attempted = False
         while self.camera_running and session_id == self.camera_session_id:
             try:
                 frame = camera.read()
             except Exception as exc:
+                if not release_attempted:
+                    release_attempted = True
+                    if request_web_fallback_camera_release():
+                        time.sleep(0.5)
+                        continue
                 self.result_queue.put(("camera_error", session_id, exc))
                 return
             if frame:
@@ -2924,6 +3161,7 @@ class ProbeApp(tk.Tk):
             self.latest_camera_frame = None
 
         if frame:
+            publish_camera_frame(frame.image_bgr)
             self.camera_image = tk.PhotoImage(data=self._ppm_with_scalebar(frame.image_bgr), format="PPM")
             if self.vision_panel:
                 self.vision_panel.set_image(self.camera_image)
@@ -2935,7 +3173,15 @@ class ProbeApp(tk.Tk):
                 self.autofocus_camera_image = tk.PhotoImage(data=frame.ppm_bytes, format="PPM")
                 self.autofocus_video_label.configure(image=self.autofocus_camera_image, text="")
             if hasattr(self, "imgstitch_live_label") and not self.imgstitch_running:
-                self.imgstitch_camera_image = tk.PhotoImage(data=frame.ppm_bytes, format="PPM")
+                import cv2
+
+                live = frame.image_bgr
+                scale = min(220 / live.shape[1], 124 / live.shape[0], 1.0)
+                if scale < 1.0:
+                    live = cv2.resize(live, (int(live.shape[1] * scale), int(live.shape[0] * scale)), interpolation=cv2.INTER_AREA)
+                rgb_live = cv2.cvtColor(live, cv2.COLOR_BGR2RGB)
+                height, width = rgb_live.shape[:2]
+                self.imgstitch_camera_image = tk.PhotoImage(data=f"P6 {width} {height} 255\n".encode("ascii") + rgb_live.tobytes(), format="PPM")
                 self.imgstitch_live_label.configure(image=self.imgstitch_camera_image, text="")
             self._update_focus_scores(frame.focus_scores)
 

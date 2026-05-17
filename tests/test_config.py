@@ -7,6 +7,7 @@ from semi_auto_probe.config import (
     ProbeConfig,
     calibration_distance_px,
     calibration_key,
+    derive_missing_calibrations,
     load_probe_config,
     pulses_from_um,
     save_probe_config,
@@ -38,6 +39,17 @@ class ProbeConfigTest(unittest.TestCase):
         self.assertAlmostEqual(config.current_um_per_px(), 0.84)
         config.eyepiece = 2.0
         self.assertIsNone(config.current_um_per_px())
+
+    def test_derives_missing_calibrations_from_20x_1_5x_without_overwrite(self) -> None:
+        config = ProbeConfig()
+        config.set_calibration(20, 1.5, 0.42)
+        config.set_calibration(10, 1.5, 99.0)
+
+        added = derive_missing_calibrations(config)
+
+        self.assertGreater(added, 0)
+        self.assertAlmostEqual(config.calibrations[calibration_key(10, 1.5)], 99.0)
+        self.assertAlmostEqual(config.calibrations[calibration_key(5, 3.0)], 0.42 * (20 * 1.5) / (5 * 3.0))
 
     def test_json_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

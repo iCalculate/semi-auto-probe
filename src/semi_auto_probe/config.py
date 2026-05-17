@@ -10,10 +10,30 @@ from typing import Any
 DEFAULT_CONFIG_FILENAME = "probe_config.local.json"
 OBJECTIVE_OPTIONS = (20, 10, 5)
 EYEPIECE_OPTIONS = (1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0)
+CALIBRATION_REFERENCE_OBJECTIVE = 20
+CALIBRATION_REFERENCE_EYEPIECE = 1.5
 
 
 def calibration_key(objective: int, eyepiece: float) -> str:
     return f"objective_{objective:g}__eyepiece_{eyepiece:g}"
+
+
+def derive_missing_calibrations(config: "ProbeConfig") -> int:
+    base_key = calibration_key(CALIBRATION_REFERENCE_OBJECTIVE, CALIBRATION_REFERENCE_EYEPIECE)
+    base_um_per_px = config.calibrations.get(base_key)
+    if base_um_per_px is None:
+        return 0
+
+    added = 0
+    reference_magnification = CALIBRATION_REFERENCE_OBJECTIVE * CALIBRATION_REFERENCE_EYEPIECE
+    for objective in OBJECTIVE_OPTIONS:
+        for eyepiece in EYEPIECE_OPTIONS:
+            key = calibration_key(objective, eyepiece)
+            if key in config.calibrations:
+                continue
+            config.calibrations[key] = float(base_um_per_px) * reference_magnification / (objective * eyepiece)
+            added += 1
+    return added
 
 
 def calibration_distance_px(p1: tuple[float, float], p2: tuple[float, float], p3: tuple[float, float]) -> float:
@@ -105,6 +125,7 @@ class ProbeConfig:
         self.calibrations[calibration_key(objective, eyepiece)] = float(um_per_px)
 
     def to_dict(self) -> dict[str, Any]:
+        derive_missing_calibrations(self)
         self.validate()
         return {
             "objective": self.objective,
@@ -131,6 +152,7 @@ class ProbeConfig:
             cc_accel_time_s=float(data.get("cc_accel_time_s", cls.cc_accel_time_s)),
             calibrations={str(key): float(value) for key, value in data.get("calibrations", {}).items()},
         )
+        derive_missing_calibrations(config)
         config.validate()
         return config
 
@@ -138,7 +160,9 @@ class ProbeConfig:
 def load_probe_config(path: Path | None = None) -> ProbeConfig:
     config_path = path or Path.cwd() / DEFAULT_CONFIG_FILENAME
     if not config_path.exists():
-        return ProbeConfig()
+        config = ProbeConfig()
+        derive_missing_calibrations(config)
+        return config
     with config_path.open("r", encoding="utf-8") as file:
         data = json.load(file)
     return ProbeConfig.from_dict(data)
@@ -146,4 +170,5 @@ def load_probe_config(path: Path | None = None) -> ProbeConfig:
 
 def save_probe_config(config: ProbeConfig, path: Path | None = None) -> None:
     config_path = path or Path.cwd() / DEFAULT_CONFIG_FILENAME
+    derive_missing_calibrations(config)
     config_path.write_text(json.dumps(config.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
