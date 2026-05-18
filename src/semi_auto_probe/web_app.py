@@ -32,6 +32,11 @@ DIRECT_CAMERA_HEIGHT_ENV = "SEMI_AUTO_PROBE_WEB_CAMERA_HEIGHT"
 DIRECT_CAMERA_FPS_ENV = "SEMI_AUTO_PROBE_WEB_DIRECT_CAMERA_FPS"
 DEFAULT_DIRECT_CAMERA_FPS = 10.0
 DEFAULT_PID_FILE = Path.cwd() / ".runtime" / "semi-auto-probe-web.pid"
+DIRECT_CAMERA_LABELS = {
+    0: "ProbeOM",
+    1: "EmbeddedCam",
+    2: "MonitorCam",
+}
 
 
 @dataclass
@@ -137,7 +142,7 @@ class WebProbeService:
             {"id": "desktop", "label": "Microscope feed", "fps": 1, "available": desktop_available},
         ]
         for index in range(max_index + 1):
-            sources.append({"id": f"direct:{index}", "label": f"Camera {index}", "fps": self._direct_camera_fps(), "available": True})
+            sources.append({"id": f"direct:{index}", "label": self._direct_camera_label(index), "fps": self._direct_camera_fps(), "available": True})
         return {"selected": self._selected_camera_source, "sources": sources}
 
     def mjpeg_frames(self, source: str | None = None) -> Iterator[bytes]:
@@ -241,8 +246,12 @@ class WebProbeService:
         if source == "desktop":
             return "Microscope feed"
         if source == "direct":
-            return f"Camera {direct_index}" if direct_index is not None else "Direct camera"
+            return WebProbeService._direct_camera_label(direct_index) if direct_index is not None else "Direct camera"
         return None
+
+    @staticmethod
+    def _direct_camera_label(index: int) -> str:
+        return DIRECT_CAMERA_LABELS.get(index, f"Camera {index}")
 
     @staticmethod
     def _direct_camera_fps() -> float:

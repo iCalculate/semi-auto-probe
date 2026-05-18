@@ -20,8 +20,10 @@ const els = {
 
 let streamActive = false;
 let lastError = "";
+let tokenSaveTimer = null;
 
 els.token.value = localStorage.getItem("probeWebToken") || "";
+populateFallbackCameraSources();
 
 function token() {
   return localStorage.getItem("probeWebToken") || "";
@@ -45,6 +47,23 @@ function log(message, data) {
 
 function setTone(element, tone) {
   element.dataset.tone = tone;
+}
+
+function populateFallbackCameraSources() {
+  if (els.cameraSource.options.length > 0) return;
+  const fallbackSources = [
+    { id: "auto", label: "Auto", fps: "1/10" },
+    { id: "desktop", label: "Microscope feed", fps: 1 },
+    { id: "direct:0", label: "ProbeOM", fps: 10 },
+    { id: "direct:1", label: "EmbeddedCam", fps: 10 },
+    { id: "direct:2", label: "MonitorCam", fps: 10 },
+  ];
+  for (const source of fallbackSources) {
+    const option = document.createElement("option");
+    option.value = source.id;
+    option.textContent = `${source.label} (${source.fps} FPS)`;
+    els.cameraSource.append(option);
+  }
 }
 
 async function api(path, options = {}) {
@@ -148,7 +167,10 @@ async function refreshCameraSources() {
       ? currentValue
       : data.selected;
   } catch (error) {
-    log("Camera source error", { message: error.message });
+    populateFallbackCameraSources();
+    if (token()) {
+      log("Camera source error", { message: error.message });
+    }
   }
 }
 
@@ -175,6 +197,25 @@ els.saveToken.addEventListener("click", async () => {
   log("Token saved");
   await refreshCameraSources();
   await refreshStatus();
+});
+
+els.token.addEventListener("input", () => {
+  window.clearTimeout(tokenSaveTimer);
+  tokenSaveTimer = window.setTimeout(async () => {
+    localStorage.setItem("probeWebToken", els.token.value);
+    streamActive = false;
+    await refreshCameraSources();
+    await refreshStatus();
+  }, 300);
+});
+
+els.token.addEventListener("keydown", async (event) => {
+  if (event.key === "Enter") {
+    localStorage.setItem("probeWebToken", els.token.value);
+    streamActive = false;
+    await refreshCameraSources();
+    await refreshStatus();
+  }
 });
 
 els.applySource.addEventListener("click", async () => {

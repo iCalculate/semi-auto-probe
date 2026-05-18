@@ -55,7 +55,7 @@ uv run semi-auto-probe-web
 Or double-click:
 
 ```text
-D:\Project\semi-auto-probe\restart_web.bat
+D:\Project\semi-auto-probe\src\semi_auto_probe\web\restart_web.ps1
 ```
 
 Open:
