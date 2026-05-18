@@ -72,7 +72,7 @@ class ImgStitchTest(unittest.TestCase):
 
         self.assertEqual(positions[(0, 0)], (0.0, 0.0))
         self.assertEqual(positions[(0, 1)], (10.0, 0.0))
-        self.assertEqual(positions[(1, 1)], (10.0, 20.0))
+        self.assertEqual(positions[(1, 1)], (10.0, -20.0))
 
     def test_recompose_session_zero_weight_uses_stage_positions(self) -> None:
         left = np.zeros((40, 50, 3), dtype=np.uint8)
@@ -161,6 +161,41 @@ class ImgStitchTest(unittest.TestCase):
             loaded = StitchSession.load(path)
 
         self.assertEqual(loaded, session)
+
+    def test_recompose_session_reports_all_internal_grid_edges(self) -> None:
+        tiles = {
+            (0, 0): np.full((20, 20, 3), 30, dtype=np.uint8),
+            (0, 1): np.full((20, 20, 3), 60, dtype=np.uint8),
+            (1, 0): np.full((20, 20, 3), 90, dtype=np.uint8),
+            (1, 1): np.full((20, 20, 3), 120, dtype=np.uint8),
+        }
+        session = StitchSession(
+            rows=2,
+            cols=2,
+            tile_width=20,
+            tile_height=20,
+            um_per_px=1.0,
+            objective=20,
+            eyepiece=1.5,
+            range_mode="array",
+            step_x_um=15.0,
+            step_y_um=15.0,
+            origin_stage_x=0,
+            origin_stage_y=0,
+            origin_stage_z=0,
+            settings=StitchSettings(overlap_x=5, overlap_y=5, max_correction_um=0.0, registration_weight=0.0),
+            tiles=(
+                TileRecord(0, 0, 1, "a.png", 0, 0, 0, 0.0, 0.0),
+                TileRecord(0, 1, 2, "b.png", 15, 0, 0, 15.0, 0.0),
+                TileRecord(1, 1, 3, "d.png", 15, 15, 0, 15.0, 15.0),
+                TileRecord(1, 0, 4, "c.png", 0, 15, 0, 0.0, 15.0),
+            ),
+        )
+
+        _mosaic, _positions, edges = recompose_session(session, tile_images=tiles)
+
+        self.assertEqual(len(edges), 4)
+        self.assertEqual({edge.current for edge in edges}, {(0, 1), (1, 0), (1, 1)})
 
 
 if __name__ == "__main__":

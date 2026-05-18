@@ -31,6 +31,8 @@ class VisionPanel:
         self.polygon_closed = False
         self.configure_job: str | None = None
         self.hover_canvas_point: tuple[float, float] | None = None
+        self.shift_down = False
+        self.pre_shift_status: str | None = None
 
         self.frame = ttk.Frame(parent, style="Panel.TFrame")
         self.frame.grid(row=1, column=0, sticky="nsew")
@@ -57,14 +59,13 @@ class VisionPanel:
     def _build_toolbar(self, parent: ttk.Frame) -> None:
         toolbar = ttk.Frame(parent, style="Panel.TFrame")
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        toolbar.columnconfigure(7, weight=1)
+        toolbar.columnconfigure(6, weight=1)
 
         tools = (
             ("cross", "Center +"),
             ("point_distance", "Point-Point"),
             ("line_distance", "Point-Line"),
             ("polygon_area", "Polygon Area"),
-            ("move_center", "Move Center"),
         )
         for column, (tool, label) in enumerate(tools):
             button = tk.Button(
@@ -85,8 +86,8 @@ class VisionPanel:
             button.grid(row=0, column=column, sticky="w", padx=(0, 6))
             self.tool_buttons[tool] = button
 
-        ttk.Button(toolbar, text="Clear", command=self.clear_measurement).grid(row=0, column=5, sticky="w", padx=(4, 8))
-        ttk.Label(toolbar, textvariable=self.status_var, style="Muted.TLabel", wraplength=360).grid(row=0, column=6, columnspan=2, sticky="ew")
+        ttk.Button(toolbar, text="Clear", command=self.clear_measurement).grid(row=0, column=4, sticky="w", padx=(4, 8))
+        ttk.Label(toolbar, textvariable=self.status_var, style="Muted.TLabel", wraplength=360).grid(row=0, column=5, columnspan=2, sticky="ew")
         self._refresh_tool_buttons()
 
     def set_tool(self, tool: str) -> None:
@@ -100,7 +101,6 @@ class VisionPanel:
                 "point_distance": "Click two points to measure distance.",
                 "line_distance": "Click two line points, then a point to measure distance to line.",
                 "polygon_area": "Click polygon vertices. Double-click or right-click to finish.",
-                "move_center": "Double-click a point to move it to image center.",
                 "idle": "Select a vision tool.",
             }
             self.status_var.set(status_by_tool.get(self.tool_var.get(), "Select a vision tool."))
@@ -216,9 +216,37 @@ class VisionPanel:
 
     def _refresh_canvas_cursor(self) -> None:
         try:
-            self.canvas.configure(cursor="tcross" if self.tool_var.get() == "move_center" else "crosshair")
+            self.canvas.configure(cursor="tcross" if self._move_center_active() else "crosshair")
         except tk.TclError:
             return
+
+    def set_shift_down(self, is_down: bool) -> None:
+        if self.shift_down == is_down:
+            return
+        self.shift_down = is_down
+        if not is_down:
+            if self.pre_shift_status is not None:
+                self.status_var.set(self.pre_shift_status)
+            self.pre_shift_status = None
+        elif self._hover_point_in_image() is not None:
+            self.pre_shift_status = self.status_var.get()
+            self.status_var.set("Shift move center enabled. Click a point to move it to image center.")
+        else:
+            self.pre_shift_status = self.status_var.get()
+        self._refresh_tool_buttons()
+        self._refresh_canvas_cursor()
+        if not is_down:
+            self._clear_move_hover()
+        else:
+            self._draw_move_hover()
+
+    def _move_center_active(self) -> bool:
+        return self.shift_down and self._hover_point_in_image() is not None
+
+    def _hover_point_in_image(self) -> tuple[float, float] | None:
+        if self.hover_canvas_point is None:
+            return None
+        return self._canvas_to_image_point(*self.hover_canvas_point, update_status=False)
 
     def _on_canvas_configure(self, _event: tk.Event) -> None:
         if self.configure_job is not None:
@@ -237,6 +265,13 @@ class VisionPanel:
         self.draw_overlay()
 
     def _on_canvas_click(self, event: tk.Event) -> str | None:
+        if self.shift_down:
+            point = self._canvas_to_image_point(event.x, event.y)
+            if point is not None and self.photo is not None:
+                self.pre_shift_status = None
+                self.move_point_to_center(point[0], point[1], self.photo.width(), self.photo.height())
+            return "break"
+
         tool = self.tool_var.get()
         if tool not in ("point_distance", "line_distance", "polygon_area"):
             return None
@@ -272,10 +307,7 @@ class VisionPanel:
         return "break"
 
     def _on_canvas_double_click(self, event: tk.Event) -> str | None:
-        if self.tool_var.get() == "move_center":
-            point = self._canvas_to_image_point(event.x, event.y)
-            if point is not None and self.photo is not None:
-                self.move_point_to_center(point[0], point[1], self.photo.width(), self.photo.height())
+        if self.shift_down:
             return "break"
         if self.tool_var.get() == "polygon_area":
             self._finish_polygon_measurement()
@@ -289,17 +321,20 @@ class VisionPanel:
         return None
 
     def _on_canvas_motion(self, event: tk.Event) -> None:
-        if self.tool_var.get() != "move_center":
-            self._clear_move_hover()
-            return
+        self.hover_canvas_point = (float(event.x), float(event.y))
         if self._canvas_to_image_point(event.x, event.y, update_status=False) is None:
             self._clear_move_hover()
             return
-        self.hover_canvas_point = (float(event.x), float(event.y))
-        self._draw_move_hover()
+        if self.shift_down:
+            self.status_var.set("Shift move center enabled. Click a point to move it to image center.")
+            self._refresh_canvas_cursor()
+            self._draw_move_hover()
+        elif self.canvas.cget("cursor") != "crosshair":
+            self._refresh_canvas_cursor()
 
     def _on_canvas_leave(self, _event: tk.Event) -> None:
         self._clear_move_hover()
+        self._refresh_canvas_cursor()
 
     def _canvas_to_image_point(self, canvas_x: float, canvas_y: float, update_status: bool = True) -> tuple[float, float] | None:
         if self.image_bounds is None:
@@ -328,7 +363,7 @@ class VisionPanel:
     def _draw_move_hover(self) -> None:
         try:
             self.canvas.delete("move_hover")
-            if self.tool_var.get() != "move_center" or self.hover_canvas_point is None or self.image_bounds is None or self.photo is None:
+            if not self.shift_down or self.hover_canvas_point is None or self.image_bounds is None or self.photo is None:
                 return
             point = self._canvas_to_image_point(*self.hover_canvas_point, update_status=False)
             if point is None:
@@ -376,6 +411,7 @@ class VisionPanel:
         self.hover_canvas_point = None
         try:
             self.canvas.delete("move_hover")
+            self._refresh_canvas_cursor()
         except tk.TclError:
             return
 

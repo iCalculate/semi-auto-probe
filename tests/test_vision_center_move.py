@@ -58,7 +58,7 @@ class VisionCenterMoveTests(unittest.TestCase):
 
     def test_preview_and_cc_plan_share_signed_pulses(self) -> None:
         app = self.make_app_shell()
-        app.probe_config.set_calibration(20, 1.5, 0.5)
+        app.probe_config.set_calibration(20, 2.0, 0.5)
 
         plan = app._image_centering_cc_plan(
             point_x=430,

@@ -33,14 +33,20 @@ class StitchSettings:
     max_correction_um: float = 20.0
     registration_weight: float = 0.0
     show_seams: bool = True
+    seam_response_yellow: float = 0.10
+    seam_response_green: float = 0.25
 
     def normalized(self) -> "StitchSettings":
+        yellow = max(0.0, float(self.seam_response_yellow))
+        green = max(yellow, float(self.seam_response_green))
         return StitchSettings(
             overlap_x=max(1, int(self.overlap_x)),
             overlap_y=max(1, int(self.overlap_y)),
             max_correction_um=max(0.0, float(self.max_correction_um)),
             registration_weight=min(1.0, max(0.0, float(self.registration_weight))),
             show_seams=bool(self.show_seams),
+            seam_response_yellow=yellow,
+            seam_response_green=green,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -51,6 +57,8 @@ class StitchSettings:
             "max_correction_um": settings.max_correction_um,
             "registration_weight": settings.registration_weight,
             "show_seams": settings.show_seams,
+            "seam_response_yellow": settings.seam_response_yellow,
+            "seam_response_green": settings.seam_response_green,
         }
 
     @classmethod
@@ -61,6 +69,8 @@ class StitchSettings:
             max_correction_um=float(data.get("max_correction_um", 20.0)),
             registration_weight=float(data.get("registration_weight", 0.0)),
             show_seams=bool(data.get("show_seams", True)),
+            seam_response_yellow=float(data.get("seam_response_yellow", 0.10)),
+            seam_response_green=float(data.get("seam_response_green", 0.25)),
         ).normalized()
 
 
@@ -272,6 +282,10 @@ def estimate_overlap_shift(
         previous_roi = previous_gray[-overlap_y:, :]
         current_roi = current_gray[:overlap_y, :]
         expected_dx, expected_dy = 0.0, previous_gray.shape[0] - overlap_y
+    elif direction == "up":
+        previous_roi = previous_gray[:overlap_y, :]
+        current_roi = current_gray[-overlap_y:, :]
+        expected_dx, expected_dy = 0.0, -(previous_gray.shape[0] - overlap_y)
     else:
         raise ValueError(f"Unsupported stitch direction: {direction}")
 
@@ -280,7 +294,7 @@ def estimate_overlap_shift(
 
     window = cv2_module.createHanningWindow((previous_roi.shape[1], previous_roi.shape[0]), cv2_module.CV_32F)
     (shift_x, shift_y), response = cv2_module.phaseCorrelate(previous_roi, current_roi, window)
-    return expected_dx + shift_x, expected_dy + shift_y, float(response)
+    return expected_dx - shift_x, expected_dy - shift_y, float(response)
 
 
 def compose_mosaic(
@@ -325,7 +339,7 @@ def stage_positions_from_um(tiles: Iterable[TileRecord], um_per_px: float) -> di
     return {
         tile.key: (
             (tile.stage_x_um - origin_x_um) / um_per_px,
-            (tile.stage_y_um - origin_y_um) / um_per_px,
+            -(tile.stage_y_um - origin_y_um) / um_per_px,
         )
         for tile in records
     }
@@ -339,7 +353,7 @@ def _direction_between(previous: GridIndex, current: GridIndex) -> str:
     if row == previous_row and col < previous_col:
         return "left"
     if row > previous_row:
-        return "down"
+        return "up"
     raise ValueError(f"Unsupported tile transition: {previous} -> {current}")
 
 
@@ -353,10 +367,10 @@ def _clamp_vector(dx: float, dy: float, max_length: float) -> tuple[float, float
     return dx * scale, dy * scale
 
 
-def _quality_from_metrics(response: float, correction_um: float, max_correction_um: float) -> str:
-    if response >= 0.25 and correction_um <= max_correction_um * 0.5:
+def _quality_from_metrics(response: float, correction_um: float, settings: StitchSettings) -> str:
+    if response >= settings.seam_response_green and correction_um <= settings.max_correction_um * 0.5:
         return "good"
-    if response >= 0.10 and correction_um <= max_correction_um:
+    if response >= settings.seam_response_yellow and correction_um <= settings.max_correction_um:
         return "warning"
     return "bad"
 
@@ -368,6 +382,72 @@ def compose_mosaic_from_stage_positions(
 ) -> tuple[np.ndarray, dict[GridIndex, tuple[float, float]]]:
     positions = stage_positions_from_um(records, um_per_px)
     return compose_mosaic(tiles, positions), positions
+
+
+def _edge_quality_between(
+    previous_key: GridIndex,
+    current_key: GridIndex,
+    settings: StitchSettings,
+    session: StitchSession,
+    tile_images: dict[GridIndex, np.ndarray],
+    base_positions: dict[GridIndex, tuple[float, float]],
+    positions: dict[GridIndex, tuple[float, float]],
+) -> StitchEdgeQuality:
+    direction = _direction_between(previous_key, current_key)
+    expected_shift = (
+        base_positions[current_key][0] - base_positions[previous_key][0],
+        base_positions[current_key][1] - base_positions[previous_key][1],
+    )
+    measured_shift = expected_shift
+    response = 0.0
+    try:
+        measured_dx, measured_dy, response = estimate_overlap_shift(
+            tile_images[previous_key],
+            tile_images[current_key],
+            direction,
+            settings.overlap_x,
+            settings.overlap_y,
+        )
+        measured_shift = (measured_dx, measured_dy)
+    except Exception:
+        measured_shift = expected_shift
+        response = 0.0
+    applied_shift = (
+        positions[current_key][0] - positions[previous_key][0],
+        positions[current_key][1] - positions[previous_key][1],
+    )
+    correction_um = float(np.hypot(applied_shift[0] - expected_shift[0], applied_shift[1] - expected_shift[1]) * session.um_per_px)
+    return StitchEdgeQuality(
+        previous=previous_key,
+        current=current_key,
+        direction=direction,
+        expected_shift_px=expected_shift,
+        measured_shift_px=measured_shift,
+        applied_shift_px=applied_shift,
+        response=float(response),
+        correction_um=correction_um,
+        quality=_quality_from_metrics(float(response), correction_um, settings),
+    )
+
+
+def _all_adjacent_edges(
+    session: StitchSession,
+    settings: StitchSettings,
+    tile_images: dict[GridIndex, np.ndarray],
+    base_positions: dict[GridIndex, tuple[float, float]],
+    positions: dict[GridIndex, tuple[float, float]],
+) -> list[StitchEdgeQuality]:
+    available = {tile.key for tile in session.tiles if tile.key in tile_images and tile.key in positions}
+    edges: list[StitchEdgeQuality] = []
+    for row, col in sorted(available):
+        key = (row, col)
+        right_key = (row, col + 1)
+        lower_key = (row + 1, col)
+        if right_key in available:
+            edges.append(_edge_quality_between(key, right_key, settings, session, tile_images, base_positions, positions))
+        if lower_key in available:
+            edges.append(_edge_quality_between(key, lower_key, settings, session, tile_images, base_positions, positions))
+    return edges
 
 
 def recompose_session(
@@ -387,7 +467,6 @@ def recompose_session(
 
     base_positions = stage_positions_from_um(session.tiles, session.um_per_px)
     positions: dict[GridIndex, tuple[float, float]] = {}
-    edges: list[StitchEdgeQuality] = []
     max_correction_px = settings.max_correction_um / session.um_per_px if session.um_per_px > 0 else 0.0
     ordered_keys = [tile.key for tile in sorted(session.tiles, key=lambda tile: tile.order)]
     previous_key: GridIndex | None = None
@@ -437,26 +516,9 @@ def recompose_session(
             base_positions[key][0] + applied_correction[0],
             base_positions[key][1] + applied_correction[1],
         )
-        applied_shift = (
-            positions[key][0] - positions[previous_key][0],
-            positions[key][1] - positions[previous_key][1],
-        )
-        correction_um = float(np.hypot(applied_correction[0], applied_correction[1]) * session.um_per_px)
-        edges.append(
-            StitchEdgeQuality(
-                previous=previous_key,
-                current=key,
-                direction=direction,
-                expected_shift_px=expected_shift,
-                measured_shift_px=measured_shift,
-                applied_shift_px=applied_shift,
-                response=float(response),
-                correction_um=correction_um,
-                quality=_quality_from_metrics(float(response), correction_um, settings.max_correction_um),
-            )
-        )
         previous_key = key
 
+    edges = _all_adjacent_edges(session, settings, tile_images, base_positions, positions)
     return compose_mosaic(tile_images, positions), positions, edges
 
 
@@ -482,6 +544,8 @@ def build_seam_quality_overlay(
         "warning": (30, 190, 245),
         "bad": (80, 80, 255),
     }
+
+    edges = list(edges)
     for edge in edges:
         if edge.current not in positions:
             continue
@@ -489,17 +553,46 @@ def build_seam_quality_overlay(
         x0 = int(round(x - min_x))
         y0 = int(round(y - min_y))
         color = colors.get(edge.quality, colors["warning"])
+        shift_x = abs(edge.applied_shift_px[0])
+        shift_y = abs(edge.applied_shift_px[1])
         if edge.direction in ("right", "left"):
-            line_x = x0 if edge.direction == "right" else x0 + tile_width
-            y1 = max(0, y0)
-            y2 = min(overlay.shape[0] - 1, y0 + tile_height)
-            cv2_module.line(overlay, (line_x, y1), (line_x, y2), color, 2, cv2_module.LINE_AA)
-        elif edge.direction == "down":
-            line_y = y0
-            x1 = max(0, x0)
-            x2 = min(overlay.shape[1] - 1, x0 + tile_width)
-            cv2_module.line(overlay, (x1, line_y), (x2, line_y), color, 2, cv2_module.LINE_AA)
-    return cv2_module.addWeighted(overlay, alpha, mosaic_bgr, 1.0 - alpha, 0)
+            overlap_width = max(2, min(tile_width, int(round(tile_width - shift_x))))
+            x1 = x0 if edge.direction == "right" else x0 + tile_width - overlap_width
+            x2 = x1 + overlap_width
+            y1 = y0
+            y2 = y0 + tile_height
+        elif edge.direction in ("down", "up"):
+            overlap_height = max(2, min(tile_height, int(round(tile_height - shift_y))))
+            y1 = y0 if edge.direction == "down" else y0 + tile_height - overlap_height
+            y2 = y1 + overlap_height
+            x1 = x0
+            x2 = x0 + tile_width
+        else:
+            continue
+        x1 = max(0, min(overlay.shape[1] - 1, x1))
+        x2 = max(0, min(overlay.shape[1], x2))
+        y1 = max(0, min(overlay.shape[0] - 1, y1))
+        y2 = max(0, min(overlay.shape[0], y2))
+        if x2 > x1 and y2 > y1:
+            cv2_module.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+            cv2_module.rectangle(overlay, (x1, y1), (x2, y2), colors.get(edge.quality, colors["warning"]), 1)
+
+    result = cv2_module.addWeighted(overlay, alpha, mosaic_bgr, 1.0 - alpha, 0)
+    bar_width = min(180, max(90, result.shape[1] // 5))
+    bar_height = 12
+    margin = 12
+    x0 = max(0, result.shape[1] - bar_width - margin)
+    y0 = margin
+    segment_width = max(1, bar_width // 3)
+    for index, quality in enumerate(("bad", "warning", "good")):
+        x1 = x0 + index * segment_width
+        x2 = x0 + bar_width if index == 2 else x0 + (index + 1) * segment_width
+        cv2_module.rectangle(result, (x1, y0), (x2, y0 + bar_height), colors[quality], -1)
+    cv2_module.rectangle(result, (x0, y0), (x0 + bar_width, y0 + bar_height), (230, 230, 230), 1)
+    cv2_module.putText(result, "bad", (x0, y0 + bar_height + 14), cv2_module.FONT_HERSHEY_SIMPLEX, 0.38, (230, 230, 230), 1, cv2_module.LINE_AA)
+    cv2_module.putText(result, "warn", (x0 + segment_width - 8, y0 + bar_height + 14), cv2_module.FONT_HERSHEY_SIMPLEX, 0.38, (230, 230, 230), 1, cv2_module.LINE_AA)
+    cv2_module.putText(result, "good", (x0 + bar_width - 36, y0 + bar_height + 14), cv2_module.FONT_HERSHEY_SIMPLEX, 0.38, (230, 230, 230), 1, cv2_module.LINE_AA)
+    return result
 
 
 def fit_plane(samples: Iterable[tuple[float, float, float]]) -> PlaneModel:

@@ -38,6 +38,7 @@ class ExclusiveSerialWorkflowTests(unittest.TestCase):
         app.imgstitch_restore_home_signal = False
         app.imgstitch_restore_realtime = False
         app.imgstitch_running = False
+        app.imgstitch_focus_sampling_required = False
         app._home_signal_worker = lambda: None
         return app
 

@@ -30,6 +30,7 @@ class ProbeConfigTest(unittest.TestCase):
 
     def test_calibration_lookup_is_per_lens_combination(self) -> None:
         config = ProbeConfig()
+        config.eyepiece = 1.5
         config.set_calibration(20, 1.5, 0.42)
         config.set_calibration(10, 1.5, 0.84)
 
@@ -68,6 +69,46 @@ class ProbeConfigTest(unittest.TestCase):
             self.assertEqual(loaded.cc_speed_percent, 80)
             self.assertAlmostEqual(loaded.cc_accel_time_s, 0.2)
             self.assertAlmostEqual(loaded.current_um_per_px(), 1.25)
+
+    def test_imgstitch_seam_thresholds_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / DEFAULT_CONFIG_FILENAME
+            config = ProbeConfig(imgstitch_seam_response_yellow=0.2, imgstitch_seam_response_green=0.45)
+
+            save_probe_config(config, path)
+            loaded = load_probe_config(path)
+
+            self.assertAlmostEqual(loaded.imgstitch_seam_response_yellow, 0.2)
+            self.assertAlmostEqual(loaded.imgstitch_seam_response_green, 0.45)
+
+    def test_autofocus_config_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / DEFAULT_CONFIG_FILENAME
+            config = ProbeConfig(
+                autofocus_settle_ms=150,
+                autofocus_sample_count=7,
+                imgstitch_settle_ms=175,
+                focus_threshold_yellow={"Laplacian": 700.0, "Tenengrad": 800.0, "Brenner": 900.0},
+                focus_threshold_green={"Laplacian": 1700.0, "Tenengrad": 1800.0, "Brenner": 1900.0},
+            )
+
+            save_probe_config(config, path)
+            loaded = load_probe_config(path)
+
+            self.assertEqual(loaded.autofocus_settle_ms, 150)
+            self.assertEqual(loaded.autofocus_sample_count, 7)
+            self.assertEqual(loaded.imgstitch_settle_ms, 175)
+            self.assertEqual(loaded.focus_threshold_yellow["Laplacian"], 700.0)
+            self.assertEqual(loaded.focus_threshold_green["Brenner"], 1900.0)
+
+    def test_green_threshold_must_not_be_below_yellow(self) -> None:
+        config = ProbeConfig(
+            focus_threshold_yellow={"Laplacian": 100.0, "Tenengrad": 100.0, "Brenner": 100.0},
+            focus_threshold_green={"Laplacian": 99.0, "Tenengrad": 100.0, "Brenner": 100.0},
+        )
+
+        with self.assertRaises(ValueError):
+            config.validate()
 
     def test_three_point_distance(self) -> None:
         distance = calibration_distance_px((0, 0), (10, 0), (5, 4))

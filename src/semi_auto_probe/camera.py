@@ -54,7 +54,7 @@ class UsbCamera:
         self._capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self._update_property_text()
 
-    def read(self) -> CameraFrame | None:
+    def read(self, calculate_focus_scores: bool = True) -> CameraFrame | None:
         if not self.is_open:
             self.open()
         assert self._capture is not None
@@ -66,7 +66,7 @@ class UsbCamera:
 
         frame = self._cv2.flip(frame, 0)
         raw_frame = frame.copy()
-        focus_scores = self._focus_scores(frame)
+        focus_scores = self._focus_scores(frame) if calculate_focus_scores else {}
         self._draw_overlay(frame)
         rgb = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
         height, width = rgb.shape[:2]
