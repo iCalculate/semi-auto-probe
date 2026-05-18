@@ -50,6 +50,9 @@ class WebStatus:
     selected_camera_source: str
     frame_age_seconds: float | None
     publisher_fps: float | None
+    active_camera_streams: int
+    active_http_requests: int
+    total_http_requests: int
     last_error: str | None
 
 
@@ -62,6 +65,10 @@ class WebProbeService:
         self._direct_camera_index: int | None = None
         self._selected_camera_source = "auto"
         self._active_camera_streams = 0
+        self._metrics_lock = threading.RLock()
+        self._active_http_requests = 0
+        self._total_http_requests = 0
+        self._clients: dict[str, dict[str, object]] = {}
         self._last_error: str | None = None
 
     def start_from_environment(self) -> None:
@@ -91,8 +98,102 @@ class WebProbeService:
                 selected_camera_source=self._selected_camera_source,
                 frame_age_seconds=publisher_status.get("frame_age_seconds") if publisher_status else None,
                 publisher_fps=publisher_status.get("publisher_fps") if active_source == "desktop" and publisher_status else (self._direct_camera_fps() if active_source == "direct" else None),
+                active_camera_streams=self._active_camera_streams,
+                active_http_requests=self._active_http_requests,
+                total_http_requests=self._total_http_requests,
                 last_error=self._last_error,
             )
+
+    def begin_request(self, request: Request) -> str:
+        client_id = self._client_id_from_request(request)
+        with self._metrics_lock:
+            self._active_http_requests += 1
+            self._total_http_requests += 1
+            entry = self._clients.setdefault(
+                client_id,
+                {
+                    "ip": client_id,
+                    "user_agent": request.headers.get("user-agent", "-"),
+                    "active_requests": 0,
+                    "active_camera_streams": 0,
+                    "total_requests": 0,
+                    "last_path": "",
+                    "last_seen": 0.0,
+                },
+            )
+            entry["active_requests"] = int(entry["active_requests"]) + 1
+            entry["total_requests"] = int(entry["total_requests"]) + 1
+            entry["last_path"] = request.url.path
+            entry["last_seen"] = time.time()
+            entry["user_agent"] = request.headers.get("user-agent", "-")
+            return client_id
+
+    def end_request(self, client_id: str) -> None:
+        with self._metrics_lock:
+            self._active_http_requests = max(0, self._active_http_requests - 1)
+            if client_id in self._clients:
+                self._clients[client_id]["active_requests"] = max(0, int(self._clients[client_id]["active_requests"]) - 1)
+
+    def begin_camera_stream(self, request: Request) -> str:
+        client_id = self._client_id_from_request(request)
+        with self._metrics_lock:
+            entry = self._clients.setdefault(
+                client_id,
+                {
+                    "ip": client_id,
+                    "user_agent": request.headers.get("user-agent", "-"),
+                    "active_requests": 0,
+                    "active_camera_streams": 0,
+                    "total_requests": 0,
+                    "last_path": "",
+                    "last_seen": 0.0,
+                },
+            )
+            entry["active_camera_streams"] = int(entry["active_camera_streams"]) + 1
+            entry["last_path"] = request.url.path
+            entry["last_seen"] = time.time()
+            entry["user_agent"] = request.headers.get("user-agent", "-")
+            return client_id
+
+    def end_camera_stream(self, client_id: str) -> None:
+        with self._metrics_lock:
+            if client_id in self._clients:
+                self._clients[client_id]["active_camera_streams"] = max(0, int(self._clients[client_id]["active_camera_streams"]) - 1)
+
+    def connections(self) -> dict[str, object]:
+        now = time.time()
+        with self._metrics_lock:
+            clients = []
+            for entry in self._clients.values():
+                clients.append(
+                    {
+                        "ip": entry["ip"],
+                        "user_agent": entry["user_agent"],
+                        "active_requests": entry["active_requests"],
+                        "active_camera_streams": entry["active_camera_streams"],
+                        "total_requests": entry["total_requests"],
+                        "last_path": entry["last_path"],
+                        "last_seen_seconds_ago": round(now - float(entry["last_seen"]), 1) if entry["last_seen"] else None,
+                    }
+                )
+            clients.sort(key=lambda item: (int(item["active_camera_streams"]), int(item["active_requests"]), int(item["total_requests"])), reverse=True)
+            return {
+                "active_http_requests": self._active_http_requests,
+                "active_camera_streams": self._active_camera_streams,
+                "total_http_requests": self._total_http_requests,
+                "client_count": len(clients),
+                "clients": clients,
+            }
+
+    @staticmethod
+    def _client_id_from_request(request: Request) -> str:
+        cf_ip = request.headers.get("cf-connecting-ip")
+        if cf_ip:
+            return cf_ip.strip()
+        forwarded_for = request.headers.get("x-forwarded-for")
+        if forwarded_for:
+            return forwarded_for.split(",", 1)[0].strip()
+        return request.client.host if request.client else "unknown"
 
     def connect_serial(self, serial_port: str, timeout: float = 1.0) -> dict[str, object]:
         with self._serial_lock:
@@ -145,9 +246,10 @@ class WebProbeService:
             sources.append({"id": f"direct:{index}", "label": self._direct_camera_label(index), "fps": self._direct_camera_fps(), "available": True})
         return {"selected": self._selected_camera_source, "sources": sources}
 
-    def mjpeg_frames(self, source: str | None = None) -> Iterator[bytes]:
+    def mjpeg_frames(self, request: Request, source: str | None = None) -> Iterator[bytes]:
         if source:
             self.set_camera_source(source)
+        client_id = self.begin_camera_stream(request)
         with self._camera_lock:
             self._active_camera_streams += 1
         try:
@@ -176,6 +278,7 @@ class WebProbeService:
                 self._active_camera_streams = max(0, self._active_camera_streams - 1)
                 if self._active_camera_streams == 0:
                     self._close_direct_camera()
+            self.end_camera_stream(client_id)
 
     def release_direct_camera(self) -> dict[str, object]:
         with self._camera_lock:
@@ -302,6 +405,18 @@ app = FastAPI(
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+@app.middleware("http")
+async def collect_request_metrics(request: Request, call_next):
+    client_id = ""
+    if not request.url.path.startswith("/internal/"):
+        client_id = service.begin_request(request)
+    try:
+        return await call_next(request)
+    finally:
+        if not request.url.path.startswith("/internal/"):
+            service.end_request(client_id)
+
+
 def pid_file_path() -> Path:
     return Path(os.environ.get(PID_FILE_ENV, str(DEFAULT_PID_FILE)))
 
@@ -361,6 +476,11 @@ def api_positions() -> dict[str, object]:
     return service.read_positions()
 
 
+@app.get("/api/connections", dependencies=[Depends(require_access_token)])
+def api_connections() -> dict[str, object]:
+    return service.connections()
+
+
 @app.get("/api/camera-sources", dependencies=[Depends(require_access_token)])
 def api_camera_sources() -> dict[str, object]:
     return service.camera_sources()
@@ -380,9 +500,9 @@ def internal_release_camera(request: Request) -> dict[str, object]:
 
 
 @app.get("/camera.mjpg", dependencies=[Depends(require_access_token)])
-def camera_stream(source: str | None = Query(default=None)) -> StreamingResponse:
+def camera_stream(request: Request, source: str | None = Query(default=None)) -> StreamingResponse:
     return StreamingResponse(
-        service.mjpeg_frames(source=source),
+        service.mjpeg_frames(request=request, source=source),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 

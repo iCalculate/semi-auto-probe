@@ -58,6 +58,41 @@ Or double-click:
 D:\Project\semi-auto-probe\src\semi_auto_probe\web\restart_web.ps1
 ```
 
+For a fully hidden restart with no PowerShell window, double-click:
+
+```text
+D:\Project\semi-auto-probe\src\semi_auto_probe\web\restart_web_silent.vbs
+```
+
+For a persistent tray icon with right-click controls, double-click:
+
+```text
+D:\Project\semi-auto-probe\src\semi_auto_probe\web\web_tray_silent.vbs
+```
+
+The tray menu supports:
+
+- Open Dashboard
+- Restart Web Service
+- Stop Running
+- Web Settings > Update Token
+- Web Settings > Check Connections opens a lightweight connection dashboard
+  with source IPs, active camera streams, active requests, totals, last path,
+  and user-agent details. It refreshes every 5 seconds only while the window is
+  open.
+
+Restart logs are written to:
+
+```text
+D:\Project\semi-auto-probe\.runtime\restart_web.log
+```
+
+Tray logs are written to:
+
+```text
+D:\Project\semi-auto-probe\.runtime\web_tray.log
+```
+
 Open:
 
 ```text
