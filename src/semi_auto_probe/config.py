@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,86 @@ OBJECTIVE_OPTIONS = (20, 10, 5)
 EYEPIECE_OPTIONS = (1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0)
 CALIBRATION_REFERENCE_OBJECTIVE = 20
 CALIBRATION_REFERENCE_EYEPIECE = 1.5
+KEYBOARD_MOTION_SCHEME_ARROW_PAGE = "arrow_page"
+KEYBOARD_MOTION_SCHEME_WASD_QE = "wasd_qe"
+KEYBOARD_MOTION_SCHEMES = (
+    KEYBOARD_MOTION_SCHEME_ARROW_PAGE,
+    KEYBOARD_MOTION_SCHEME_WASD_QE,
+)
+KEYBOARD_MOTION_SCHEME_LABELS = {
+    KEYBOARD_MOTION_SCHEME_ARROW_PAGE: "Arrow keys + PageUp/PageDown",
+    KEYBOARD_MOTION_SCHEME_WASD_QE: "WASD + Q/E",
+}
+AUTOFOCUS_PEAK_MODEL_GAUSSIAN = "gaussian"
+AUTOFOCUS_PEAK_MODEL_LORENTZIAN = "lorentzian"
+AUTOFOCUS_PEAK_MODEL_PARABOLIC = "parabolic"
+AUTOFOCUS_PEAK_MODEL_PSEUDO_VOIGT = "pseudo_voigt"
+AUTOFOCUS_PEAK_MODELS = (
+    AUTOFOCUS_PEAK_MODEL_GAUSSIAN,
+    AUTOFOCUS_PEAK_MODEL_LORENTZIAN,
+    AUTOFOCUS_PEAK_MODEL_PARABOLIC,
+    AUTOFOCUS_PEAK_MODEL_PSEUDO_VOIGT,
+)
+AUTOFOCUS_PEAK_MODEL_LABELS = {
+    AUTOFOCUS_PEAK_MODEL_GAUSSIAN: "Gaussian",
+    AUTOFOCUS_PEAK_MODEL_LORENTZIAN: "Lorentzian",
+    AUTOFOCUS_PEAK_MODEL_PARABOLIC: "Parabolic",
+    AUTOFOCUS_PEAK_MODEL_PSEUDO_VOIGT: "Pseudo-Voigt",
+}
+JOG_STEP_AXES = ("X", "Y", "Z")
+DEFAULT_JOG_STEP_LEVELS = {axis: (1, 10, 100, 1000) for axis in JOG_STEP_AXES}
+
+
+def parse_jog_step_levels_text(text: str) -> tuple[int, ...]:
+    parts = [part for part in re.split(r"[\s,;]+", text.strip()) if part]
+    if not parts:
+        raise ValueError("Jog step levels cannot be empty.")
+    values: list[int] = []
+    for part in parts:
+        try:
+            value = int(part)
+        except ValueError as exc:
+            raise ValueError(f"Jog step level must be an integer: {part!r}.") from exc
+        if value <= 0:
+            raise ValueError("Jog step levels must be positive integers.")
+        values.append(value)
+    return tuple(sorted(set(values)))
+
+
+def format_jog_step_levels(levels: tuple[int, ...] | list[int]) -> str:
+    return ", ".join(str(value) for value in levels)
+
+
+def normalize_autofocus_peak_model(value: Any) -> str:
+    normalized = str(value or AUTOFOCUS_PEAK_MODEL_GAUSSIAN).strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "normal": AUTOFOCUS_PEAK_MODEL_GAUSSIAN,
+        "normal_distribution": AUTOFOCUS_PEAK_MODEL_GAUSSIAN,
+        "cauchy": AUTOFOCUS_PEAK_MODEL_LORENTZIAN,
+        "quadratic": AUTOFOCUS_PEAK_MODEL_PARABOLIC,
+        "pseudo_voigt": AUTOFOCUS_PEAK_MODEL_PSEUDO_VOIGT,
+        "pseudovoigt": AUTOFOCUS_PEAK_MODEL_PSEUDO_VOIGT,
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in AUTOFOCUS_PEAK_MODELS:
+        raise ValueError(f"AutoFocus peak model must be one of {AUTOFOCUS_PEAK_MODELS}.")
+    return normalized
+
+
+def normalize_jog_step_levels_map(data: Any) -> dict[str, tuple[int, ...]]:
+    raw_map = data if isinstance(data, dict) else {}
+    normalized: dict[str, tuple[int, ...]] = {}
+    for axis in JOG_STEP_AXES:
+        raw_value = raw_map.get(axis, raw_map.get(axis.lower(), DEFAULT_JOG_STEP_LEVELS[axis]))
+        if isinstance(raw_value, str):
+            levels = parse_jog_step_levels_text(raw_value)
+        else:
+            try:
+                levels = parse_jog_step_levels_text(", ".join(str(value) for value in raw_value))
+            except TypeError as exc:
+                raise ValueError(f"{axis} jog step levels must be a list or comma-separated text.") from exc
+        normalized[axis] = levels
+    return normalized
 
 
 def calibration_key(objective: int, eyepiece: float) -> str:
@@ -70,9 +151,12 @@ class ProbeConfig:
     cc_accel_time_s: float = 0.1
     autofocus_settle_ms: int = 100
     autofocus_sample_count: int = 5
+    autofocus_peak_model: str = AUTOFOCUS_PEAK_MODEL_GAUSSIAN
     imgstitch_settle_ms: int = 100
     imgstitch_seam_response_yellow: float = 0.10
     imgstitch_seam_response_green: float = 0.25
+    keyboard_motion_scheme: str = KEYBOARD_MOTION_SCHEME_ARROW_PAGE
+    jog_step_levels: dict[str, tuple[int, ...]] = field(default_factory=lambda: dict(DEFAULT_JOG_STEP_LEVELS))
     focus_threshold_yellow: dict[str, float] = field(default_factory=lambda: {"Laplacian": 1000.0, "Tenengrad": 20000.0, "Brenner": 1000.0})
     focus_threshold_green: dict[str, float] = field(default_factory=lambda: {"Laplacian": 2000.0, "Tenengrad": 40000.0, "Brenner": 2000.0})
     calibrations: dict[str, float] = field(default_factory=dict)
@@ -96,12 +180,16 @@ class ProbeConfig:
             raise ValueError("AutoFocus settle time must be in range 0..10000 ms.")
         if self.autofocus_sample_count <= 0 or self.autofocus_sample_count > 1000:
             raise ValueError("AutoFocus sample count must be in range 1..1000.")
+        self.autofocus_peak_model = normalize_autofocus_peak_model(self.autofocus_peak_model)
         if self.imgstitch_settle_ms < 0 or self.imgstitch_settle_ms > 10000:
             raise ValueError("ImgStitch settle time must be in range 0..10000 ms.")
         if self.imgstitch_seam_response_yellow < 0 or self.imgstitch_seam_response_green < 0:
             raise ValueError("ImgStitch seam response thresholds must be non-negative.")
         if self.imgstitch_seam_response_green < self.imgstitch_seam_response_yellow:
             raise ValueError("ImgStitch green seam response threshold must be greater than or equal to yellow threshold.")
+        if self.keyboard_motion_scheme not in KEYBOARD_MOTION_SCHEMES:
+            raise ValueError(f"Keyboard motion scheme must be one of {KEYBOARD_MOTION_SCHEMES}.")
+        self.jog_step_levels = normalize_jog_step_levels_map(self.jog_step_levels)
         for metric in ("Laplacian", "Tenengrad", "Brenner"):
             yellow = float(self.focus_threshold_yellow.get(metric, 0.0))
             green = float(self.focus_threshold_green.get(metric, 0.0))
@@ -162,9 +250,15 @@ class ProbeConfig:
             "cc_accel_time_s": self.cc_accel_time_s,
             "autofocus_settle_ms": self.autofocus_settle_ms,
             "autofocus_sample_count": self.autofocus_sample_count,
+            "autofocus_peak_model": self.autofocus_peak_model,
             "imgstitch_settle_ms": self.imgstitch_settle_ms,
             "imgstitch_seam_response_yellow": self.imgstitch_seam_response_yellow,
             "imgstitch_seam_response_green": self.imgstitch_seam_response_green,
+            "keyboard_motion_scheme": self.keyboard_motion_scheme,
+            "jog_step_levels": {
+                axis: list(self.jog_step_levels[axis])
+                for axis in JOG_STEP_AXES
+            },
             "focus_threshold_yellow": dict(sorted(self.focus_threshold_yellow.items())),
             "focus_threshold_green": dict(sorted(self.focus_threshold_green.items())),
             "calibrations": dict(sorted(self.calibrations.items())),
@@ -183,9 +277,12 @@ class ProbeConfig:
             cc_accel_time_s=float(data.get("cc_accel_time_s", cls.cc_accel_time_s)),
             autofocus_settle_ms=int(data.get("autofocus_settle_ms", cls.autofocus_settle_ms)),
             autofocus_sample_count=int(data.get("autofocus_sample_count", cls.autofocus_sample_count)),
+            autofocus_peak_model=normalize_autofocus_peak_model(data.get("autofocus_peak_model", AUTOFOCUS_PEAK_MODEL_GAUSSIAN)),
             imgstitch_settle_ms=int(data.get("imgstitch_settle_ms", cls.imgstitch_settle_ms)),
             imgstitch_seam_response_yellow=float(data.get("imgstitch_seam_response_yellow", cls.imgstitch_seam_response_yellow)),
             imgstitch_seam_response_green=float(data.get("imgstitch_seam_response_green", cls.imgstitch_seam_response_green)),
+            keyboard_motion_scheme=str(data.get("keyboard_motion_scheme", KEYBOARD_MOTION_SCHEME_ARROW_PAGE)),
+            jog_step_levels=normalize_jog_step_levels_map(data.get("jog_step_levels")),
             focus_threshold_yellow={
                 **cls().focus_threshold_yellow,
                 **{str(key): float(value) for key, value in data.get("focus_threshold_yellow", {}).items()},

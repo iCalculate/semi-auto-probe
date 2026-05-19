@@ -42,12 +42,16 @@ class MatplotlibFocusMap3DView:
         self.view_elev = 28.0
         self.view_azim = -45.0
         self.zoom = 1.0
-        self.drag_start: tuple[float, float, float, float] | None = None
+        self.drag_start: tuple[int, int, float, float] | None = None
         self.base_limits: tuple[float, float, float, float, float, float] | None = None
-        self.canvas.mpl_connect("button_press_event", self._on_press)
-        self.canvas.mpl_connect("button_release_event", self._on_release)
-        self.canvas.mpl_connect("motion_notify_event", self._on_motion)
-        self.canvas.mpl_connect("scroll_event", self._on_scroll)
+        self.view_draw_pending = False
+        self.canvas_widget.bind("<ButtonPress-1>", self._on_press)
+        self.canvas_widget.bind("<B1-Motion>", self._on_motion)
+        self.canvas_widget.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas_widget.bind("<Double-Button-1>", self._on_reset_view)
+        self.canvas_widget.bind("<MouseWheel>", self._on_scroll)
+        self.canvas_widget.bind("<Button-4>", self._on_scroll)
+        self.canvas_widget.bind("<Button-5>", self._on_scroll)
         try:
             self.axes.disable_mouse_rotation()
         except AttributeError:
@@ -82,10 +86,10 @@ class MatplotlibFocusMap3DView:
             if abs(max_y - min_y) < 1e-9:
                 min_y -= 1.0
                 max_y += 1.0
-            grid_x, grid_y = np.meshgrid(np.linspace(min_x, max_x, 13), np.linspace(min_y, max_y, 13))
+            grid_x, grid_y = np.meshgrid(np.linspace(min_x, max_x, 9), np.linspace(min_y, max_y, 9))
             grid_z = model.a * grid_x + model.b * grid_y + model.c
-            self.axes.plot_surface(grid_x, grid_y, grid_z, color="#0ea5e9", alpha=0.22, linewidth=0, shade=True, antialiased=False)
-            self.axes.plot_wireframe(grid_x, grid_y, grid_z, color="#7dd3fc", alpha=0.5, linewidth=0.35, rstride=2, cstride=2)
+            self.axes.plot_surface(grid_x, grid_y, grid_z, color="#075985", alpha=0.34, linewidth=0, shade=False, antialiased=False)
+            self.axes.plot_wireframe(grid_x, grid_y, grid_z, color="#38bdf8", alpha=0.55, linewidth=0.55, rstride=2, cstride=2)
             for x_value, y_value, z_value in zip(xs, ys, zs):
                 fit_z = model.z_at(float(x_value), float(y_value))
                 self.axes.plot([x_value, x_value], [y_value, y_value], [fit_z, z_value], color="#e5edf5", alpha=0.55, linewidth=0.8)
@@ -107,9 +111,15 @@ class MatplotlibFocusMap3DView:
         self.axes.set_facecolor("#05070a")
         self.axes.tick_params(colors="#94a3b8", labelsize=7, pad=0)
         for axis in (self.axes.xaxis, self.axes.yaxis, self.axes.zaxis):
-            axis.pane.set_facecolor((0.02, 0.04, 0.07, 0.92))
-            axis.pane.set_edgecolor("#334155")
-        self.axes.grid(True, color="#334155")
+            axis.pane.set_facecolor((0.02, 0.04, 0.07, 0.72))
+            axis.pane.set_edgecolor("#182231")
+            try:
+                axis._axinfo["grid"]["color"] = (0.12, 0.16, 0.22, 0.42)
+                axis._axinfo["grid"]["linewidth"] = 0.45
+                axis._axinfo["axisline"]["color"] = (0.18, 0.24, 0.32, 0.65)
+            except (AttributeError, KeyError):
+                pass
+        self.axes.grid(True)
 
     def _update_limits(self, xs: np.ndarray, ys: np.ndarray, zs: np.ndarray, model: SamplePlaneModel | None) -> None:
         z_values = list(zs)
@@ -135,9 +145,14 @@ class MatplotlibFocusMap3DView:
             span_z + pad_z * 2.0,
         )
         xy_span = max(span_x, span_y, 1.0)
-        z_aspect = max(0.28, min(0.72, span_z / xy_span * 4.0))
+        # Keep X/Y in true data proportion. Z is intentionally normalized
+        # separately so shallow focus planes still use the panel height.
+        xy_aspect_x = max(span_x / xy_span, 0.35)
+        xy_aspect_y = max(span_y / xy_span, 0.35)
+        z_distribution = float(np.std(z_values)) / max(span_z, 1e-9)
+        z_aspect = max(0.58, min(0.95, 0.68 + z_distribution * 0.42))
         try:
-            self.axes.set_box_aspect((max(span_x / xy_span, 0.45), max(span_y / xy_span, 0.45), z_aspect))
+            self.axes.set_box_aspect((xy_aspect_x, xy_aspect_y, z_aspect))
         except AttributeError:
             pass
         self._apply_limits()
@@ -157,39 +172,52 @@ class MatplotlibFocusMap3DView:
         except TypeError:
             self.axes.view_init(elev=self.view_elev, azim=self.view_azim)
 
-    def _on_press(self, event: object) -> None:
-        if getattr(event, "dblclick", False):
-            self.view_elev = 28.0
-            self.view_azim = -45.0
-            self.zoom = 1.0
-            self._apply_view()
-            self._apply_limits()
-            self.canvas.draw_idle()
-            return
-        if getattr(event, "button", None) != 1 or getattr(event, "x", None) is None or getattr(event, "y", None) is None:
-            return
-        self.drag_start = (float(event.x), float(event.y), self.view_elev, self.view_azim)
+    def _on_press(self, event: tk.Event) -> str:
+        self.drag_start = (event.x, event.y, self.view_elev, self.view_azim)
+        return "break"
 
-    def _on_release(self, _event: object) -> None:
+    def _on_release(self, _event: tk.Event) -> str:
         self.drag_start = None
+        return "break"
 
-    def _on_motion(self, event: object) -> None:
-        if self.drag_start is None or getattr(event, "x", None) is None or getattr(event, "y", None) is None:
-            return
+    def _on_motion(self, event: tk.Event) -> str:
+        if self.drag_start is None:
+            return "break"
         start_x, start_y, start_elev, start_azim = self.drag_start
-        self.view_azim = start_azim + (float(event.x) - start_x) * 0.35
-        self.view_elev = max(-88.0, min(88.0, start_elev - (float(event.y) - start_y) * 0.28))
+        width = max(self.canvas_widget.winfo_width(), 1)
+        height = max(self.canvas_widget.winfo_height(), 1)
+        self.view_azim = start_azim - (event.x - start_x) / width * 180.0
+        self.view_elev = max(-80.0, min(80.0, start_elev + (event.y - start_y) / height * 95.0))
         self._apply_view()
-        self.canvas.draw_idle()
+        self._schedule_view_draw()
+        return "break"
 
-    def _on_scroll(self, event: object) -> None:
-        button = getattr(event, "button", "")
-        step = getattr(event, "step", 0)
-        if button == "up" or step > 0:
-            self.zoom = max(0.25, self.zoom * 0.86)
+    def _on_scroll(self, event: tk.Event) -> str:
+        if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+            self.zoom = max(0.25, self.zoom * 0.9)
         else:
-            self.zoom = min(4.0, self.zoom / 0.86)
+            self.zoom = min(4.0, self.zoom / 0.9)
         self._apply_limits()
+        self._schedule_view_draw()
+        return "break"
+
+    def _on_reset_view(self, _event: tk.Event) -> str:
+        self.view_elev = 28.0
+        self.view_azim = -45.0
+        self.zoom = 1.0
+        self._apply_view()
+        self._apply_limits()
+        self._schedule_view_draw()
+        return "break"
+
+    def _schedule_view_draw(self) -> None:
+        if self.view_draw_pending:
+            return
+        self.view_draw_pending = True
+        self.canvas_widget.after(15, self._flush_view_draw)
+
+    def _flush_view_draw(self) -> None:
+        self.view_draw_pending = False
         self.canvas.draw_idle()
 
 
@@ -295,8 +323,8 @@ class CanvasFocusMap3DView:
         if self.drag_start is None:
             return "break"
         start_x, start_y, start_yaw, start_pitch = self.drag_start
-        self.yaw = start_yaw + (event.x - start_x) * 0.45
-        self.pitch = max(-80.0, min(80.0, start_pitch - (event.y - start_y) * 0.45))
+        self.yaw = start_yaw - (event.x - start_x) * 0.45
+        self.pitch = max(-80.0, min(80.0, start_pitch + (event.y - start_y) * 0.45))
         self.render(self.records, self.model)
         return "break"
 

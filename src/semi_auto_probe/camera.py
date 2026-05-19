@@ -11,6 +11,7 @@ class CameraFrame:
     ppm_bytes: bytes
     focus_scores: dict[str, float]
     image_bgr: object
+    captured_at: float
 
 
 class UsbCamera:
@@ -63,6 +64,7 @@ class UsbCamera:
         ok, frame = self._capture.read()
         if not ok:
             return None
+        captured_at = time.monotonic()
 
         frame = self._cv2.flip(frame, 0)
         raw_frame = frame.copy()
@@ -71,7 +73,7 @@ class UsbCamera:
         rgb = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
         height, width = rgb.shape[:2]
         header = f"P6 {width} {height} 255\n".encode("ascii")
-        return CameraFrame(width=width, height=height, ppm_bytes=header + rgb.tobytes(), focus_scores=focus_scores, image_bgr=raw_frame)
+        return CameraFrame(width=width, height=height, ppm_bytes=header + rgb.tobytes(), focus_scores=focus_scores, image_bgr=raw_frame, captured_at=captured_at)
 
     def _focus_scores(self, frame) -> dict[str, float]:
         assert self._cv2 is not None

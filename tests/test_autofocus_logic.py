@@ -3,6 +3,11 @@ from __future__ import annotations
 import unittest
 
 from semi_auto_probe.app import ProbeApp
+from semi_auto_probe.config import (
+    AUTOFOCUS_PEAK_MODEL_LORENTZIAN,
+    AUTOFOCUS_PEAK_MODEL_PARABOLIC,
+    AUTOFOCUS_PEAK_MODEL_PSEUDO_VOIGT,
+)
 
 
 class AutoFocusLogicTests(unittest.TestCase):
@@ -85,6 +90,54 @@ class AutoFocusLogicTests(unittest.TestCase):
 
     def test_gaussian_fit_falls_back_for_flat_scores(self) -> None:
         self.assertEqual(ProbeApp._fit_gaussian_focus_peak({1: 10.0, 2: 10.0, 3: 10.0}), 1.0)
+
+    def test_lorentzian_fit_returns_peak_center_with_zero_baseline(self) -> None:
+        scores = {
+            80: 20.0,
+            90: 50.0,
+            100: 100.0,
+            110: 50.0,
+            120: 20.0,
+        }
+
+        model = ProbeApp._fit_focus_peak_model(scores, AUTOFOCUS_PEAK_MODEL_LORENTZIAN)
+
+        self.assertIsNotNone(model)
+        assert model is not None
+        self.assertEqual(model["baseline"], 0.0)
+        self.assertAlmostEqual(float(model["mu"]), 100.0, delta=1.0)
+
+    def test_parabolic_fit_returns_peak_center_with_zero_baseline(self) -> None:
+        scores = {
+            80: 0.0,
+            90: 75.0,
+            100: 100.0,
+            110: 75.0,
+            120: 0.0,
+        }
+
+        model = ProbeApp._fit_focus_peak_model(scores, AUTOFOCUS_PEAK_MODEL_PARABOLIC)
+
+        self.assertIsNotNone(model)
+        assert model is not None
+        self.assertEqual(model["baseline"], 0.0)
+        self.assertAlmostEqual(float(model["mu"]), 100.0, delta=1.0)
+
+    def test_pseudo_voigt_fit_returns_peak_center_with_zero_baseline(self) -> None:
+        scores = {
+            80: 25.0,
+            90: 68.0,
+            100: 100.0,
+            110: 68.0,
+            120: 25.0,
+        }
+
+        model = ProbeApp._fit_focus_peak_model(scores, AUTOFOCUS_PEAK_MODEL_PSEUDO_VOIGT)
+
+        self.assertIsNotNone(model)
+        assert model is not None
+        self.assertEqual(model["baseline"], 0.0)
+        self.assertAlmostEqual(float(model["mu"]), 100.0, delta=1.0)
 
 
 if __name__ == "__main__":

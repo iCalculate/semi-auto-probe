@@ -8,6 +8,7 @@ import shutil
 import threading
 import time
 import tkinter as tk
+from collections.abc import Callable
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -17,17 +18,31 @@ from .af_plane import (
     clear_sample_plane_model,
     fit_sample_plane,
     generate_af_mesh,
+    get_sample_plane_model,
     get_focus_z_at_xy,
     set_sample_plane_model,
 )
 from .camera import UsbCamera
 from .config import (
+    AUTOFOCUS_PEAK_MODEL_GAUSSIAN,
+    AUTOFOCUS_PEAK_MODEL_LABELS,
+    AUTOFOCUS_PEAK_MODEL_LORENTZIAN,
+    AUTOFOCUS_PEAK_MODELS,
+    AUTOFOCUS_PEAK_MODEL_PARABOLIC,
+    AUTOFOCUS_PEAK_MODEL_PSEUDO_VOIGT,
     DEFAULT_CONFIG_FILENAME,
     EYEPIECE_OPTIONS,
+    JOG_STEP_AXES,
+    KEYBOARD_MOTION_SCHEME_ARROW_PAGE,
+    KEYBOARD_MOTION_SCHEME_LABELS,
+    KEYBOARD_MOTION_SCHEME_WASD_QE,
     OBJECTIVE_OPTIONS,
     ProbeConfig,
     derive_missing_calibrations,
+    format_jog_step_levels,
     load_probe_config,
+    normalize_autofocus_peak_model,
+    parse_jog_step_levels_text,
     pulses_from_um,
     save_probe_config,
 )
@@ -61,6 +76,72 @@ RESULT_POLL_INTERVAL_MS = 25
 RESULT_POLL_MAX_EVENTS = 30
 RESULT_POLL_MAX_SECONDS = 0.012
 REALTIME_POSITION_UI_INTERVAL_SECONDS = 0.05
+AUTOFOCUS_POST_SETTLE_DISCARD_FRAMES = 2
+FOCUSMAP_AUTOSAVE_FILENAME = "last_focusmap_mapping.json"
+
+
+class ToggleSwitch(tk.Canvas):
+    def __init__(
+        self,
+        parent: tk.Widget,
+        variable: tk.BooleanVar,
+        colors: dict[str, str],
+        *,
+        command: Callable[[], None] | None = None,
+        background: str | None = None,
+        width: int = 44,
+        height: int = 24,
+    ) -> None:
+        super().__init__(
+            parent,
+            width=width,
+            height=height,
+            bg=background or colors["surface"],
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2",
+        )
+        self.variable = variable
+        self.colors = colors
+        self.command = command
+        self.switch_width = width
+        self.switch_height = height
+        self.variable.trace_add("write", lambda *_args: self._draw())
+        self.bind("<Button-1>", self._toggle)
+        self.bind("<space>", self._toggle)
+        self.bind("<Return>", self._toggle)
+        self._draw()
+
+    def _toggle(self, _event: tk.Event | None = None) -> str:
+        self.variable.set(not bool(self.variable.get()))
+        if self.command is not None:
+            self.command()
+        return "break"
+
+    def _draw(self) -> None:
+        self.delete("all")
+        enabled = bool(self.variable.get())
+        width = self.switch_width
+        height = self.switch_height
+        radius = height / 2
+        track_fill = "#0f3b2d" if enabled else self.colors["surface_3"]
+        track_outline = "#1f7a5a" if enabled else self.colors["border"]
+        knob_fill = "#d1fae5" if enabled else self.colors["muted"]
+        self.create_oval(1, 1, 1 + height - 2, height - 1, fill=track_fill, outline=track_outline, width=1)
+        self.create_oval(width - height + 1, 1, width - 1, height - 1, fill=track_fill, outline=track_outline, width=1)
+        self.create_rectangle(radius, 1, width - radius, height - 1, fill=track_fill, outline=track_fill)
+        self.create_line(radius, 1, width - radius, 1, fill=track_outline)
+        self.create_line(radius, height - 1, width - radius, height - 1, fill=track_outline)
+        knob_radius = radius - 4
+        knob_center = width - radius if enabled else radius
+        self.create_oval(
+            knob_center - knob_radius,
+            radius - knob_radius,
+            knob_center + knob_radius,
+            radius + knob_radius,
+            fill=knob_fill,
+            outline=knob_fill,
+        )
 
 
 class ProbeApp(tk.Tk):
@@ -72,6 +153,7 @@ class ProbeApp(tk.Tk):
         self.geometry("1400x880")
         self.minsize(1040, 600)
         self.configure(bg="#0b0f14")
+        self.after_idle(self._maximize_default_window)
 
         self.serial_client: ControllerSerialClient | None = None
         self.camera: UsbCamera | None = None
@@ -103,6 +185,7 @@ class ProbeApp(tk.Tk):
         self.imgstitch_focus_sampling_required = False
         self.latest_stitch_frame = None
         self.current_page = "Main"
+        self.active_page_name: str | None = None
         self.config_path = Path.cwd() / DEFAULT_CONFIG_FILENAME
         try:
             self.probe_config = load_probe_config(self.config_path)
@@ -131,7 +214,8 @@ class ProbeApp(tk.Tk):
         self.latest_focus_frame_ppm: bytes | None = None
         self.focus_history: list[tuple[float, dict[str, float]]] = []
         self.autofocus_samples: list[tuple[float, float, int]] = []
-        self.autofocus_z_score_samples: list[tuple[int, float, int]] = []
+        self.autofocus_z_score_samples: list[dict[str, object]] = []
+        self.autofocus_fine_range: tuple[int, int] | None = None
         self.autofocus_history_rows: list[dict[str, object]] = []
         self.autofocus_run_start_time: float | None = None
         self.autofocus_run_end_time: float | None = None
@@ -186,11 +270,12 @@ class ProbeApp(tk.Tk):
             "Z": tk.StringVar(value="10"),
         }
         self.jog_step_levels = {
-            "X": (1, 10, 100, 1000),
-            "Y": (1, 10, 100, 1000),
-            "Z": (1, 10, 50),
+            axis: tuple(self.probe_config.jog_step_levels[axis])
+            for axis in JOG_STEP_AXES
         }
         self.motion_mode_var = tk.StringVar(value="Relative")
+        self.main_focusmap_plane_var = tk.BooleanVar(value=False)
+        self.keyboard_move_enabled_var = tk.BooleanVar(value=True)
         self.realtime_enabled = False
         self.realtime_button_var = tk.StringVar(value="Continue")
         self.home_signal_button_var = tk.StringVar(value="Home Signals")
@@ -227,6 +312,7 @@ class ProbeApp(tk.Tk):
         self.imgstitch_show_seams_var = tk.BooleanVar(value=True)
         self.imgstitch_green_edge_correction_var = tk.BooleanVar(value=True)
         self.imgstitch_white_balance_var = tk.BooleanVar(value=True)
+        self.imgstitch_focusmap_plane_var = tk.BooleanVar(value=False)
         self.imgstitch_quality_var = tk.StringVar(value="No seam data")
         self.imgstitch_point_status_var = tk.StringVar(value="No rectangle points")
         self.imgstitch_plane_af_var = tk.BooleanVar(value=False)
@@ -255,6 +341,7 @@ class ProbeApp(tk.Tk):
         self.axis_indicator_canvases: dict[str, tk.Canvas] = {}
         self.axis_indicator_items: dict[str, int] = {}
         self.axis_indicator_colors = {"X": "#60a5fa", "Y": "#34d399", "Z": "#fbbf24"}
+        self.axis_control_buttons: dict[str, list[ttk.Button]] = {}
         self.objective_var = tk.StringVar(value=str(self.probe_config.objective))
         self.eyepiece_var = tk.StringVar(value=f"{self.probe_config.eyepiece:g}")
         self.microstep_var = tk.StringVar(value=str(self.probe_config.microstep))
@@ -265,7 +352,13 @@ class ProbeApp(tk.Tk):
         self.cc_accel_time_var = tk.StringVar(value=f"{self.probe_config.cc_accel_time_s:g}")
         self.autofocus_settle_ms_var = tk.StringVar(value=str(self.probe_config.autofocus_settle_ms))
         self.autofocus_sample_count_var = tk.StringVar(value=str(self.probe_config.autofocus_sample_count))
+        self.autofocus_peak_model_var = tk.StringVar(value=self._autofocus_peak_model_label(self.probe_config.autofocus_peak_model))
         self.imgstitch_settle_ms_var = tk.StringVar(value=str(self.probe_config.imgstitch_settle_ms))
+        self.keyboard_motion_scheme_var = tk.StringVar(value=self._keyboard_motion_scheme_label(self.probe_config.keyboard_motion_scheme))
+        self.jog_step_level_vars = {
+            axis: tk.StringVar(value=format_jog_step_levels(self.jog_step_levels[axis]))
+            for axis in JOG_STEP_AXES
+        }
         self.focus_threshold_yellow_vars = {
             metric: tk.StringVar(value=f"{self.probe_config.focus_threshold_yellow[metric]:g}")
             for metric in ("Laplacian", "Tenengrad", "Brenner")
@@ -300,6 +393,15 @@ class ProbeApp(tk.Tk):
             self.iconphoto(True, self.window_icon)
         except tk.TclError as exc:
             logger.warning("Failed to load window icon from %s: %s", icon_path, exc)
+
+    def _maximize_default_window(self) -> None:
+        try:
+            self.state("zoomed")
+        except tk.TclError:
+            try:
+                self.attributes("-zoomed", True)
+            except tk.TclError:
+                logger.debug("Default maximize is not supported on this platform.")
 
     def _configure_theme(self) -> None:
         self.colors = {
@@ -399,10 +501,147 @@ class ProbeApp(tk.Tk):
         )
         style.configure("TLabelframe", background=self.colors["surface"], bordercolor=self.colors["border"])
         style.configure("TLabelframe.Label", background=self.colors["surface"], foreground=self.colors["muted"], font=("Segoe UI Semibold", 9))
+        self.option_add("*Entry.selectBackground", "#2563eb")
+        self.option_add("*Entry.selectForeground", "#f8fafc")
+        self.option_add("*Spinbox.selectBackground", "#2563eb")
+        self.option_add("*Spinbox.selectForeground", "#f8fafc")
         self.option_add("*TCombobox*Listbox.background", self.colors["surface_2"])
         self.option_add("*TCombobox*Listbox.foreground", self.colors["text"])
-        self.option_add("*TCombobox*Listbox.selectBackground", self.colors["surface_3"])
-        self.option_add("*TCombobox*Listbox.selectForeground", self.colors["text"])
+        self.option_add("*TCombobox*Listbox.selectBackground", "#2563eb")
+        self.option_add("*TCombobox*Listbox.selectForeground", "#f8fafc")
+
+    @staticmethod
+    def _integer_text_allowed(proposed: str, minimum: int | None = None, maximum: int | None = None) -> bool:
+        if proposed == "":
+            return True
+        allow_negative = minimum is None or minimum < 0
+        if proposed == "-":
+            return allow_negative
+        if proposed.startswith("-"):
+            if not allow_negative or not proposed[1:].isdigit():
+                return False
+        elif not proposed.isdigit():
+            return False
+        try:
+            value = int(proposed)
+        except ValueError:
+            return False
+        if maximum is not None and value > maximum:
+            return False
+        return True
+
+    @staticmethod
+    def _float_text_allowed(proposed: str, minimum: float | None = None, maximum: float | None = None) -> bool:
+        if proposed == "":
+            return True
+        allow_negative = minimum is None or minimum < 0
+        if proposed in {"-", ".", "-."}:
+            return allow_negative or not proposed.startswith("-")
+        if proposed.count(".") > 1:
+            return False
+        if proposed.startswith("-"):
+            if not allow_negative:
+                return False
+            digits = proposed[1:].replace(".", "", 1)
+        else:
+            digits = proposed.replace(".", "", 1)
+        if digits and not digits.isdigit():
+            return False
+        try:
+            value = float(proposed)
+        except ValueError:
+            return False
+        if maximum is not None and value > maximum:
+            return False
+        return True
+
+    @staticmethod
+    def _jog_step_text_allowed(proposed: str) -> bool:
+        return all(char.isdigit() or char in {",", ";", " ", "\t"} for char in proposed)
+
+    def _numeric_widget_options(self, *, font: tuple[str, int] | tuple[str, int, str] = ("Segoe UI", 10), fg: str | None = None) -> dict[str, object]:
+        return {
+            "relief": "flat",
+            "bd": 0,
+            "bg": self.colors["surface_2"],
+            "fg": fg or self.colors["text"],
+            "insertbackground": self.colors["text"],
+            "selectbackground": "#2563eb",
+            "selectforeground": "#f8fafc",
+            "highlightthickness": 1,
+            "highlightbackground": self.colors["border"],
+            "highlightcolor": "#38bdf8",
+            "font": font,
+        }
+
+    def _numeric_entry(
+        self,
+        parent: tk.Widget,
+        variable: tk.StringVar,
+        *,
+        kind: str = "int",
+        minimum: float | int | None = None,
+        maximum: float | int | None = None,
+        width: int = 10,
+        justify: str = "left",
+        font: tuple[str, int] | tuple[str, int, str] = ("Segoe UI", 10),
+        fg: str | None = None,
+    ) -> tk.Entry:
+        if kind == "float":
+            validate_command = self.register(lambda proposed: self._float_text_allowed(proposed, None if minimum is None else float(minimum), None if maximum is None else float(maximum)))
+        else:
+            validate_command = self.register(lambda proposed: self._integer_text_allowed(proposed, None if minimum is None else int(minimum), None if maximum is None else int(maximum)))
+        return tk.Entry(
+            parent,
+            textvariable=variable,
+            width=width,
+            justify=justify,
+            validate="key",
+            validatecommand=(validate_command, "%P"),
+            **self._numeric_widget_options(font=font, fg=fg),
+        )
+
+    def _numeric_spinbox(
+        self,
+        parent: tk.Widget,
+        variable: tk.StringVar,
+        *,
+        kind: str = "int",
+        from_value: float | int = 0,
+        to_value: float | int = 1_000_000,
+        increment: float | int = 1,
+        width: int = 9,
+        command: Callable[[], None] | None = None,
+    ) -> tk.Spinbox:
+        if kind == "float":
+            validate_command = self.register(lambda proposed: self._float_text_allowed(proposed, float(from_value), float(to_value)))
+        else:
+            validate_command = self.register(lambda proposed: self._integer_text_allowed(proposed, int(from_value), int(to_value)))
+        options: dict[str, object] = {
+            "from_": from_value,
+            "to": to_value,
+            "increment": increment,
+            "textvariable": variable,
+            "width": width,
+            "validate": "key",
+            "validatecommand": (validate_command, "%P"),
+            "buttonbackground": self.colors["surface_3"],
+            **self._numeric_widget_options(),
+        }
+        if command is not None:
+            options["command"] = command
+        spinbox = tk.Spinbox(parent, **options)
+        return spinbox
+
+    def _jog_step_levels_entry(self, parent: tk.Widget, variable: tk.StringVar) -> tk.Entry:
+        validate_command = self.register(lambda proposed: self._jog_step_text_allowed(proposed))
+        return tk.Entry(
+            parent,
+            textvariable=variable,
+            validate="key",
+            validatecommand=(validate_command, "%P"),
+            **self._numeric_widget_options(),
+        )
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -425,7 +664,7 @@ class ProbeApp(tk.Tk):
         ttk.Button(toolbar, text="Test", command=self.run_comm_test).grid(row=0, column=4, padx=(0, 12))
 
         ttk.Label(toolbar, text="CAM", style="Muted.TLabel").grid(row=0, column=5, padx=(0, 6))
-        self.camera_index_spinbox = ttk.Spinbox(toolbar, from_=0, to=8, textvariable=self.camera_index_var, width=3)
+        self.camera_index_spinbox = self._numeric_spinbox(toolbar, self.camera_index_var, from_value=0, to_value=8, width=3)
         self.camera_index_spinbox.grid(row=0, column=6, padx=(0, 6), ipady=1)
         ttk.Button(toolbar, text="Restart", command=self.restart_camera).grid(row=0, column=7, padx=(0, 10))
         ttk.Button(toolbar, text="EMERGENCY STOP", style="Danger.TButton", command=self.emergency_stop).grid(row=0, column=8)
@@ -488,11 +727,26 @@ class ProbeApp(tk.Tk):
         self._build_imgstitch_page(imgstitch_page)
         self._build_config_page(config_page)
         self._update_config_display()
+        self._warm_page_layouts()
         self.show_page("Main")
 
     def show_page(self, name: str) -> None:
+        if name not in self.pages:
+            return
+        if name == self.active_page_name:
+            return
+        if name != "Main":
+            self._clear_held_keyboard_moves()
+            if self.vision_panel is not None:
+                self.vision_panel.set_shift_down(False)
         self.current_page = name
-        self.pages[name].tkraise()
+        page = self.pages[name]
+        try:
+            page.update_idletasks()
+        except tk.TclError:
+            pass
+        page.tkraise()
+        self.active_page_name = name
         for page_name, button in self.tab_buttons.items():
             selected = page_name == name
             button.configure(
@@ -500,6 +754,23 @@ class ProbeApp(tk.Tk):
                 fg="#d1fae5" if selected else self.colors["muted"],
                 highlightbackground="#2dd4bf" if selected else self.colors["border"],
             )
+        self.after_idle(lambda page_name=name: self._refresh_after_page_switch(page_name))
+
+    def _warm_page_layouts(self) -> None:
+        for page in self.pages.values():
+            try:
+                page.update_idletasks()
+            except tk.TclError:
+                pass
+
+    def _refresh_after_page_switch(self, name: str) -> None:
+        if name != self.current_page:
+            return
+        if name == "Main" and self.vision_panel is not None:
+            self.vision_panel.draw_image()
+            self.vision_panel.draw_overlay()
+        elif name == "FocusMap":
+            self._draw_focusmap_all()
 
     def _build_main_page(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -516,7 +787,16 @@ class ProbeApp(tk.Tk):
         camera_header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         camera_header.columnconfigure(0, weight=1)
         ttk.Label(camera_header, text="LIVE VISION", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(camera_header, text="USB camera preview", style="Muted.TLabel").grid(row=0, column=1, sticky="e")
+        keyboard_toggle = ttk.Frame(camera_header, style="Panel.TFrame")
+        keyboard_toggle.grid(row=0, column=1, sticky="e", padx=(12, 10))
+        ttk.Label(keyboard_toggle, text="KeyboardMove", style="Muted.TLabel").grid(row=0, column=0, sticky="e", padx=(0, 6))
+        ToggleSwitch(
+            keyboard_toggle,
+            self.keyboard_move_enabled_var,
+            self.colors,
+            command=self._on_keyboard_move_toggle,
+        ).grid(row=0, column=1, sticky="e")
+        ttk.Label(camera_header, text="USB camera preview", style="Muted.TLabel").grid(row=0, column=2, sticky="e")
 
         self.vision_panel = VisionPanel(
             camera_panel,
@@ -704,16 +984,13 @@ class ProbeApp(tk.Tk):
             cell.grid(row=1, column=col, sticky="ew", padx=(0 if col == 0 else 6, 0 if col == 2 else 6))
             cell.columnconfigure(0, weight=1, minsize=84)
             ttk.Label(cell, text=axis, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
-            entry = tk.Entry(
+            entry = self._numeric_entry(
                 cell,
-                textvariable=self.position_vars[axis],
+                self.position_vars[axis],
+                minimum=None,
+                maximum=None,
                 justify="center",
-                relief="flat",
-                bd=0,
-                bg=self.colors["surface_2"],
                 fg=self.colors["accent"],
-                insertbackground=self.colors["text"],
-                selectbackground=self.colors["surface_3"],
                 font=("Cascadia Mono", 15, "bold"),
                 width=7,
             )
@@ -751,6 +1028,17 @@ class ProbeApp(tk.Tk):
         ttk.Button(zero_bar, text="Set New Zero", style="Accent.TButton", command=self.set_xyz_zero).grid(row=0, column=1, sticky="ew", padx=(4, 4))
         ttk.Button(zero_bar, text="Go Zero", command=self.go_xyz_zero).grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
+        focusmap_toggle = ttk.Frame(axes, style="Panel.TFrame")
+        focusmap_toggle.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 10))
+        focusmap_toggle.columnconfigure(0, weight=1)
+        ttk.Label(focusmap_toggle, text="FocusMap Z", style="Panel.TLabel").grid(row=0, column=0, sticky="w")
+        ToggleSwitch(
+            focusmap_toggle,
+            self.main_focusmap_plane_var,
+            self.colors,
+            command=self._on_main_focusmap_plane_toggle,
+        ).grid(row=0, column=1, sticky="e")
+
     def _axis_control_row(self, parent: ttk.Frame, row_index: int, axis: str, label: str, color: str) -> None:
         row = ttk.Frame(parent, style="Panel.TFrame", padding=(8, 6))
         row.grid(row=row_index, column=0, sticky="ew", padx=8, pady=(8 if row_index == 0 else 3, 4))
@@ -765,10 +1053,14 @@ class ProbeApp(tk.Tk):
 
         ttk.Label(row, text=label, style="Panel.TLabel").grid(row=0, column=1, sticky="w")
         ttk.Label(row, text="Jog Step", style="Muted.TLabel").grid(row=1, column=1, sticky="w", pady=(4, 0))
-        ttk.Spinbox(row, from_=1, to=1_000_000, increment=1, textvariable=self.step_vars[axis], width=7).grid(row=1, column=2, sticky="ew", padx=(6, 6), pady=(4, 0))
-        ttk.Button(row, text="Fwd", style="Accent.TButton", command=lambda a=axis: self.axis_forward(a)).grid(row=0, column=2, sticky="ew", padx=(6, 0))
-        ttk.Button(row, text="Rev", command=lambda a=axis: self.axis_reverse(a)).grid(row=0, column=3, sticky="ew", padx=(6, 0))
-        ttk.Button(row, text="Stop", style="Ghost.TButton", command=lambda a=axis: self.axis_stop(a)).grid(row=1, column=3, sticky="ew", padx=(8, 0), pady=(4, 0))
+        self._numeric_spinbox(row, self.step_vars[axis], from_value=1, to_value=1_000_000, width=7).grid(row=1, column=2, sticky="ew", padx=(6, 6), pady=(4, 0))
+        fwd_button = ttk.Button(row, text="Fwd", style="Accent.TButton", command=lambda a=axis: self.axis_forward(a))
+        fwd_button.grid(row=0, column=2, sticky="ew", padx=(6, 0))
+        rev_button = ttk.Button(row, text="Rev", command=lambda a=axis: self.axis_reverse(a))
+        rev_button.grid(row=0, column=3, sticky="ew", padx=(6, 0))
+        stop_button = ttk.Button(row, text="Stop", style="Ghost.TButton", command=lambda a=axis: self.axis_stop(a))
+        stop_button.grid(row=1, column=3, sticky="ew", padx=(8, 0), pady=(4, 0))
+        self.axis_control_buttons[axis] = [fwd_button, rev_button, stop_button]
 
     def _build_communication_page(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -785,7 +1077,7 @@ class ProbeApp(tk.Tk):
         ttk.Radiobutton(mode_bar, text="Hex", variable=self.comm_input_mode_var, value="Hex", command=self._update_comm_note).grid(row=0, column=0, sticky="w")
         ttk.Radiobutton(mode_bar, text="Text", variable=self.comm_input_mode_var, value="Text", command=self._update_comm_note).grid(row=0, column=1, sticky="w", padx=(10, 0))
         ttk.Label(mode_bar, text="Read bytes", style="Muted.TLabel").grid(row=0, column=2, sticky="w", padx=(22, 6))
-        ttk.Spinbox(mode_bar, from_=0, to=4096, increment=1, width=6, textvariable=self.comm_read_length_var).grid(row=0, column=3, sticky="w")
+        self._numeric_spinbox(mode_bar, self.comm_read_length_var, from_value=0, to_value=4096, width=6).grid(row=0, column=3, sticky="w")
         ttk.Button(mode_bar, text="Load Test", style="Ghost.TButton", command=self.load_default_comm_test).grid(row=0, column=4, sticky="e", padx=(18, 0))
         ttk.Button(mode_bar, text="Send", style="Accent.TButton", command=self.send_manual_command).grid(row=0, column=5, sticky="e", padx=(8, 0))
         ttk.Button(mode_bar, text="Clear", command=self.clear_hex_history).grid(row=0, column=6, sticky="e", padx=(8, 0))
@@ -878,7 +1170,7 @@ class ProbeApp(tk.Tk):
         graph_header.columnconfigure(0, weight=1)
         ttk.Label(graph_header, text="FOCUS SCORE HISTORY", style="Section.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(graph_header, text="Window", style="Muted.TLabel").grid(row=0, column=1, sticky="e", padx=(0, 6))
-        window_spin = ttk.Spinbox(graph_header, from_=5, to=600, increment=5, width=6, textvariable=self.focus_window_var, command=self._draw_focus_history)
+        window_spin = self._numeric_spinbox(graph_header, self.focus_window_var, from_value=5, to_value=600, increment=5, width=6, command=self._draw_focus_history)
         window_spin.grid(row=0, column=2, sticky="e")
         ttk.Label(graph_header, text="s", style="Muted.TLabel").grid(row=0, column=3, sticky="e", padx=(4, 0))
         window_spin.bind("<Return>", lambda _event: self._draw_focus_history())
@@ -910,11 +1202,11 @@ class ProbeApp(tk.Tk):
         metric_combo.bind("<<ComboboxSelected>>", lambda _event: self._on_focus_metric_changed())
 
         ttk.Label(control_panel, text="Initial Step", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=(12, 4))
-        ttk.Spinbox(control_panel, from_=1, to=10000, increment=1, textvariable=self.autofocus_step_var, width=10).grid(row=5, column=0, sticky="ew")
+        self._numeric_spinbox(control_panel, self.autofocus_step_var, from_value=1, to_value=10000, width=10).grid(row=5, column=0, sticky="ew")
         ttk.Label(control_panel, text="Min Step", style="Muted.TLabel").grid(row=6, column=0, sticky="w", pady=(12, 4))
-        ttk.Spinbox(control_panel, from_=1, to=10000, increment=1, textvariable=self.autofocus_min_step_var, width=10).grid(row=7, column=0, sticky="ew")
+        self._numeric_spinbox(control_panel, self.autofocus_min_step_var, from_value=1, to_value=10000, width=10).grid(row=7, column=0, sticky="ew")
         ttk.Label(control_panel, text="Search Range (+/-)", style="Muted.TLabel").grid(row=8, column=0, sticky="w", pady=(12, 4))
-        ttk.Spinbox(control_panel, from_=1, to=1000000, increment=10, textvariable=self.autofocus_max_moves_var, width=10).grid(row=9, column=0, sticky="ew")
+        self._numeric_spinbox(control_panel, self.autofocus_max_moves_var, from_value=1, to_value=1_000_000, increment=10, width=10).grid(row=9, column=0, sticky="ew")
 
         manual = ttk.Frame(control_panel, style="Panel.TFrame")
         manual.grid(row=10, column=0, sticky="ew", pady=(16, 0))
@@ -1022,9 +1314,23 @@ class ProbeApp(tk.Tk):
         control_panel.grid_propagate(False)
         control_panel.columnconfigure((0, 1), weight=1, uniform="af_plane_controls")
 
-        def add_spinbox(row_index: int, label: str, variable: tk.StringVar, column: int, from_value: float = -1_000_000, to_value: float = 1_000_000, increment: float = 1) -> None:
-            ttk.Label(control_panel, text=label, style="Muted.TLabel").grid(row=row_index, column=column, sticky="w", pady=(7, 2), padx=(0, 5) if column == 0 else (5, 0))
-            ttk.Spinbox(control_panel, from_=from_value, to=to_value, increment=increment, textvariable=variable, width=9).grid(row=row_index + 1, column=column, sticky="ew", padx=(0, 5) if column == 0 else (5, 0))
+        self.af_plane_center_range_widgets: list[tk.Widget] = []
+        self.af_plane_pick_region_widgets: list[tk.Widget] = []
+
+        def add_spinbox(
+            row_index: int,
+            label: str,
+            variable: tk.StringVar,
+            column: int,
+            from_value: float = -1_000_000,
+            to_value: float = 1_000_000,
+            increment: float = 1,
+        ) -> tuple[tk.Widget, tk.Widget]:
+            label_widget = ttk.Label(control_panel, text=label, style="Muted.TLabel")
+            label_widget.grid(row=row_index, column=column, sticky="w", pady=(7, 2), padx=(0, 5) if column == 0 else (5, 0))
+            spinbox = self._numeric_spinbox(control_panel, variable, from_value=from_value, to_value=to_value, increment=increment, width=9)
+            spinbox.grid(row=row_index + 1, column=column, sticky="ew", padx=(0, 5) if column == 0 else (5, 0))
+            return label_widget, spinbox
 
         row = 0
         ttk.Label(control_panel, text="MESH SETUP", style="Section.TLabel").grid(row=row, column=0, columnspan=2, sticky="w")
@@ -1033,22 +1339,32 @@ class ProbeApp(tk.Tk):
         ttk.Label(control_panel, text="Region mode", style="Muted.TLabel").grid(row=row, column=1, sticky="w", pady=(8, 2), padx=(5, 0))
         row += 1
         ttk.Combobox(control_panel, textvariable=self.af_plane_mesh_type_var, values=("Rectangular", "Hexagonal"), state="readonly", width=12).grid(row=row, column=0, sticky="ew", padx=(0, 5))
-        ttk.Combobox(control_panel, textvariable=self.af_plane_region_mode_var, values=("Center / Range", "Pick P1/P2"), state="readonly", width=12).grid(row=row, column=1, sticky="ew", padx=(5, 0))
+        region_combo = ttk.Combobox(control_panel, textvariable=self.af_plane_region_mode_var, values=("Center / Range", "Pick P1/P2"), state="readonly", width=12)
+        region_combo.grid(row=row, column=1, sticky="ew", padx=(5, 0))
+        region_combo.bind("<<ComboboxSelected>>", lambda _event: self._update_af_plane_region_controls())
+        self.af_plane_region_mode_var.trace_add("write", lambda *_args: self._update_af_plane_region_controls())
         row += 1
-        add_spinbox(row, "Center X", self.af_plane_center_x_var, 0)
-        add_spinbox(row, "Center Y", self.af_plane_center_y_var, 1)
+        self.af_plane_center_range_widgets.extend(add_spinbox(row, "Center X", self.af_plane_center_x_var, 0))
+        self.af_plane_center_range_widgets.extend(add_spinbox(row, "Center Y", self.af_plane_center_y_var, 1))
         row += 2
         current_button = ttk.Button(control_panel, text="Use Current XY", command=self.use_current_xy_for_af_plane_center)
         current_button.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(7, 0))
+        self.af_plane_center_range_widgets.append(current_button)
         row += 1
-        add_spinbox(row, "X Range", self.af_plane_x_range_var, 0, from_value=0)
-        add_spinbox(row, "Y Range", self.af_plane_y_range_var, 1, from_value=0)
+        self.af_plane_center_range_widgets.extend(add_spinbox(row, "X Range", self.af_plane_x_range_var, 0, from_value=0))
+        self.af_plane_center_range_widgets.extend(add_spinbox(row, "Y Range", self.af_plane_y_range_var, 1, from_value=0))
         row += 2
-        ttk.Button(control_panel, text="Pick P1", command=lambda: self.pick_af_plane_region_point("p1")).grid(row=row, column=0, sticky="ew", pady=(8, 0), padx=(0, 5))
-        ttk.Button(control_panel, text="Pick P2", command=lambda: self.pick_af_plane_region_point("p2")).grid(row=row, column=1, sticky="ew", pady=(8, 0), padx=(5, 0))
+        pick_p1_button = ttk.Button(control_panel, text="Pick P1", command=lambda: self.pick_af_plane_region_point("p1"))
+        pick_p1_button.grid(row=row, column=0, sticky="ew", pady=(8, 0), padx=(0, 5))
+        pick_p2_button = ttk.Button(control_panel, text="Pick P2", command=lambda: self.pick_af_plane_region_point("p2"))
+        pick_p2_button.grid(row=row, column=1, sticky="ew", pady=(8, 0), padx=(5, 0))
+        self.af_plane_pick_region_widgets.extend([pick_p1_button, pick_p2_button])
         row += 1
-        ttk.Label(control_panel, textvariable=self.af_plane_p1_var, style="Value.TLabel", padding=6).grid(row=row, column=0, sticky="ew", pady=(5, 0), padx=(0, 5))
-        ttk.Label(control_panel, textvariable=self.af_plane_p2_var, style="Value.TLabel", padding=6).grid(row=row, column=1, sticky="ew", pady=(5, 0), padx=(5, 0))
+        p1_label = ttk.Label(control_panel, textvariable=self.af_plane_p1_var, style="Value.TLabel", padding=6)
+        p1_label.grid(row=row, column=0, sticky="ew", pady=(5, 0), padx=(0, 5))
+        p2_label = ttk.Label(control_panel, textvariable=self.af_plane_p2_var, style="Value.TLabel", padding=6)
+        p2_label.grid(row=row, column=1, sticky="ew", pady=(5, 0), padx=(5, 0))
+        self.af_plane_pick_region_widgets.extend([p1_label, p2_label])
         row += 1
         add_spinbox(row, "Columns", self.af_plane_cols_var, 0, from_value=1)
         add_spinbox(row, "Rows", self.af_plane_rows_var, 1, from_value=1)
@@ -1063,7 +1379,7 @@ class ProbeApp(tk.Tk):
         row += 1
         metric_combo = ttk.Combobox(control_panel, textvariable=self.focus_metric_var, values=("Laplacian", "Tenengrad", "Brenner"), state="readonly", width=12)
         metric_combo.grid(row=row, column=0, sticky="ew", padx=(0, 5))
-        ttk.Spinbox(control_panel, from_=0, to=10, increment=1, textvariable=self.af_plane_retry_count_var, width=9).grid(row=row, column=1, sticky="ew", padx=(5, 0))
+        self._numeric_spinbox(control_panel, self.af_plane_retry_count_var, from_value=0, to_value=10, width=9).grid(row=row, column=1, sticky="ew", padx=(5, 0))
         row += 1
         add_spinbox(row, "Initial Step", self.autofocus_step_var, 0, from_value=1, to_value=1_000_000)
         add_spinbox(row, "Min Step", self.autofocus_min_step_var, 1, from_value=1, to_value=1_000_000)
@@ -1086,6 +1402,20 @@ class ProbeApp(tk.Tk):
         ttk.Button(control_panel, text="Save Results", command=self.save_af_plane_results).grid(row=row, column=1, sticky="ew", pady=(8, 0), padx=(5, 0))
         row += 1
         ttk.Button(control_panel, text="Load Results", command=self.load_af_plane_results).grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self._update_af_plane_region_controls()
+
+    def _update_af_plane_region_controls(self) -> None:
+        center_visible = self.af_plane_region_mode_var.get() == "Center / Range"
+        for widget in getattr(self, "af_plane_center_range_widgets", []):
+            if center_visible:
+                widget.grid()
+            else:
+                widget.grid_remove()
+        for widget in getattr(self, "af_plane_pick_region_widgets", []):
+            if center_visible:
+                widget.grid_remove()
+            else:
+                widget.grid()
 
     def _build_af_plane_eval_panel(self, parent: ttk.Frame) -> None:
         eval_panel = ttk.Frame(parent, style="Panel.TFrame")
@@ -1196,10 +1526,11 @@ class ProbeApp(tk.Tk):
             from_value: float = 1,
             to_value: float = 1_000_000,
             increment: float = 1,
+            kind: str = "int",
         ) -> int:
             label_widget = ttk.Label(control_panel, text=label, style="Muted.TLabel")
             label_widget.grid(row=row_index, column=column, sticky="w", pady=(7, 2), padx=(0, 5) if column == 0 else (5, 0))
-            spinbox = ttk.Spinbox(control_panel, from_=from_value, to=to_value, increment=increment, textvariable=variable, width=9)
+            spinbox = self._numeric_spinbox(control_panel, variable, kind=kind, from_value=from_value, to_value=to_value, increment=increment, width=9)
             spinbox.grid(row=row_index + 1, column=column, sticky="ew", padx=(0, 5) if column == 0 else (5, 0))
             if mode is not None and registry is not None:
                 registry[mode].extend([label_widget, spinbox])
@@ -1210,8 +1541,8 @@ class ProbeApp(tk.Tk):
         row = 4
         _ = add_spinbox(row, "Rows", self.imgstitch_rows_var, "Array", self.imgstitch_mode_widgets, column=0)
         row = add_spinbox(row, "Cols", self.imgstitch_cols_var, "Array", self.imgstitch_mode_widgets, column=1)
-        _ = add_spinbox(row, "Width (um)", self.imgstitch_width_um_var, "Space", self.imgstitch_mode_widgets, column=0)
-        row = add_spinbox(row, "Height (um)", self.imgstitch_height_um_var, "Space", self.imgstitch_mode_widgets, column=1)
+        _ = add_spinbox(row, "Width (um)", self.imgstitch_width_um_var, "Space", self.imgstitch_mode_widgets, column=0, kind="float")
+        row = add_spinbox(row, "Height (um)", self.imgstitch_height_um_var, "Space", self.imgstitch_mode_widgets, column=1, kind="float")
 
         point_buttons = ttk.Frame(control_panel, style="Panel.TFrame")
         point_buttons.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(7, 0))
@@ -1236,8 +1567,8 @@ class ProbeApp(tk.Tk):
         row += 1
         _ = add_spinbox(row, "Overlap X (px)", self.imgstitch_overlap_x_var, "XY Stitch", self.imgstitch_mode_widgets, column=0)
         row = add_spinbox(row, "Overlap Y (px)", self.imgstitch_overlap_y_var, "XY Stitch", self.imgstitch_mode_widgets, column=1)
-        _ = add_spinbox(row, "Step X (um)", self.imgstitch_step_x_var, "Manual Step", self.imgstitch_mode_widgets, column=0)
-        row = add_spinbox(row, "Step Y (um)", self.imgstitch_step_y_var, "Manual Step", self.imgstitch_mode_widgets, column=1)
+        _ = add_spinbox(row, "Step X (um)", self.imgstitch_step_x_var, "Manual Step", self.imgstitch_mode_widgets, column=0, kind="float")
+        row = add_spinbox(row, "Step Y (um)", self.imgstitch_step_y_var, "Manual Step", self.imgstitch_mode_widgets, column=1, kind="float")
 
         t_header = ttk.Label(control_panel, text="T-STACK", style="Section.TLabel")
         t_header.grid(row=row, column=0, columnspan=2, sticky="w", pady=(10, 2))
@@ -1262,9 +1593,9 @@ class ProbeApp(tk.Tk):
         self.imgstack_mode_widgets["Z-Stack"].append(z_header)
         self.imgstitch_tile_mode_widgets["Z-Stack"].append(z_header)
         row += 1
-        _ = add_spinbox(row, "Z Step (um)", self.z_stack_step_um_var, "Z-Stack", self.imgstack_mode_widgets, column=0)
+        _ = add_spinbox(row, "Z Step (um)", self.z_stack_step_um_var, "Z-Stack", self.imgstack_mode_widgets, column=0, kind="float")
         self.imgstitch_tile_mode_widgets["Z-Stack"].extend(self.imgstack_mode_widgets["Z-Stack"][-2:])
-        row = add_spinbox(row, "Z Range +/- (um)", self.z_stack_range_um_var, "Z-Stack", self.imgstack_mode_widgets, column=1)
+        row = add_spinbox(row, "Z Range +/- (um)", self.z_stack_range_um_var, "Z-Stack", self.imgstack_mode_widgets, column=1, kind="float")
         self.imgstitch_tile_mode_widgets["Z-Stack"].extend(self.imgstack_mode_widgets["Z-Stack"][-2:])
         z_fusion_label = ttk.Label(control_panel, text="Fusion Method", style="Muted.TLabel")
         z_fusion_label.grid(row=row, column=0, columnspan=2, sticky="w", pady=(7, 2))
@@ -1283,8 +1614,8 @@ class ProbeApp(tk.Tk):
         recompose_label.grid(row=row, column=0, columnspan=2, sticky="w", pady=(10, 2))
         self.imgstitch_mode_widgets["XY Stitch"].append(recompose_label)
         row += 1
-        _ = add_spinbox(row, "Max correction (um)", self.imgstitch_max_correction_um_var, "XY Stitch", self.imgstitch_mode_widgets, column=0, from_value=0, increment=0.5)
-        row = add_spinbox(row, "Reg weight (0-1)", self.imgstitch_registration_weight_var, "XY Stitch", self.imgstitch_mode_widgets, column=1, from_value=0, to_value=1, increment=0.05)
+        _ = add_spinbox(row, "Max correction (um)", self.imgstitch_max_correction_um_var, "XY Stitch", self.imgstitch_mode_widgets, column=0, from_value=0, increment=0.5, kind="float")
+        row = add_spinbox(row, "Reg weight (0-1)", self.imgstitch_registration_weight_var, "XY Stitch", self.imgstitch_mode_widgets, column=1, from_value=0, to_value=1, increment=0.05, kind="float")
         white_balance_check = ttk.Checkbutton(control_panel, text="White balance correction", variable=self.imgstitch_white_balance_var)
         white_balance_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=(6, 0))
         self.imgstitch_mode_widgets["XY Stitch"].append(white_balance_check)
@@ -1300,14 +1631,21 @@ class ProbeApp(tk.Tk):
 
         plane_check = ttk.Checkbutton(control_panel, text="Four-corner plane AF", variable=self.imgstitch_plane_af_var)
         plane_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        focusmap_plane_check = ttk.Checkbutton(
+            control_panel,
+            text="Use FocusMap plane Z",
+            variable=self.imgstitch_focusmap_plane_var,
+            command=self._on_imgstitch_focusmap_plane_toggle,
+        )
+        focusmap_plane_check.grid(row=row + 1, column=0, columnspan=2, sticky="w", pady=(6, 0))
         start_button = ttk.Button(control_panel, text="Start", style="Accent.TButton", command=self.start_imgstitch)
-        start_button.grid(row=row + 1, column=0, sticky="ew", pady=(8, 0), padx=(0, 5))
+        start_button.grid(row=row + 2, column=0, sticky="ew", pady=(8, 0), padx=(0, 5))
         recompose_button = ttk.Button(control_panel, text="Apply and Recalculate", command=self.recompose_imgstitch_session)
-        recompose_button.grid(row=row + 1, column=1, sticky="ew", pady=(8, 0), padx=(5, 0))
+        recompose_button.grid(row=row + 2, column=1, sticky="ew", pady=(8, 0), padx=(5, 0))
         self.imgstitch_recompose_button = recompose_button
-        ttk.Button(control_panel, text="Stop", style="Danger.TButton", command=self.stop_imgstitch).grid(row=row + 2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        ttk.Label(control_panel, textvariable=self.imgstitch_status_var, style="Status.TLabel", wraplength=300, padding=8).grid(row=row + 3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        self.imgstitch_mode_widgets["XY Stitch"].extend([plane_check, recompose_button])
+        ttk.Button(control_panel, text="Stop", style="Danger.TButton", command=self.stop_imgstitch).grid(row=row + 3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(control_panel, textvariable=self.imgstitch_status_var, style="Status.TLabel", wraplength=300, padding=8).grid(row=row + 4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.imgstitch_mode_widgets["XY Stitch"].extend([plane_check, focusmap_plane_check, recompose_button])
         for variable in (
             self.imgstitch_overlap_x_var,
             self.imgstitch_overlap_y_var,
@@ -1346,6 +1684,24 @@ class ProbeApp(tk.Tk):
         ttk.Button(optical_panel, text="Save Config", command=self.apply_config).grid(row=5, column=1, sticky="ew", pady=(14, 0), padx=(8, 0))
         ttk.Label(optical_panel, textvariable=self.config_status_var, style="Status.TLabel", wraplength=560, padding=10).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(18, 0))
 
+        main_control_panel = ttk.Frame(optical_panel, style="Panel.TFrame")
+        main_control_panel.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(24, 0))
+        main_control_panel.columnconfigure(1, weight=1)
+        ttk.Label(main_control_panel, text="MAIN CONTROL", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        ttk.Label(main_control_panel, text="Motion keys", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=2)
+        keyboard_combo = ttk.Combobox(
+            main_control_panel,
+            values=[KEYBOARD_MOTION_SCHEME_LABELS[KEYBOARD_MOTION_SCHEME_ARROW_PAGE], KEYBOARD_MOTION_SCHEME_LABELS[KEYBOARD_MOTION_SCHEME_WASD_QE]],
+            textvariable=self.keyboard_motion_scheme_var,
+            state="readonly",
+        )
+        keyboard_combo.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=2)
+        keyboard_combo.bind("<<ComboboxSelected>>", lambda _event: self.apply_config(save=True))
+
+        for row_index, axis in enumerate(JOG_STEP_AXES, start=2):
+            ttk.Label(main_control_panel, text=f"Alt+{axis} levels", style="Muted.TLabel").grid(row=row_index, column=0, sticky="w", pady=2)
+            self._jog_step_levels_entry(main_control_panel, self.jog_step_level_vars[axis]).grid(row=row_index, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+
         motor_panel = ttk.Frame(parent, style="Panel.TFrame", padding=16)
         motor_panel.grid(row=0, column=1, sticky="nsew")
         motor_panel.columnconfigure(0, weight=1)
@@ -1353,92 +1709,52 @@ class ProbeApp(tk.Tk):
         ttk.Label(motor_panel, text="MOTOR MAPPING", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
 
         fields = (
-            ("Microstep", self.microstep_var),
-            ("Base angle (deg)", self.base_angle_var),
-            ("X/Y lead (mm)", self.lead_xy_var),
-            ("Z lead (mm)", self.lead_z_var),
-            ("CC speed (%)", self.cc_speed_percent_var),
-            ("CC accel/decel (s)", self.cc_accel_time_var),
+            ("Microstep", self.microstep_var, "int", 1, 1_000_000),
+            ("Base angle (deg)", self.base_angle_var, "float", 0.000001, 360),
+            ("X/Y lead (mm)", self.lead_xy_var, "float", 0.000001, 1_000_000),
+            ("Z lead (mm)", self.lead_z_var, "float", 0.000001, 1_000_000),
+            ("CC speed (%)", self.cc_speed_percent_var, "int", 0, 100),
+            ("CC accel/decel (s)", self.cc_accel_time_var, "float", 0, 2.55),
         )
-        for index, (label, variable) in enumerate(fields, start=1):
+        for index, (label, variable, kind, minimum, maximum) in enumerate(fields, start=1):
             col = (index - 1) % 2
             row = 1 + ((index - 1) // 2) * 2
             ttk.Label(motor_panel, text=label, style="Muted.TLabel").grid(row=row, column=col, sticky="w", pady=(16, 4), padx=(0 if col == 0 else 8, 8 if col == 0 else 0))
-            entry = tk.Entry(
-                motor_panel,
-                textvariable=variable,
-                relief="flat",
-                bd=0,
-                bg=self.colors["surface_2"],
-                fg=self.colors["text"],
-                insertbackground=self.colors["text"],
-                selectbackground=self.colors["surface_3"],
-                font=("Segoe UI", 10),
-            )
+            entry = self._numeric_entry(motor_panel, variable, kind=kind, minimum=minimum, maximum=maximum)
             entry.grid(row=row + 1, column=col, sticky="ew", padx=(0 if col == 0 else 8, 8 if col == 0 else 0), ipady=6)
 
         ttk.Label(motor_panel, text="CONVERSION", style="Section.TLabel").grid(row=7, column=0, columnspan=2, sticky="w", pady=(24, 6))
         ttk.Label(motor_panel, textvariable=self.motor_conversion_var, style="Value.TLabel", wraplength=560, padding=10).grid(row=8, column=0, columnspan=2, sticky="ew")
+
         autofocus_panel = ttk.Frame(motor_panel, style="Panel.TFrame")
         autofocus_panel.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(24, 0))
         autofocus_panel.columnconfigure((1, 2), weight=1, uniform="af_thresholds")
         ttk.Label(autofocus_panel, text="AUTOFOCUS CONFIG", style="Section.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
         ttk.Label(autofocus_panel, text="Settle after Z move (ms)", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=2)
-        tk.Entry(
-            autofocus_panel,
-            textvariable=self.autofocus_settle_ms_var,
-            relief="flat",
-            bd=0,
-            bg=self.colors["surface_2"],
-            fg=self.colors["text"],
-            insertbackground=self.colors["text"],
-            selectbackground=self.colors["surface_3"],
-            font=("Segoe UI", 10),
-        ).grid(row=1, column=1, columnspan=2, sticky="ew", padx=(8, 0), ipady=5)
+        self._numeric_entry(autofocus_panel, self.autofocus_settle_ms_var, minimum=0, maximum=10000).grid(row=1, column=1, columnspan=2, sticky="ew", padx=(8, 0), ipady=5)
         ttk.Label(autofocus_panel, text="AF integration frames", style="Muted.TLabel").grid(row=2, column=0, sticky="w", pady=2)
-        tk.Entry(
-            autofocus_panel,
-            textvariable=self.autofocus_sample_count_var,
-            relief="flat",
-            bd=0,
-            bg=self.colors["surface_2"],
-            fg=self.colors["text"],
-            insertbackground=self.colors["text"],
-            selectbackground=self.colors["surface_3"],
-            font=("Segoe UI", 10),
-        ).grid(row=2, column=1, columnspan=2, sticky="ew", padx=(8, 0), ipady=5)
+        self._numeric_entry(autofocus_panel, self.autofocus_sample_count_var, minimum=1, maximum=1000).grid(row=2, column=1, columnspan=2, sticky="ew", padx=(8, 0), ipady=5)
         ttk.Label(autofocus_panel, text="Settle after stitch move (ms)", style="Muted.TLabel").grid(row=3, column=0, sticky="w", pady=2)
-        tk.Entry(
+        self._numeric_entry(autofocus_panel, self.imgstitch_settle_ms_var, minimum=0, maximum=10000).grid(row=3, column=1, columnspan=2, sticky="ew", padx=(8, 0), ipady=5)
+        ttk.Label(autofocus_panel, text="Peak fit model", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=2)
+        peak_model_combo = ttk.Combobox(
             autofocus_panel,
-            textvariable=self.imgstitch_settle_ms_var,
-            relief="flat",
-            bd=0,
-            bg=self.colors["surface_2"],
-            fg=self.colors["text"],
-            insertbackground=self.colors["text"],
-            selectbackground=self.colors["surface_3"],
-            font=("Segoe UI", 10),
-        ).grid(row=3, column=1, columnspan=2, sticky="ew", padx=(8, 0), ipady=5)
-        ttk.Label(autofocus_panel, text="Metric", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=(10, 2))
-        ttk.Label(autofocus_panel, text="Yellow", style="Muted.TLabel").grid(row=4, column=1, sticky="w", padx=(8, 0), pady=(10, 2))
-        ttk.Label(autofocus_panel, text="Green", style="Muted.TLabel").grid(row=4, column=2, sticky="w", padx=(8, 0), pady=(10, 2))
-        for row_index, metric_name in enumerate(("Laplacian", "Tenengrad", "Brenner"), start=5):
+            textvariable=self.autofocus_peak_model_var,
+            values=[AUTOFOCUS_PEAK_MODEL_LABELS[model] for model in AUTOFOCUS_PEAK_MODELS],
+            state="readonly",
+        )
+        peak_model_combo.grid(row=4, column=1, columnspan=2, sticky="ew", padx=(8, 0), ipady=2)
+        peak_model_combo.bind("<<ComboboxSelected>>", lambda _event: self.apply_config(save=True))
+        ttk.Label(autofocus_panel, text="Metric", style="Muted.TLabel").grid(row=5, column=0, sticky="w", pady=(10, 2))
+        ttk.Label(autofocus_panel, text="Yellow", style="Muted.TLabel").grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(10, 2))
+        ttk.Label(autofocus_panel, text="Green", style="Muted.TLabel").grid(row=5, column=2, sticky="w", padx=(8, 0), pady=(10, 2))
+        for row_index, metric_name in enumerate(("Laplacian", "Tenengrad", "Brenner"), start=6):
             ttk.Label(autofocus_panel, text=metric_name, style="Muted.TLabel").grid(row=row_index, column=0, sticky="w", pady=2)
             for column, variable in (
                 (1, self.focus_threshold_yellow_vars[metric_name]),
                 (2, self.focus_threshold_green_vars[metric_name]),
             ):
-                tk.Entry(
-                    autofocus_panel,
-                    textvariable=variable,
-                    relief="flat",
-                    bd=0,
-                    bg=self.colors["surface_2"],
-                    fg=self.colors["text"],
-                    insertbackground=self.colors["text"],
-                    selectbackground=self.colors["surface_3"],
-                    font=("Segoe UI", 10),
-                ).grid(row=row_index, column=column, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+                self._numeric_entry(autofocus_panel, variable, kind="float", minimum=0, maximum=1_000_000_000).grid(row=row_index, column=column, sticky="ew", padx=(8, 0), pady=2, ipady=5)
 
         ttk.Button(motor_panel, text="Apply Mapping", style="Accent.TButton", command=self.apply_config).grid(row=10, column=0, columnspan=2, sticky="ew", pady=(18, 0))
 
@@ -1538,14 +1854,7 @@ class ProbeApp(tk.Tk):
             self.last_logged_control_width = control_width
 
     def _bind_keyboard_controls(self) -> None:
-        self.key_bindings = {
-            "Right": ("X", False),
-            "Left": ("X", True),
-            "Up": ("Y", False),
-            "Down": ("Y", True),
-            "Prior": ("Z", False),
-            "Next": ("Z", True),
-        }
+        self.key_bindings = self._keyboard_bindings_for_configured_scheme()
         self.bind_all("<KeyPress>", self._on_key_press)
         self.bind_all("<KeyRelease>", self._on_key_release)
         self.bind_all("<Alt-x>", lambda _event: self.cycle_jog_step("X"))
@@ -1557,6 +1866,69 @@ class ProbeApp(tk.Tk):
         self.bind_all("<MouseWheel>", self._on_mouse_wheel)
         self.bind_all("<Button-4>", self._on_mouse_wheel)
         self.bind_all("<Button-5>", self._on_mouse_wheel)
+
+    def _keyboard_bindings_for_configured_scheme(self) -> dict[str, tuple[str, bool]]:
+        scheme = getattr(self.probe_config, "keyboard_motion_scheme", KEYBOARD_MOTION_SCHEME_ARROW_PAGE)
+        if scheme == KEYBOARD_MOTION_SCHEME_WASD_QE:
+            return {
+                "d": ("X", False),
+                "a": ("X", True),
+                "w": ("Y", False),
+                "s": ("Y", True),
+                "q": ("Z", False),
+                "e": ("Z", True),
+            }
+        return {
+            "Right": ("X", False),
+            "Left": ("X", True),
+            "Up": ("Y", False),
+            "Down": ("Y", True),
+            "Prior": ("Z", False),
+            "Next": ("Z", True),
+        }
+
+    def _refresh_keyboard_bindings(self) -> None:
+        self._clear_held_keyboard_moves()
+        self.key_bindings = self._keyboard_bindings_for_configured_scheme()
+
+    def _keyboard_motion_scheme_label(self, scheme: str) -> str:
+        return KEYBOARD_MOTION_SCHEME_LABELS.get(scheme, KEYBOARD_MOTION_SCHEME_LABELS[KEYBOARD_MOTION_SCHEME_ARROW_PAGE])
+
+    def _keyboard_motion_scheme_from_label(self, label: str) -> str:
+        for scheme, scheme_label in KEYBOARD_MOTION_SCHEME_LABELS.items():
+            if label == scheme_label or label == scheme:
+                return scheme
+        return KEYBOARD_MOTION_SCHEME_ARROW_PAGE
+
+    def _keyboard_event_key(self, event: tk.Event) -> str:
+        keysym = str(getattr(event, "keysym", ""))
+        return keysym.lower() if len(keysym) == 1 else keysym
+
+    def _keyboard_event_targets_text_input(self, event: tk.Event) -> bool:
+        widget = getattr(event, "widget", None)
+        return isinstance(widget, (tk.Entry, tk.Text, tk.Spinbox, ttk.Entry, ttk.Spinbox, ttk.Combobox))
+
+    def _keyboard_controls_enabled(self) -> bool:
+        enabled_var = self.__dict__.get("keyboard_move_enabled_var")
+        enabled = True if enabled_var is None else bool(enabled_var.get())
+        return self.current_page == "Main" and enabled
+
+    def _clear_held_keyboard_moves(self) -> None:
+        for state in list(self.held_keys.values()):
+            job = state.get("job")
+            if job is not None:
+                try:
+                    self.after_cancel(str(job))
+                except tk.TclError:
+                    pass
+        self.held_keys.clear()
+
+    def _on_keyboard_move_toggle(self) -> None:
+        if self.keyboard_move_enabled_var.get():
+            self.status_var.set("KeyboardMove enabled.")
+        else:
+            self._clear_held_keyboard_moves()
+            self.status_var.set("KeyboardMove disabled.")
 
     def cycle_jog_step(self, axis: str) -> str:
         levels = self.jog_step_levels[axis]
@@ -1576,41 +1948,46 @@ class ProbeApp(tk.Tk):
 
     def _on_key_press(self, event: tk.Event) -> str | None:
         if event.keysym in ("Shift_L", "Shift_R"):
-            if self.vision_panel:
+            if self.current_page == "Main" and self.vision_panel:
                 self.vision_panel.set_shift_down(True)
             return None
-        if isinstance(event.widget, tk.Entry):
+        if self._keyboard_event_targets_text_input(event):
             return None
-        binding = self.key_bindings.get(event.keysym)
+        if not self._keyboard_controls_enabled():
+            return None
+        key = self._keyboard_event_key(event)
+        binding = self.key_bindings.get(key)
         if binding is None:
             return None
-        if event.keysym in self.held_keys:
+        if key in self.held_keys:
             return "break"
 
         axis, reverse = binding
-        self.held_keys[event.keysym] = {
+        self.held_keys[key] = {
             "axis": axis,
             "reverse": reverse,
             "interval_ms": 420,
             "job": None,
         }
-        self._keyboard_move(event.keysym)
+        self._keyboard_move(key)
         return "break"
 
     def _on_key_release(self, event: tk.Event) -> str | None:
         if event.keysym in ("Shift_L", "Shift_R"):
-            if self.vision_panel:
+            if self.current_page == "Main" and self.vision_panel:
                 self.vision_panel.set_shift_down(False)
             return None
-        if isinstance(event.widget, tk.Entry):
-            return None
-        state = self.held_keys.pop(event.keysym, None)
+        key = self._keyboard_event_key(event)
+        state = self.held_keys.pop(key, None)
         if state is None:
             return None
 
         job = state.get("job")
         if job is not None:
-            self.after_cancel(str(job))
+            try:
+                self.after_cancel(str(job))
+            except tk.TclError:
+                pass
         return "break"
 
     def _on_mouse_wheel(self, event: tk.Event) -> str | None:
@@ -1640,6 +2017,9 @@ class ProbeApp(tk.Tk):
         state = self.held_keys.get(keysym)
         if state is None:
             return
+        if not self._keyboard_controls_enabled():
+            self.held_keys.pop(keysym, None)
+            return
 
         axis = str(state["axis"])
         reverse = bool(state["reverse"])
@@ -1659,6 +2039,10 @@ class ProbeApp(tk.Tk):
         if self.position_click_job is not None:
             self.after_cancel(self.position_click_job)
             self.position_click_job = None
+        if axis == "Z" and self.main_focusmap_plane_var.get():
+            self._update_main_focusmap_z_display()
+            self.status_var.set("FocusMap Z is enabled; Z follows the mapped plane.")
+            return "break"
 
         starting_new_mode = self.current_position_edit_mode != mode
         self.current_position_edit_mode = mode
@@ -1666,6 +2050,10 @@ class ProbeApp(tk.Tk):
         if starting_new_mode:
             self.modified_position_axes.clear()
             for target_axis in ("X", "Y", "Z"):
+                if target_axis == "Z" and self.main_focusmap_plane_var.get():
+                    self.position_edit_modes[target_axis] = None
+                    self._apply_focusmap_z_lock_to_position_entry()
+                    continue
                 self.position_inputs[target_axis].configure(state="normal")
                 if mode == "Relative":
                     self.position_edit_modes[target_axis] = None
@@ -1697,6 +2085,8 @@ class ProbeApp(tk.Tk):
         axes = ("X", "Y", "Z")
         self._fill_empty_position_default(axis)
         next_axis = axes[(axes.index(axis) + 1) % len(axes)]
+        if next_axis == "Z" and self.main_focusmap_plane_var.get():
+            next_axis = axes[(axes.index(next_axis) + 1) % len(axes)]
         self.begin_position_edit(next_axis, self.current_position_edit_mode or "Relative")
         return "break"
 
@@ -1704,6 +2094,8 @@ class ProbeApp(tk.Tk):
         axes = ("X", "Y", "Z")
         self._fill_empty_position_default(axis)
         previous_axis = axes[(axes.index(axis) - 1) % len(axes)]
+        if previous_axis == "Z" and self.main_focusmap_plane_var.get():
+            previous_axis = axes[(axes.index(previous_axis) - 1) % len(axes)]
         self.begin_position_edit(previous_axis, self.current_position_edit_mode or "Relative")
         return "break"
 
@@ -1724,6 +2116,7 @@ class ProbeApp(tk.Tk):
             if axis in self.position_inputs:
                 self.position_inputs[axis].configure(fg=self.colors["accent"])
                 self.position_inputs[axis].configure(state="readonly", readonlybackground=self.colors["surface_2"])
+        self._update_main_focusmap_z_display()
 
     def _axis_is_actively_editing(self, axis: str) -> bool:
         return (
@@ -1793,7 +2186,13 @@ class ProbeApp(tk.Tk):
                 cc_accel_time_s=float(self.cc_accel_time_var.get()),
                 autofocus_settle_ms=int(self.autofocus_settle_ms_var.get()),
                 autofocus_sample_count=int(self.autofocus_sample_count_var.get()),
+                autofocus_peak_model=self._autofocus_peak_model_from_label(self.autofocus_peak_model_var.get()),
                 imgstitch_settle_ms=int(self.imgstitch_settle_ms_var.get()),
+                keyboard_motion_scheme=self._keyboard_motion_scheme_from_label(self.keyboard_motion_scheme_var.get()),
+                jog_step_levels={
+                    axis: parse_jog_step_levels_text(self.jog_step_level_vars[axis].get())
+                    for axis in JOG_STEP_AXES
+                },
                 focus_threshold_yellow={
                     metric: float(self.focus_threshold_yellow_vars[metric].get())
                     for metric in ("Laplacian", "Tenengrad", "Brenner")
@@ -1814,6 +2213,7 @@ class ProbeApp(tk.Tk):
         derive_missing_calibrations(self.probe_config)
         self._sync_config_vars_from_config()
         self._update_config_display()
+        self._refresh_keyboard_bindings()
         if save:
             try:
                 save_probe_config(self.probe_config, self.config_path)
@@ -1837,10 +2237,31 @@ class ProbeApp(tk.Tk):
         self.cc_accel_time_var.set(f"{self.probe_config.cc_accel_time_s:g}")
         self.autofocus_settle_ms_var.set(str(self.probe_config.autofocus_settle_ms))
         self.autofocus_sample_count_var.set(str(self.probe_config.autofocus_sample_count))
+        self.autofocus_peak_model_var.set(self._autofocus_peak_model_label(self.probe_config.autofocus_peak_model))
         self.imgstitch_settle_ms_var.set(str(self.probe_config.imgstitch_settle_ms))
+        self.keyboard_motion_scheme_var.set(self._keyboard_motion_scheme_label(self.probe_config.keyboard_motion_scheme))
+        self.jog_step_levels = {
+            axis: tuple(self.probe_config.jog_step_levels[axis])
+            for axis in JOG_STEP_AXES
+        }
+        for axis in JOG_STEP_AXES:
+            self.jog_step_level_vars[axis].set(format_jog_step_levels(self.jog_step_levels[axis]))
         for metric in ("Laplacian", "Tenengrad", "Brenner"):
             self.focus_threshold_yellow_vars[metric].set(f"{self.probe_config.focus_threshold_yellow[metric]:g}")
             self.focus_threshold_green_vars[metric].set(f"{self.probe_config.focus_threshold_green[metric]:g}")
+
+    @staticmethod
+    def _autofocus_peak_model_label(model: str) -> str:
+        normalized = normalize_autofocus_peak_model(model)
+        return AUTOFOCUS_PEAK_MODEL_LABELS[normalized]
+
+    @staticmethod
+    def _autofocus_peak_model_from_label(label: str) -> str:
+        normalized_label = label.strip().lower()
+        for model, model_label in AUTOFOCUS_PEAK_MODEL_LABELS.items():
+            if normalized_label == model_label.lower():
+                return model
+        return normalize_autofocus_peak_model(label)
 
     def _update_config_display(self) -> None:
         um_per_px = self.probe_config.current_um_per_px()
@@ -1857,7 +2278,14 @@ class ProbeApp(tk.Tk):
             f"CC: speed {self.probe_config.cc_speed_percent}%, accel/decel {self.probe_config.cc_accel_time_s:.3g}s ({self.probe_config.cc_acceleration_units()} units)",
             f"AF settle: {self.probe_config.autofocus_settle_ms} ms",
             f"AF integration: {self.probe_config.autofocus_sample_count} frame(s)",
+            f"AF peak model: {self._autofocus_peak_model_label(self.probe_config.autofocus_peak_model)}",
             f"Stitch settle: {self.probe_config.imgstitch_settle_ms} ms",
+            f"Keyboard: {self._keyboard_motion_scheme_label(self.probe_config.keyboard_motion_scheme)}",
+            "Jog levels: "
+            + "; ".join(
+                f"{axis} {format_jog_step_levels(self.probe_config.jog_step_levels[axis])}"
+                for axis in JOG_STEP_AXES
+            ),
         ]
         self.motor_conversion_var.set("\n".join(conversion_lines))
 
@@ -1932,6 +2360,7 @@ class ProbeApp(tk.Tk):
             "autofocus",
             "autofocus manual",
             "button",
+            "focusmap",
             "go_zero",
             "imgstitch",
             "keyboard",
@@ -1961,6 +2390,8 @@ class ProbeApp(tk.Tk):
                 self.position_vars[axis_name].set(str(position.position))
                 if axis_name in self.position_inputs:
                     self.position_inputs[axis_name].configure(state="readonly", readonlybackground=self.colors["surface_2"])
+        if self.main_focusmap_plane_var.get() and axis_name in {"X", "Y", "Z"}:
+            self._update_main_focusmap_z_display()
 
     def _show_target_positions(self, targets: dict[str, int]) -> None:
         for axis, value in targets.items():
@@ -1975,11 +2406,12 @@ class ProbeApp(tk.Tk):
                 self.position_inputs[axis].configure(state="normal")
                 self.position_inputs[axis].configure(fg=self.colors["danger"])
                 self.position_inputs[axis].configure(state="readonly", readonlybackground=self.colors["surface_2"])
+        self._apply_focusmap_z_lock_to_position_entry()
 
-    def _update_focus_scores(self, scores: dict[str, float]) -> None:
+    def _update_focus_scores(self, scores: dict[str, float], timestamp: float | None = None) -> None:
         metric = self.focus_metric_var.get()
         score = float(scores.get(metric, 0.0))
-        now = time.monotonic()
+        now = float(timestamp if timestamp is not None else time.monotonic())
         with self.focus_lock:
             self.latest_focus_scores = dict(scores)
             self.latest_focus_timestamp = now
@@ -2104,62 +2536,110 @@ class ProbeApp(tk.Tk):
     def _draw_autofocus_z_score(self) -> None:
         if not hasattr(self, "z_score_canvas"):
             return
-        canvas = self.z_score_canvas
+        self._draw_af_z_score_plot(self.z_score_canvas, compact=False)
+
+    @staticmethod
+    def _scores_by_z_from_af_samples(samples: list[dict[str, object]]) -> dict[int, float]:
+        grouped_scores: dict[int, list[float]] = {}
+        for sample in samples:
+            z_value = int(sample["z"])
+            grouped_scores.setdefault(z_value, []).append(float(sample["score"]))
+        return {
+            z_value: sum(scores) / len(scores)
+            for z_value, scores in grouped_scores.items()
+            if scores
+        }
+
+    def _draw_af_z_score_plot(self, canvas: tk.Canvas, compact: bool = False) -> None:
         width = max(canvas.winfo_width(), 10)
         height = max(canvas.winfo_height(), 10)
         canvas.delete("all")
         canvas.create_rectangle(0, 0, width, height, fill=self.colors["surface_2"], outline="")
-        canvas.create_text(12, 12, text="AF Z vs Score", anchor="nw", fill=self.colors["muted"], font=("Segoe UI", 9))
+        title_y = 10 if compact else 12
+        canvas.create_text(12, title_y, text="AF Z vs Score", anchor="nw", fill=self.colors["muted"], font=("Segoe UI", 9))
         with self.focus_lock:
-            samples = list(self.autofocus_z_score_samples)
+            samples = [dict(sample) for sample in self.autofocus_z_score_samples]
+            fine_range = self.autofocus_fine_range
         if len(samples) < 2:
             canvas.create_text(width // 2, height // 2, text="Waiting for AF samples", fill=self.colors["muted"], font=("Segoe UI Semibold", 11))
             return
 
-        z_values = [sample[0] for sample in samples]
-        score_values = [sample[1] for sample in samples]
+        z_values = [float(sample["z"]) for sample in samples]
+        score_values = [float(sample["score"]) for sample in samples]
         min_z, max_z = min(z_values), max(z_values)
-        fit_model = self._fit_gaussian_focus_model({z: score for z, score, _direction in samples})
+        fine_samples = [sample for sample in samples if str(sample.get("stage", "")) == "fine"]
+        # Fit only the precision sweep, independent of the display color thresholds.
+        fit_scores = self._scores_by_z_from_af_samples(fine_samples)
+        fit_model = self._fit_focus_peak_model(fit_scores, self.probe_config.autofocus_peak_model)
         min_score, max_score = 0.0, max(score_values)
         if fit_model is not None:
             max_score = max(max_score, fit_model["baseline"] + fit_model["amplitude"])
         z_span = max(max_z - min_z, 1)
         score_span = max(max_score - min_score, 1.0)
-        left, top, right, bottom = 50, 28, width - 18, height - 34
-        canvas.create_rectangle(left, top, right, bottom, outline=self.colors["border"])
+        left = 46 if compact else 50
+        top = 30 if compact else 28
+        right = width - (16 if compact else 18)
+        bottom = height - (30 if compact else 34)
         metric = self.focus_metric_var.get()
-        points: list[float] = []
-        for z_value, score, direction in samples:
-            x = left + (z_value - min_z) / z_span * (right - left)
-            y = bottom - (score - min_score) / score_span * (bottom - top)
-            points.extend((x, y))
-        if len(points) >= 4:
-            canvas.create_line(*points, fill="#94a3b8", width=1, dash=(3, 3))
+
+        def point_xy(z_value: float, score: float) -> tuple[float, float]:
+            x_value = left + (z_value - min_z) / z_span * (right - left)
+            y_value = bottom - (score - min_score) / score_span * (bottom - top)
+            return x_value, y_value
+
+        if fine_range is not None:
+            range_start, range_end = sorted((float(fine_range[0]), float(fine_range[1])))
+            range_x1, _ = point_xy(range_start, min_score)
+            range_x2, _ = point_xy(range_end, min_score)
+            range_x1 = max(left, min(right, range_x1))
+            range_x2 = max(left, min(right, range_x2))
+            if range_x2 > range_x1:
+                canvas.create_rectangle(range_x1, top, range_x2, bottom, fill="#38bdf8", outline="", stipple="gray12")
+
+        canvas.create_rectangle(left, top, right, bottom, outline=self.colors["border"])
+
         if fit_model is not None:
             curve_points: list[float] = []
+            curve_start = min_z
+            curve_end = max_z
+            if fine_range is not None:
+                curve_start = max(curve_start, min(fine_range))
+                curve_end = min(curve_end, max(fine_range))
             for index in range(80):
-                z_value = min_z + index * z_span / 79
-                fit_score = self._gaussian_score_at(z_value, fit_model)
-                x = left + (z_value - min_z) / z_span * (right - left)
-                y = bottom - (fit_score - min_score) / score_span * (bottom - top)
+                z_value = curve_start + index * max(curve_end - curve_start, 1.0) / 79
+                fit_score = self._focus_peak_score_at(z_value, fit_model)
+                x, y = point_xy(z_value, fit_score)
                 curve_points.extend((x, y))
             if len(curve_points) >= 4:
                 canvas.create_line(*curve_points, fill="#e5e7eb", width=2, smooth=True)
-            mu_x = left + (fit_model["mu"] - min_z) / z_span * (right - left)
+            mu_x, _ = point_xy(fit_model["mu"], min_score)
             canvas.create_line(mu_x, top, mu_x, bottom, fill="#e5e7eb", dash=(4, 3))
             canvas.create_text(
                 right - 8,
-                top + 8,
-                text=f"mu {fit_model['mu']:.1f} | sigma {fit_model['sigma']:.1f}",
+                top + (8 if not compact else 18),
+                text=f"{fit_model['label']} | mu {fit_model['mu']:.1f} | w {fit_model['width']:.1f}",
                 anchor="ne",
                 fill="#e5e7eb",
                 font=("Segoe UI", 8),
             )
-        for z_value, score, direction in samples:
-            x = left + (z_value - min_z) / z_span * (right - left)
-            y = bottom - (score - min_score) / score_span * (bottom - top)
-            color = self._focus_score_color(metric, score)
-            canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=color, outline="")
+
+        def draw_stage_points(stage_names: set[str], radius: int, color_override: str | None = None) -> None:
+            for sample in samples:
+                stage = str(sample.get("stage", "sample"))
+                if stage not in stage_names:
+                    continue
+                z_value = float(sample["z"])
+                score = float(sample["score"])
+                x, y = point_xy(z_value, score)
+                color = color_override or self._focus_score_color(metric, score)
+                outline = "#0b0f14" if color_override else "#e5edf5"
+                canvas.create_oval(x - radius, y - radius, x + radius, y + radius, fill=color, outline=outline)
+
+        radius = 3 if compact else 4
+        draw_stage_points({"center", "coarse"}, radius, "#64748b")
+        draw_stage_points({"fine"}, radius + 1, None)
+        draw_stage_points({"final"}, radius + 1, "#e5e7eb")
+        draw_stage_points({"return_center", "sample"}, radius, "#94a3b8")
         canvas.create_text(left, bottom + 10, text=str(min_z), anchor="nw", fill=self.colors["muted"], font=("Segoe UI", 8))
         canvas.create_text(right, bottom + 10, text=str(max_z), anchor="ne", fill=self.colors["muted"], font=("Segoe UI", 8))
         canvas.create_text(left, top, text=f"{max_score:.1f}", anchor="sw", fill=self.colors["muted"], font=("Segoe UI", 8))
@@ -2334,6 +2814,7 @@ class ProbeApp(tk.Tk):
         with self.focus_lock:
             self.autofocus_samples.clear()
             self.autofocus_z_score_samples.clear()
+            self.autofocus_fine_range = None
             self.autofocus_history_rows.clear()
             self.focus_history.clear()
             self.autofocus_run_start_time = run_start
@@ -2388,33 +2869,70 @@ class ProbeApp(tk.Tk):
         with self.focus_lock:
             return dict(self.latest_focus_scores)
 
-    def _sample_focus_score_frames(self, after_time: float, sample_count: int, timeout: float = 2.0) -> dict[str, float]:
+    def _sample_focus_score_frames(
+        self,
+        after_time: float,
+        sample_count: int,
+        timeout: float = 2.0,
+        discard_count: int = 0,
+    ) -> tuple[dict[str, float], dict[str, object]]:
         sample_count = max(1, int(sample_count))
+        discard_count = max(0, int(discard_count))
         deadline = time.monotonic() + timeout
         samples: list[dict[str, float]] = []
+        sample_timestamps: list[float] = []
         last_timestamp = after_time
+        discarded = 0
+        latest_fresh_scores: dict[str, float] | None = None
 
         while len(samples) < sample_count and time.monotonic() < deadline and not self.autofocus_stop_event.is_set():
             with self.focus_lock:
                 timestamp = self.latest_focus_timestamp
                 scores = dict(self.latest_focus_scores)
             if timestamp > last_timestamp:
-                samples.append(scores)
                 last_timestamp = timestamp
+                latest_fresh_scores = scores
+                if discarded < discard_count:
+                    discarded += 1
+                    continue
+                samples.append(scores)
+                sample_timestamps.append(timestamp)
             else:
                 time.sleep(0.01)
 
+        stats = {
+            "requested_samples": sample_count,
+            "discard_requested": discard_count,
+            "discarded_frames": discarded,
+            "sampled_frames": len(samples),
+            "sample_after": after_time,
+            "first_sample_delay_ms": ((sample_timestamps[0] - after_time) * 1000.0) if sample_timestamps else None,
+            "last_sample_delay_ms": ((sample_timestamps[-1] - after_time) * 1000.0) if sample_timestamps else None,
+            "sample_timed_out": len(samples) < sample_count,
+        }
+
         if not samples:
+            if latest_fresh_scores is not None:
+                return latest_fresh_scores, stats
             with self.focus_lock:
-                return dict(self.latest_focus_scores)
+                return dict(self.latest_focus_scores), stats
 
         return {
             metric_name: sum(sample.get(metric_name, 0.0) for sample in samples) / len(samples)
             for metric_name in ("Laplacian", "Tenengrad", "Brenner")
-        }
+        }, stats
 
     def _sample_focus_score(self, metric: str, duration: float = 0.36, after_time: float | None = None) -> float:
         return self._sample_focus_scores(after_time=after_time, duration=duration).get(metric, 0.0)
+
+    @staticmethod
+    def _format_optional_float(value: object) -> str:
+        if value is None or value == "":
+            return ""
+        try:
+            return f"{float(value):.1f}"
+        except (TypeError, ValueError):
+            return str(value)
 
     def _record_autofocus_sample(
         self,
@@ -2426,29 +2944,59 @@ class ProbeApp(tk.Tk):
         reached_hex: str = "",
         stage: str = "sample",
         scores: dict[str, float] | None = None,
+        target_z: int | None = None,
+        readback_z: int | None = None,
+        move_delta: int = 0,
+        reached_wait_seconds: float | None = None,
+        sample_stats: dict[str, object] | None = None,
     ) -> None:
+        sample_stats = dict(sample_stats or {})
+        target_z = z_position if target_z is None else target_z
+        readback_z = z_position if readback_z is None else readback_z
         with self.focus_lock:
             timestamp = self.latest_focus_timestamp or time.monotonic()
             scores = dict(scores or self.latest_focus_scores)
             self.autofocus_samples.append((timestamp, score, direction))
             self.focus_history.append((timestamp, scores))
-            self.autofocus_z_score_samples.append((z_position, score, direction))
+            self.autofocus_z_score_samples.append({"z": z_position, "score": score, "direction": direction, "stage": stage})
             self.autofocus_history_rows.append(
                 {
                     "timestamp": f"{timestamp:.6f}",
                     "stage": stage,
                     "z_position": z_position,
+                    "target_z": target_z,
+                    "readback_z": readback_z,
+                    "move_delta": move_delta,
                     "direction": direction,
                     "selected_metric": metric,
                     "selected_score": f"{score:.6f}",
                     "laplacian": f"{scores.get('Laplacian', 0.0):.6f}",
                     "tenengrad": f"{scores.get('Tenengrad', 0.0):.6f}",
                     "brenner": f"{scores.get('Brenner', 0.0):.6f}",
+                    "reached_wait_ms": f"{reached_wait_seconds * 1000.0:.1f}" if reached_wait_seconds is not None else "",
+                    "settle_ms": f"{float(sample_stats.get('settle_seconds', 0.0)) * 1000.0:.1f}",
+                    "discarded_frames": sample_stats.get("discarded_frames", ""),
+                    "sampled_frames": sample_stats.get("sampled_frames", ""),
+                    "first_frame_delay_ms": self._format_optional_float(sample_stats.get("first_sample_delay_ms")),
+                    "last_frame_delay_ms": self._format_optional_float(sample_stats.get("last_sample_delay_ms")),
+                    "sample_timed_out": sample_stats.get("sample_timed_out", ""),
                     "command_hex": command_hex,
                     "reached_hex": reached_hex,
                 }
             )
             ppm_bytes = self.latest_focus_frame_ppm
+        logger.info(
+            "AF sample %s target=%s readback=%s delta=%s reached=%s ms sampled=%s discarded=%s %s=%.3f",
+            stage,
+            target_z,
+            readback_z,
+            move_delta,
+            f"{reached_wait_seconds * 1000.0:.1f}" if reached_wait_seconds is not None else "-",
+            sample_stats.get("sampled_frames", "-"),
+            sample_stats.get("discarded_frames", "-"),
+            metric,
+            score,
+        )
         self.result_queue.put(("autofocus_sample", z_position, score, direction, ppm_bytes))
 
     def _autofocus_worker(self, metric: str, initial_step: int, min_step: int, search_range: int) -> None:
@@ -2483,10 +3031,20 @@ class ProbeApp(tk.Tk):
         coarse_scores: dict[int, float] = {}
         fine_scores: dict[int, float] = {}
 
-        center_scores = self._sample_after_motion_settles()
+        center_scores, center_sample_stats = self._sample_after_motion_settles()
         best_score = center_scores.get(metric, 0.0)
         coarse_scores[center_z] = best_score
-        self._record_autofocus_sample(metric, center_z, best_score, 0, stage="center", scores=center_scores)
+        self._record_autofocus_sample(
+            metric,
+            center_z,
+            best_score,
+            0,
+            stage="center",
+            scores=center_scores,
+            target_z=center_z,
+            readback_z=center_z,
+            sample_stats=center_sample_stats,
+        )
 
         self.result_queue.put((status_event, f"Center {center_z}, coarse step {initial_step}, min step {min_step}"))
         coarse_offsets = self._coarse_wobble_offsets(initial_step, search_range)
@@ -2514,6 +3072,9 @@ class ProbeApp(tk.Tk):
             lower_bound=lower_bound,
             upper_bound=upper_bound,
         )
+        with self.focus_lock:
+            self.autofocus_fine_range = (fine_start, fine_end)
+        self.result_queue.put(("autofocus_fine_range", fine_start, fine_end))
         self.result_queue.put((status_event, f"Fine scan {fine_start}..{fine_end}, step {min_step}"))
         for target_z in self._fine_scan_positions(fine_start, fine_end, min_step):
             if self._quick_autofocus_stop_requested():
@@ -2529,10 +3090,11 @@ class ProbeApp(tk.Tk):
         fine_best_z, fine_best_score = max(fit_scores.items(), key=lambda item: item[1])
         boundary_margin = max(min_step, initial_step)
         best_near_edge = fine_best_z <= center_z - search_range + boundary_margin or fine_best_z >= center_z + search_range - boundary_margin
-        fitted_z = self._fit_gaussian_focus_peak(fit_scores)
+        fitted_z = self._fit_focus_peak(fit_scores, self.probe_config.autofocus_peak_model)
         result_z = int(round(fitted_z))
         result_z = max(lower_bound, min(upper_bound, result_z))
-        result_is_usable = fine_best_score >= yellow_threshold and not best_near_edge
+        threshold_passed = fine_best_score >= yellow_threshold
+        result_is_usable = threshold_passed and not best_near_edge
 
         if result_is_usable:
             if current_z != result_z and not self._quick_autofocus_stop_requested():
@@ -2551,6 +3113,8 @@ class ProbeApp(tk.Tk):
             "fine_best_z": fine_best_z,
             "best_score": fine_best_score,
             "usable": result_is_usable,
+            "threshold_passed": threshold_passed,
+            "edge_limited": best_near_edge,
             "stopped": self._quick_autofocus_stop_requested(),
         }
 
@@ -2560,12 +3124,22 @@ class ProbeApp(tk.Tk):
             "timestamp",
             "stage",
             "z_position",
+            "target_z",
+            "readback_z",
+            "move_delta",
             "direction",
             "selected_metric",
             "selected_score",
             "laplacian",
             "tenengrad",
             "brenner",
+            "reached_wait_ms",
+            "settle_ms",
+            "discarded_frames",
+            "sampled_frames",
+            "first_frame_delay_ms",
+            "last_frame_delay_ms",
+            "sample_timed_out",
             "command_hex",
             "reached_hex",
         ]
@@ -2578,16 +3152,23 @@ class ProbeApp(tk.Tk):
         output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         logger.info("AutoFocus history written to %s (%s samples).", output_path, len(rows))
 
-    def _sample_after_motion_settles(self, duration: float = 0.36) -> dict[str, float]:
+    def _sample_after_motion_settles(
+        self,
+        duration: float = 0.36,
+        discard_frames: int = AUTOFOCUS_POST_SETTLE_DISCARD_FRAMES,
+    ) -> tuple[dict[str, float], dict[str, object]]:
         settle_seconds = max(0, self.probe_config.autofocus_settle_ms) / 1000.0
         if settle_seconds > 0:
             time.sleep(settle_seconds)
         sample_after = time.monotonic()
-        return self._sample_focus_score_frames(
+        scores, stats = self._sample_focus_score_frames(
             after_time=sample_after,
             sample_count=self.probe_config.autofocus_sample_count,
             timeout=max(duration, 0.2) + max(1.0, self.probe_config.autofocus_sample_count * 0.2),
+            discard_count=discard_frames,
         )
+        stats["settle_seconds"] = settle_seconds
+        return scores, stats
 
     @staticmethod
     def _coarse_wobble_offsets(initial_step: int, search_range: int) -> list[int]:
@@ -2620,26 +3201,39 @@ class ProbeApp(tk.Tk):
 
     @staticmethod
     def _gaussian_score_at(z_value: float, model: dict[str, float]) -> float:
-        import math
+        gaussian_model = dict(model)
+        gaussian_model["type"] = AUTOFOCUS_PEAK_MODEL_GAUSSIAN
+        return ProbeApp._focus_peak_score_at(z_value, gaussian_model)
 
-        sigma = max(model["sigma"], 1e-9)
-        exponent = -((z_value - model["mu"]) ** 2) / (2.0 * sigma * sigma)
-        return model["baseline"] + model["amplitude"] * math.exp(exponent)
+    @staticmethod
+    def _focus_peak_score_at(z_value: float, model: dict[str, float | str]) -> float:
+        peak_model = normalize_autofocus_peak_model(model.get("type", AUTOFOCUS_PEAK_MODEL_GAUSSIAN))
+        width = max(float(model.get("width", model.get("sigma", 1.0))), 1e-9)
+        mu = float(model["mu"])
+        amplitude = float(model["amplitude"])
+        eta = float(model.get("eta", 0.5))
+        shape_value = ProbeApp._peak_shape_value(peak_model, z_value, mu, width, eta)
+        return amplitude * shape_value
 
     @staticmethod
     def _fit_gaussian_focus_model(scores_by_z: dict[int, float]) -> dict[str, float] | None:
+        return ProbeApp._fit_focus_peak_model(scores_by_z, AUTOFOCUS_PEAK_MODEL_GAUSSIAN)  # type: ignore[return-value]
+
+    @staticmethod
+    def _fit_focus_peak_model(scores_by_z: dict[int, float], peak_model: str = AUTOFOCUS_PEAK_MODEL_GAUSSIAN) -> dict[str, float | str] | None:
+        peak_model = normalize_autofocus_peak_model(peak_model)
         if len(scores_by_z) < 3:
             return None
+        if peak_model != AUTOFOCUS_PEAK_MODEL_GAUSSIAN:
+            return ProbeApp._fit_grid_focus_peak_model(scores_by_z, peak_model)
 
         import math
         import numpy as np
 
         sorted_points = sorted(scores_by_z.items())
         best_z, _best_score = max(sorted_points, key=lambda item: item[1])
-        nearby = sorted(sorted_points, key=lambda item: (abs(item[0] - best_z), item[0]))[: min(7, len(sorted_points))]
-        nearby = sorted(nearby)
-        z_values = np.array([z for z, _score in nearby], dtype=np.float64)
-        scores = np.array([score for _z, score in nearby], dtype=np.float64)
+        z_values = np.array([z for z, _score in sorted_points], dtype=np.float64)
+        scores = np.array([score for _z, score in sorted_points], dtype=np.float64)
         score_span = float(np.ptp(scores))
         if score_span <= 1e-9:
             return None
@@ -2664,22 +3258,103 @@ class ProbeApp(tk.Tk):
         if sigma <= 0 or amplitude <= 0:
             return None
         return {
+            "type": AUTOFOCUS_PEAK_MODEL_GAUSSIAN,
+            "label": AUTOFOCUS_PEAK_MODEL_LABELS[AUTOFOCUS_PEAK_MODEL_GAUSSIAN],
             "mu": mu,
             "sigma": float(sigma),
+            "width": float(sigma),
             "amplitude": float(amplitude),
-            "baseline": baseline,
+            "baseline": 0.0,
         }
 
     @staticmethod
     def _fit_gaussian_focus_peak(scores_by_z: dict[int, float]) -> float:
+        return ProbeApp._fit_focus_peak(scores_by_z, AUTOFOCUS_PEAK_MODEL_GAUSSIAN)
+
+    @staticmethod
+    def _fit_focus_peak(scores_by_z: dict[int, float], peak_model: str = AUTOFOCUS_PEAK_MODEL_GAUSSIAN) -> float:
         if not scores_by_z:
             raise ValueError("At least one focus sample is required.")
         if len(scores_by_z) < 3:
             return float(max(scores_by_z, key=scores_by_z.get))
-        model = ProbeApp._fit_gaussian_focus_model(scores_by_z)
+        model = ProbeApp._fit_focus_peak_model(scores_by_z, peak_model)
         if model is None:
             return float(max(scores_by_z, key=scores_by_z.get))
-        return model["mu"]
+        return float(model["mu"])
+
+    @staticmethod
+    def _fit_grid_focus_peak_model(scores_by_z: dict[int, float], peak_model: str) -> dict[str, float | str] | None:
+        import math
+        import numpy as np
+
+        sorted_points = sorted((float(z), max(0.0, float(score))) for z, score in scores_by_z.items())
+        z_values = np.array([z for z, _score in sorted_points], dtype=np.float64)
+        scores = np.array([score for _z, score in sorted_points], dtype=np.float64)
+        if float(np.ptp(scores)) <= 1e-9:
+            return None
+
+        min_z = float(np.min(z_values))
+        max_z = float(np.max(z_values))
+        span = max(max_z - min_z, 1.0)
+        positive_diffs = [abs(b - a) for a, b in zip(z_values[:-1], z_values[1:]) if abs(b - a) > 1e-9]
+        min_step = min(positive_diffs) if positive_diffs else span / 20.0
+        min_width = max(min_step / 2.0, span / 40.0, 1e-6)
+        max_width = max(span * 2.0, min_width * 2.0)
+        mu_candidates = np.unique(np.concatenate((z_values, np.linspace(min_z, max_z, max(41, min(161, len(z_values) * 12))))))
+        width_candidates = np.geomspace(min_width, max_width, 36)
+        eta_candidates = (0.0, 0.25, 0.5, 0.75, 1.0) if peak_model == AUTOFOCUS_PEAK_MODEL_PSEUDO_VOIGT else (0.0,)
+
+        best: tuple[float, float, float, float, float] | None = None
+        for mu in mu_candidates:
+            for width in width_candidates:
+                for eta in eta_candidates:
+                    shape = np.array([ProbeApp._peak_shape_value(peak_model, z, float(mu), float(width), float(eta)) for z in z_values], dtype=np.float64)
+                    denom = float(np.dot(shape, shape))
+                    if denom <= 1e-12:
+                        continue
+                    amplitude = max(0.0, float(np.dot(scores, shape) / denom))
+                    if amplitude <= 0.0:
+                        continue
+                    residuals = scores - amplitude * shape
+                    sse = float(np.dot(residuals, residuals))
+                    if best is None or sse < best[0]:
+                        best = (sse, float(mu), float(width), amplitude, float(eta))
+
+        if best is None:
+            return None
+        _sse, mu, width, amplitude, eta = best
+        if not all(math.isfinite(value) for value in (mu, width, amplitude, eta)):
+            return None
+        return {
+            "type": peak_model,
+            "label": AUTOFOCUS_PEAK_MODEL_LABELS[peak_model],
+            "mu": mu,
+            "sigma": width,
+            "width": width,
+            "amplitude": amplitude,
+            "baseline": 0.0,
+            "eta": eta,
+        }
+
+    @staticmethod
+    def _peak_shape_value(peak_model: str, z_value: float, mu: float, width: float, eta: float = 0.5) -> float:
+        import math
+
+        peak_model = normalize_autofocus_peak_model(peak_model)
+        width = max(width, 1e-9)
+        normalized = (z_value - mu) / width
+        if peak_model == AUTOFOCUS_PEAK_MODEL_GAUSSIAN:
+            return math.exp(-(normalized * normalized) / 2.0)
+        if peak_model == AUTOFOCUS_PEAK_MODEL_LORENTZIAN:
+            return 1.0 / (1.0 + normalized * normalized)
+        if peak_model == AUTOFOCUS_PEAK_MODEL_PARABOLIC:
+            return max(0.0, 1.0 - normalized * normalized)
+        if peak_model == AUTOFOCUS_PEAK_MODEL_PSEUDO_VOIGT:
+            gaussian = math.exp(-(normalized * normalized) / 2.0)
+            lorentzian = 1.0 / (1.0 + normalized * normalized)
+            eta = max(0.0, min(1.0, eta))
+            return eta * lorentzian + (1.0 - eta) * gaussian
+        raise ValueError(f"Unsupported peak model: {peak_model}")
 
     def _wobble_offsets(self, start: int, limit: int) -> list[int]:
         offsets: list[int] = []
@@ -2714,23 +3389,41 @@ class ProbeApp(tk.Tk):
         delta = target_z - current_z
         command_hex = ""
         reached_hex = ""
+        reached_wait_seconds: float | None = None
         if delta:
             command = self.serial_client.move_relative(axis=Axis.Z, reverse=delta < 0, pulses=abs(delta), speed_percent=100)
             command_hex = hex_bytes(command)
             self.result_queue.put(("motor_command", "Z", "autofocus", command, source))
             self.result_queue.put(("moving",))
+            reached_start = time.monotonic()
             reached = self.serial_client.wait_axis_reached(Axis.Z, timeout=max(5.0, abs(delta) / 100.0))
+            reached_wait_seconds = time.monotonic() - reached_start
             reached_hex = hex_bytes(reached)
             logger.info("AutoFocus Z reached feedback: %s", colorize_hex_frame(reached_hex, "RX"))
-            entries = self.serial_client.read_xyz_positions()
+            entries = self.serial_client.read_stable_xyz_positions(required_repeats=2, max_attempts=10, interval_seconds=0.02)
             self.result_queue.put(("read_positions", entries, source, {"Z": target_z}))
             current_z = self._z_from_position_entries(entries)
-        scores = self._sample_after_motion_settles(duration=0.36)
+        scores, sample_stats = self._sample_after_motion_settles(duration=0.36)
         score = scores.get(metric, 0.0)
-        self._record_autofocus_sample(metric, current_z, score, 1 if delta >= 0 else -1, command_hex=command_hex, reached_hex=reached_hex, stage=stage, scores=scores)
+        self._record_autofocus_sample(
+            metric,
+            current_z,
+            score,
+            1 if delta >= 0 else -1,
+            command_hex=command_hex,
+            reached_hex=reached_hex,
+            stage=stage,
+            scores=scores,
+            target_z=target_z,
+            readback_z=current_z,
+            move_delta=delta,
+            reached_wait_seconds=reached_wait_seconds,
+            sample_stats=sample_stats,
+        )
         return score, current_z
 
     def use_current_xy_for_af_plane_center(self) -> None:
+        self.af_plane_region_mode_var.set("Center / Range")
         self.af_plane_center_x_var.set(str(self.current_position_values["X"]))
         self.af_plane_center_y_var.set(str(self.current_position_values["Y"]))
         self.af_plane_status_var.set("Center set from current XY.")
@@ -2852,16 +3545,11 @@ class ProbeApp(tk.Tk):
             min_step = int(float(self.autofocus_min_step_var.get()))
             search_range = int(float(self.autofocus_max_moves_var.get()))
             retry_count = int(float(self.af_plane_retry_count_var.get()))
-            yellow_threshold = self._focus_yellow_threshold(metric)
-            green_threshold = self._focus_green_threshold(metric)
         except ValueError:
             self.af_plane_status_var.set("FocusMap settings must be numeric.")
             return
         if min(initial_step, min_step, search_range) <= 0 or retry_count < 0:
             self.af_plane_status_var.set("AF step/range must be positive and retries non-negative.")
-            return
-        if green_threshold < yellow_threshold:
-            self.af_plane_status_var.set("Config threshold invalid.")
             return
         dry_run = self.af_plane_dry_run_var.get()
         if not dry_run:
@@ -2883,6 +3571,7 @@ class ProbeApp(tk.Tk):
         self.af_plane_model_stored = False
         self.af_plane_error_active = False
         clear_sample_plane_model()
+        self._disable_focusmap_plane_z_controls_if_unavailable()
         self._refresh_af_plane_table()
         self._draw_focusmap_all()
         self._update_af_plane_metrics()
@@ -2896,6 +3585,7 @@ class ProbeApp(tk.Tk):
         with self.focus_lock:
             self.autofocus_samples.clear()
             self.autofocus_z_score_samples.clear()
+            self.autofocus_fine_range = None
             self.autofocus_history_rows.clear()
             self.focus_history.clear()
             self.autofocus_run_start_time = time.monotonic()
@@ -2908,7 +3598,6 @@ class ProbeApp(tk.Tk):
             "min_step": min_step,
             "search_range": search_range,
             "retry_count": retry_count,
-            "yellow_threshold": yellow_threshold,
         }
         self.af_plane_thread = threading.Thread(
             target=self._af_plane_worker,
@@ -2954,6 +3643,7 @@ class ProbeApp(tk.Tk):
         self.af_plane_model_stored = False
         self.af_plane_error_active = False
         clear_sample_plane_model()
+        self._disable_focusmap_plane_z_controls_if_unavailable()
         self.af_plane_progress_var.set(0.0)
         self.af_plane_equation_var.set("No fitted plane")
         self.af_plane_eval_var.set("No fitted plane")
@@ -3043,6 +3733,7 @@ class ProbeApp(tk.Tk):
         with self.focus_lock:
             self.autofocus_samples.clear()
             self.autofocus_z_score_samples.clear()
+            self.autofocus_fine_range = None
 
     def _measure_af_plane_point(
         self,
@@ -3053,7 +3744,6 @@ class ProbeApp(tk.Tk):
     ) -> tuple[int | None, float, int, str]:
         metric = str(af_params["metric"])
         retry_limit = int(af_params["retry_count"])
-        yellow_threshold = float(af_params["yellow_threshold"])
         last_score = 0.0
         last_message = ""
         for attempt in range(retry_limit + 1):
@@ -3063,7 +3753,7 @@ class ProbeApp(tk.Tk):
                 assert origin is not None
                 measured_z = self._simulate_af_plane_z(point, origin)
                 time.sleep(0.08)
-                return measured_z, yellow_threshold + 1.0, attempt, "Dry run"
+                return measured_z, last_score, attempt, "Dry run"
             assert self.serial_client is not None
             entries = self.serial_client.read_stable_xyz_positions()
             current_z = self._axis_from_position_entries(entries, Axis.Z)
@@ -3085,9 +3775,9 @@ class ProbeApp(tk.Tk):
             last_score = float(result["best_score"])
             if self.af_plane_stop_event.is_set():
                 return None, last_score, attempt, "Stopped"
-            if bool(result.get("usable", False)) and last_score >= yellow_threshold:
+            if not bool(result.get("stopped", False)) and not bool(result.get("edge_limited", False)):
                 return measured_z, last_score, attempt, "OK"
-            last_message = f"{metric} {last_score:.2f} below yellow {yellow_threshold:g}"
+            last_message = "Fine peak near range edge; increase AF range or recenter."
         return None, last_score, retry_limit, last_message or "AutoFocus failed"
 
     def _simulate_af_plane_z(self, point: AFMeshPoint, origin: tuple[int, int, int]) -> int:
@@ -3150,7 +3840,12 @@ class ProbeApp(tk.Tk):
         )
         if not output:
             return
-        payload = {
+        payload = self._af_plane_result_payload()
+        Path(output).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self.af_plane_status_var.set(f"Saved {Path(output).name}.")
+
+    def _af_plane_result_payload(self) -> dict[str, object]:
+        return {
             "timestamp": time.time(),
             "mesh_settings": self._af_plane_mesh_settings_dict(),
             "autofocus_parameters": self._af_plane_af_params_dict(),
@@ -3158,8 +3853,13 @@ class ProbeApp(tk.Tk):
             "measured_points": [dict(record) for record in self.af_plane_results],
             "sample_plane_model": self.sample_plane_model.to_dict() if self.sample_plane_model is not None else None,
         }
-        Path(output).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        self.af_plane_status_var.set(f"Saved {Path(output).name}.")
+
+    def _autosave_af_plane_results(self) -> Path | None:
+        if self.sample_plane_model is None or not self.af_plane_results:
+            return None
+        output_path = Path.cwd() / FOCUSMAP_AUTOSAVE_FILENAME
+        output_path.write_text(json.dumps(self._af_plane_result_payload(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return output_path
 
     def load_af_plane_results(self) -> None:
         if self.af_plane_running:
@@ -3193,6 +3893,7 @@ class ProbeApp(tk.Tk):
             self._set_af_plane_fit_display(model)
         else:
             clear_sample_plane_model()
+            self._disable_focusmap_plane_z_controls_if_unavailable()
             self.af_plane_model_stored = False
             self.af_plane_equation_var.set("No fitted plane")
             self.af_plane_eval_var.set("No fitted plane")
@@ -3421,56 +4122,7 @@ class ProbeApp(tk.Tk):
     def _draw_focusmap_af_scatter(self) -> None:
         if not hasattr(self, "focusmap_af_canvas"):
             return
-        canvas = self.focusmap_af_canvas
-        width = max(canvas.winfo_width(), 10)
-        height = max(canvas.winfo_height(), 10)
-        canvas.delete("all")
-        canvas.create_rectangle(0, 0, width, height, fill=self.colors["surface_2"], outline="")
-        canvas.create_text(12, 10, text="AF Z vs Score", anchor="nw", fill=self.colors["muted"], font=("Segoe UI", 9))
-        with self.focus_lock:
-            samples = list(self.autofocus_z_score_samples)
-        if len(samples) < 2:
-            canvas.create_text(width // 2, height // 2, text="Waiting for AF samples", fill=self.colors["muted"], font=("Segoe UI Semibold", 11))
-            return
-        z_values = [sample[0] for sample in samples]
-        score_values = [sample[1] for sample in samples]
-        min_z, max_z = min(z_values), max(z_values)
-        fit_model = self._fit_gaussian_focus_model({z: score for z, score, _direction in samples})
-        min_score, max_score = 0.0, max(score_values)
-        if fit_model is not None:
-            max_score = max(max_score, fit_model["baseline"] + fit_model["amplitude"])
-        z_span = max(max_z - min_z, 1)
-        score_span = max(max_score - min_score, 1.0)
-        left, top, right, bottom = 46, 30, width - 16, height - 30
-        canvas.create_rectangle(left, top, right, bottom, outline=self.colors["border"])
-        raw_points: list[float] = []
-        for z_value, score, _direction in samples:
-            x = left + (z_value - min_z) / z_span * (right - left)
-            y = bottom - (score - min_score) / score_span * (bottom - top)
-            raw_points.extend((x, y))
-        if len(raw_points) >= 4:
-            canvas.create_line(*raw_points, fill="#94a3b8", width=1, dash=(3, 3))
-        if fit_model is not None:
-            curve_points: list[float] = []
-            for index in range(80):
-                z_value = min_z + index * z_span / 79
-                fit_score = self._gaussian_score_at(z_value, fit_model)
-                x = left + (z_value - min_z) / z_span * (right - left)
-                y = bottom - (fit_score - min_score) / score_span * (bottom - top)
-                curve_points.extend((x, y))
-            if len(curve_points) >= 4:
-                canvas.create_line(*curve_points, fill="#e5e7eb", width=2, smooth=True)
-            mu_x = left + (fit_model["mu"] - min_z) / z_span * (right - left)
-            canvas.create_line(mu_x, top, mu_x, bottom, fill="#e5e7eb", dash=(4, 3))
-            canvas.create_text(right - 6, top + 6, text=f"fit Z {fit_model['mu']:.1f}", anchor="ne", fill="#e5e7eb", font=("Segoe UI", 8))
-        metric = self.focus_metric_var.get()
-        for z_value, score, _direction in samples:
-            x = left + (z_value - min_z) / z_span * (right - left)
-            y = bottom - (score - min_score) / score_span * (bottom - top)
-            color = self._focus_score_color(metric, score)
-            canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill=color, outline="")
-        canvas.create_text(left, bottom + 8, text=str(min_z), anchor="nw", fill=self.colors["muted"], font=("Segoe UI", 8))
-        canvas.create_text(right, bottom + 8, text=str(max_z), anchor="ne", fill=self.colors["muted"], font=("Segoe UI", 8))
+        self._draw_af_z_score_plot(self.focusmap_af_canvas, compact=True)
 
     def _draw_focusmap_3d(self) -> None:
         if self.focusmap_3d_view is not None:
@@ -3496,7 +4148,17 @@ class ProbeApp(tk.Tk):
         if final:
             set_sample_plane_model(model)
             self.af_plane_model_stored = True
-            self.af_plane_status_var.set("FocusMap model stored for shared lookup.")
+            try:
+                autosave_path = self._autosave_af_plane_results()
+            except Exception as exc:
+                autosave_path = None
+                logger.warning("FocusMap autosave failed: %s", exc)
+            if autosave_path is not None:
+                self.af_plane_status_var.set(f"FocusMap model stored and autosaved to {autosave_path.name}.")
+            else:
+                self.af_plane_status_var.set("FocusMap model stored for shared lookup.")
+            if self.main_focusmap_plane_var.get():
+                self._update_main_focusmap_z_display()
         self._set_af_plane_fit_display(model)
         self._refresh_af_plane_table()
         self._update_af_plane_metrics()
@@ -3607,8 +4269,142 @@ class ProbeApp(tk.Tk):
             return "warn"
         return "bad"
 
+    @staticmethod
+    def _focusmap_plane_missing_message() -> str:
+        return "No FocusMap plane stored. Run or load FocusMap first."
+
+    def _on_main_focusmap_plane_toggle(self) -> None:
+        if not self.main_focusmap_plane_var.get():
+            self.clear_position_edits()
+            return
+        if get_sample_plane_model() is not None:
+            self._update_main_focusmap_z_display()
+            self._start_focusmap_z_sync()
+            return
+        self.main_focusmap_plane_var.set(False)
+        self._apply_focusmap_z_lock_to_position_entry()
+        self.status_var.set(self._focusmap_plane_missing_message())
+
+    def _on_imgstitch_focusmap_plane_toggle(self) -> None:
+        if not self.imgstitch_focusmap_plane_var.get():
+            return
+        if get_sample_plane_model() is not None:
+            return
+        message = self._focusmap_plane_missing_message()
+        self.imgstitch_focusmap_plane_var.set(False)
+        self.imgstitch_status_var.set(message)
+        self.status_var.set(message)
+
+    def _disable_focusmap_plane_z_controls_if_unavailable(self) -> None:
+        if get_sample_plane_model() is not None:
+            return
+        if self.main_focusmap_plane_var.get():
+            self.main_focusmap_plane_var.set(False)
+        if self.imgstitch_focusmap_plane_var.get():
+            self.imgstitch_focusmap_plane_var.set(False)
+        self._apply_focusmap_z_lock_to_position_entry()
+
+    def _apply_focusmap_z_lock_to_position_entry(self) -> None:
+        entry = self.position_inputs.get("Z")
+        if entry is None:
+            return
+        if self.main_focusmap_plane_var.get():
+            entry.configure(state="normal")
+            entry.configure(fg=self.colors["muted"])
+            entry.configure(state="readonly", readonlybackground=self.colors["surface_3"])
+            self.position_edit_modes["Z"] = None
+            self.modified_position_axes.discard("Z")
+            for button in self.axis_control_buttons.get("Z", []):
+                button.configure(state="disabled")
+        else:
+            entry.configure(state="normal")
+            entry.configure(fg=self.colors["accent"])
+            entry.configure(state="readonly", readonlybackground=self.colors["surface_2"])
+            for button in self.axis_control_buttons.get("Z", []):
+                button.configure(state="normal")
+
+    def _update_main_focusmap_z_display(self) -> int | None:
+        if not self.main_focusmap_plane_var.get():
+            self._apply_focusmap_z_lock_to_position_entry()
+            return None
+        target_z = self._focusmap_z_target_at_xy(self.current_position_values["X"], self.current_position_values["Y"])
+        if target_z is None:
+            self.main_focusmap_plane_var.set(False)
+            self.status_var.set(self._focusmap_plane_missing_message())
+            return None
+        self.position_vars["Z"].set(str(target_z))
+        self.autofocus_z_var.set(str(target_z))
+        self._apply_focusmap_z_lock_to_position_entry()
+        return target_z
+
+    def _start_focusmap_z_sync(self) -> None:
+        if not self.main_focusmap_plane_var.get():
+            return
+        if get_sample_plane_model() is None:
+            self.main_focusmap_plane_var.set(False)
+            self.clear_position_edits()
+            self.status_var.set(self._focusmap_plane_missing_message())
+            return
+        if self.motion_busy or self.keyboard_motion_busy:
+            self.main_focusmap_plane_var.set(False)
+            self.clear_position_edits()
+            self.status_var.set("Motion is busy; enable FocusMap Z after the current move completes.")
+            return
+        if not self.serial_client:
+            self.connect_serial()
+        if not self.serial_client:
+            self.main_focusmap_plane_var.set(False)
+            self.clear_position_edits()
+            return
+
+        self.motion_busy = True
+        self.status_var.set("Checking current position before enabling FocusMap Z...")
+        threading.Thread(target=self._focusmap_z_sync_worker, daemon=True).start()
+
+    def _focusmap_z_sync_worker(self) -> None:
+        assert self.serial_client is not None
+        try:
+            entries = self.serial_client.read_stable_xyz_positions()
+            positions = {position.axis_name: position.position for _command, _response, position in entries}
+            self.result_queue.put(("read_positions", entries, "focusmap"))
+
+            x_position = positions.get("X", self.current_position_values["X"])
+            y_position = positions.get("Y", self.current_position_values["Y"])
+            current_z = positions.get("Z", self.current_position_values["Z"])
+            target_z = self._focusmap_z_target_at_xy(x_position, y_position)
+            if target_z is None:
+                self.result_queue.put(("focusmap_z_unavailable",))
+                return
+            if current_z == target_z:
+                self.result_queue.put(("focusmap_z_synced", target_z, False))
+                return
+
+            delta = target_z - current_z
+            if target_z >= 0:
+                command = self.serial_client.move_absolute(axis=Axis.Z, target_position=target_z, speed_percent=100)
+                action = "focusmap absolute"
+            else:
+                command = self.serial_client.move_relative(axis=Axis.Z, reverse=delta < 0, pulses=abs(delta), speed_percent=100)
+                action = "focusmap relative"
+            self.result_queue.put(("motor_command", "Z", action, command, "focusmap"))
+            reached = self.serial_client.wait_axis_reached(Axis.Z, timeout=max(5.0, abs(target_z - current_z) / 100.0))
+            self.result_queue.put(("axis_done", "Z", reached, "focusmap"))
+            entries = self.serial_client.read_stable_xyz_positions()
+            self.result_queue.put(("read_positions", entries, "focusmap", {"Z": target_z}))
+            self.result_queue.put(("focusmap_z_synced", target_z, True))
+        except Exception as exc:
+            self.result_queue.put(("motor_error", "FOCUSMAP_Z", exc))
+        finally:
+            self.result_queue.put(("motor_done",))
+
     def get_focus_z_at_xy(self, x: float, y: float) -> float | None:
         return get_focus_z_at_xy(x, y)
+
+    def _focusmap_z_target_at_xy(self, x: float, y: float) -> int | None:
+        z_value = get_focus_z_at_xy(float(x), float(y))
+        if z_value is None:
+            return None
+        return int(round(z_value))
 
     def record_imgstitch_point(self, point_index: int) -> None:
         point = (self.current_position_values["X"], self.current_position_values["Y"])
@@ -3952,6 +4748,12 @@ class ProbeApp(tk.Tk):
         if self.imgstitch_plane_af_var.get() and (rows < 2 or cols < 2):
             self.imgstitch_status_var.set("Plane AF requires at least a 2x2 grid.")
             return
+        if self.imgstitch_plane_af_var.get() and self.imgstitch_focusmap_plane_var.get():
+            self.imgstitch_status_var.set("Choose either Four-corner plane AF or FocusMap plane Z.")
+            return
+        if self.imgstitch_focusmap_plane_var.get() and get_sample_plane_model() is None:
+            self.imgstitch_status_var.set("No FocusMap plane stored. Run or load FocusMap first.")
+            return
 
         self.imgstitch_restore_realtime = self.realtime_enabled
         if self.realtime_enabled:
@@ -3981,6 +4783,7 @@ class ProbeApp(tk.Tk):
                 step_x,
                 step_y,
                 self.imgstitch_plane_af_var.get(),
+                self.imgstitch_focusmap_plane_var.get(),
                 step_x_um,
                 step_y_um,
                 um_per_px,
@@ -4057,6 +4860,7 @@ class ProbeApp(tk.Tk):
         step_x: int,
         step_y: int,
         use_plane_af: bool,
+        use_focusmap_plane: bool,
         step_x_um: float,
         step_y_um: float,
         um_per_px: float,
@@ -4078,10 +4882,15 @@ class ProbeApp(tk.Tk):
                 origin_x, origin_y = scan_origin_override
             origin = (origin_x, origin_y, origin_z)
             plane = None
+            focusmap_plane = get_sample_plane_model() if use_focusmap_plane else None
+            if use_focusmap_plane and focusmap_plane is None:
+                raise RuntimeError("No FocusMap plane stored.")
             if use_plane_af:
                 self.result_queue.put(("imgstitch_status", "Running four-corner AF"))
                 plane = self._fit_imgstitch_plane(origin_x, origin_y, origin_z, rows, cols, step_x, step_y, range_mode)
                 self._move_absolute_stage(origin_x, origin_y, origin_z)
+            elif focusmap_plane is not None:
+                self.result_queue.put(("imgstitch_status", "Using stored FocusMap plane Z"))
 
             tiles: dict[tuple[int, int], object] = {}
             records: list[TileRecord] = []
@@ -4101,7 +4910,12 @@ class ProbeApp(tk.Tk):
                     step_y,
                     range_mode,
                 )
-                target_z = round(plane.z_at(target_x, target_y)) if plane else origin_z
+                if focusmap_plane is not None:
+                    target_z = round(focusmap_plane.z_at(target_x, target_y))
+                elif plane is not None:
+                    target_z = round(plane.z_at(target_x, target_y))
+                else:
+                    target_z = origin_z
                 moved_entries = self._move_absolute_stage(target_x, target_y, target_z)
                 actual_x = self._axis_from_position_entries(moved_entries, Axis.X)
                 actual_y = self._axis_from_position_entries(moved_entries, Axis.Y)
@@ -4235,7 +5049,14 @@ class ProbeApp(tk.Tk):
         min_step = max(1, int(min_step if min_step is not None else self.autofocus_min_step_var.get()))
         search_range = max(initial_step, int(search_range if search_range is not None else self.autofocus_max_moves_var.get()))
         result = self._run_autofocus_sequence(metric, initial_step, min_step, search_range, source=source, status_event=status_event)
-        return {"best_z": int(result["result_z"]), "best_score": float(result["best_score"]), "usable": bool(result["usable"])}
+        return {
+            "best_z": int(result["result_z"]),
+            "best_score": float(result["best_score"]),
+            "usable": bool(result["usable"]),
+            "threshold_passed": bool(result.get("threshold_passed", False)),
+            "edge_limited": bool(result.get("edge_limited", False)),
+            "stopped": bool(result.get("stopped", False)),
+        }
 
     def _quick_autofocus_stop_requested(self) -> bool:
         autofocus_event = self.__dict__.get("autofocus_stop_event")
@@ -4608,6 +5429,10 @@ class ProbeApp(tk.Tk):
     def move_edited_positions(self) -> None:
         if self.motion_busy:
             return
+        if self.main_focusmap_plane_var.get() and "Z" in self.modified_position_axes:
+            self.modified_position_axes.discard("Z")
+            self.position_edit_modes["Z"] = None
+            self._update_main_focusmap_z_display()
         if not self.modified_position_axes:
             self.status_var.set("No coordinate input has been modified.")
             return
@@ -4642,6 +5467,18 @@ class ProbeApp(tk.Tk):
         targets = {}
         for axis in axes:
             targets[axis] = values[axis] if modes[axis] == "Absolute" else self.current_position_values[axis] + values[axis]
+        if self.main_focusmap_plane_var.get() and any(axis in targets for axis in ("X", "Y")):
+            target_x = targets.get("X", self.current_position_values["X"])
+            target_y = targets.get("Y", self.current_position_values["Y"])
+            target_z = self._focusmap_z_target_at_xy(target_x, target_y)
+            if target_z is None:
+                self.status_var.set("FocusMap Z is enabled, but no FocusMap plane is stored.")
+                return
+            targets["Z"] = target_z
+            if target_z != self.current_position_values["Z"]:
+                axes = tuple((*axes, "Z"))
+                modes["Z"] = "Absolute"
+                values["Z"] = target_z
         self.motion_busy = True
         self.status_var.set("Running coordinate move...")
         self.modified_position_axes.clear()
@@ -4673,6 +5510,38 @@ class ProbeApp(tk.Tk):
         if not self.serial_client:
             return
 
+        if self.main_focusmap_plane_var.get():
+            target_x = self.current_position_values["X"] + steps["X"]
+            target_y = self.current_position_values["Y"] + steps["Y"]
+            target_z = self._focusmap_z_target_at_xy(target_x, target_y)
+            if target_z is None:
+                self.main_focusmap_plane_var.set(False)
+                self._apply_focusmap_z_lock_to_position_entry()
+                self.status_var.set(self._focusmap_plane_missing_message())
+                return
+            deltas = {
+                "X": steps["X"],
+                "Y": steps["Y"],
+                "Z": target_z - self.current_position_values["Z"],
+            }
+            axes = tuple(axis for axis in ("X", "Y", "Z") if deltas[axis] != 0)
+            if not axes:
+                self._update_main_focusmap_z_display()
+                self.status_var.set("FocusMap Z already matches the mapped plane.")
+                return
+            modes = {axis: "Relative" for axis in axes}
+            values = {axis: deltas[axis] for axis in axes}
+            targets = {
+                "X": target_x,
+                "Y": target_y,
+                "Z": target_z,
+            }
+            self.motion_busy = True
+            self.status_var.set(f"Running CC move with FocusMap Z={target_z}.")
+            self._show_target_positions(targets)
+            threading.Thread(target=self._move_edited_positions_worker, args=(axes, modes, values, targets), daemon=True).start()
+            return
+
         self.motion_busy = True
         targets = {axis: self.current_position_values[axis] + steps[axis] for axis in ("X", "Y", "Z") if steps[axis]}
         self.status_var.set(f"Running CC multi-axis relative move: X={steps['X']} Y={steps['Y']} Z={steps['Z']}.")
@@ -4699,6 +5568,11 @@ class ProbeApp(tk.Tk):
             logger.warning("%s move skipped because motion is busy.", axis)
             return
         if self._is_low_latency_jog_source(source) and self.keyboard_motion_busy:
+            return
+        if self.main_focusmap_plane_var.get() and axis == "Z":
+            self._update_main_focusmap_z_display()
+            self.status_var.set("FocusMap Z is enabled; manual Z movement is locked.")
+            logger.info("Manual Z move skipped because FocusMap Z is enabled.")
             return
 
         controller_axis = self._controller_axis(axis)
@@ -4728,6 +5602,30 @@ class ProbeApp(tk.Tk):
             target = pulses
         else:
             target = self.current_position_values[axis] + (-pulses if reverse else pulses)
+        if self.main_focusmap_plane_var.get() and axis in {"X", "Y"}:
+            target_x = target if axis == "X" else self.current_position_values["X"]
+            target_y = target if axis == "Y" else self.current_position_values["Y"]
+            target_z = self._focusmap_z_target_at_xy(target_x, target_y)
+            if target_z is None:
+                self.main_focusmap_plane_var.set(False)
+                self.status_var.set(self._focusmap_plane_missing_message())
+                return
+            modes = {axis: normalized_mode}
+            values = {axis: pulses if normalized_mode == "Absolute" else (-pulses if reverse else pulses)}
+            axes = (axis,)
+            if target_z != self.current_position_values["Z"]:
+                modes["Z"] = "Absolute"
+                values["Z"] = target_z
+                axes = (axis, "Z")
+            targets = {axis: target, "Z": target_z}
+            self._show_target_positions(targets)
+            if self._is_low_latency_jog_source(source):
+                self.keyboard_motion_busy = True
+            else:
+                self.motion_busy = True
+            self.status_var.set(f"Moving {axis} with FocusMap Z={target_z}.")
+            threading.Thread(target=self._move_edited_positions_worker, args=(axes, modes, values, targets), daemon=True).start()
+            return
         self._show_target_positions({axis: target})
         if self._is_low_latency_jog_source(source):
             self.keyboard_motion_busy = True
@@ -4992,6 +5890,8 @@ class ProbeApp(tk.Tk):
                 self.autofocus_status_var.set("Manual Z move completed")
             elif source == "af_plane":
                 self.af_plane_status_var.set("Stage moved")
+            elif source == "focusmap":
+                self.status_var.set("FocusMap Z position checked.")
             elif source == "imgstitch":
                 self.imgstitch_status_var.set("Stage moved")
             elif source == "zero_z":
@@ -5019,6 +5919,21 @@ class ProbeApp(tk.Tk):
                 positions.get("Z", "-"),
                 extra={"repeat_key": "keyboard_motion"} if self._is_low_latency_jog_source(source) else None,
             )
+            return
+
+        if event_type == "focusmap_z_unavailable":
+            self.main_focusmap_plane_var.set(False)
+            self.clear_position_edits()
+            self.status_var.set(self._focusmap_plane_missing_message())
+            return
+
+        if event_type == "focusmap_z_synced":
+            _, target_z, moved = event
+            self._update_main_focusmap_z_display()
+            if moved:
+                self.status_var.set(f"FocusMap Z enabled; Z moved to mapped plane ({target_z}).")
+            else:
+                self.status_var.set(f"FocusMap Z enabled; Z already matches mapped plane ({target_z}).")
             return
 
         if event_type == "ports_refreshed":
@@ -5213,6 +6128,11 @@ class ProbeApp(tk.Tk):
             self._draw_focusmap_af_scatter()
             return
 
+        if event_type == "autofocus_fine_range":
+            self._draw_autofocus_z_score()
+            self._draw_focusmap_af_scatter()
+            return
+
         if event_type == "autofocus_error":
             _, exc = event
             self.autofocus_status_var.set(f"Failed: {exc}")
@@ -5352,6 +6272,9 @@ class ProbeApp(tk.Tk):
 
         if event_type == "motor_error":
             _, axis, exc = event
+            if axis == "FOCUSMAP_Z":
+                self.main_focusmap_plane_var.set(False)
+                self.clear_position_edits()
             self.status_var.set(f"{axis} motor command failed: {exc}")
             logger.error("%s motor command failed: %s", axis, exc)
             return
@@ -5433,7 +6356,24 @@ class ProbeApp(tk.Tk):
 
     def _set_camera_index_error(self, is_error: bool) -> None:
         if hasattr(self, "camera_index_spinbox"):
-            self.camera_index_spinbox.configure(style="Error.TSpinbox" if is_error else "TSpinbox")
+            if is_error:
+                self.camera_index_spinbox.configure(
+                    bg="#3f1018",
+                    fg="#fecdd3",
+                    highlightbackground="#be123c",
+                    highlightcolor="#fb7185",
+                    insertbackground="#fecdd3",
+                    buttonbackground="#4c0519",
+                )
+            else:
+                self.camera_index_spinbox.configure(
+                    bg=self.colors["surface_2"],
+                    fg=self.colors["text"],
+                    highlightbackground=self.colors["border"],
+                    highlightcolor="#38bdf8",
+                    insertbackground=self.colors["text"],
+                    buttonbackground=self.colors["surface_3"],
+                )
 
     def _update_camera_frame(self) -> None:
         if not self.camera_rendering:
@@ -5444,8 +6384,8 @@ class ProbeApp(tk.Tk):
 
         if frame:
             publish_camera_frame(frame.image_bgr)
-            self.camera_image = tk.PhotoImage(data=self._ppm_with_scalebar(frame.image_bgr), format="PPM")
-            if self.vision_panel:
+            if self.current_page == "Main" and self.vision_panel:
+                self.camera_image = tk.PhotoImage(data=self._ppm_with_scalebar(frame.image_bgr), format="PPM")
                 self.vision_panel.set_image(self.camera_image)
             with self.focus_lock:
                 self.latest_focus_frame_ppm = frame.ppm_bytes
@@ -5469,7 +6409,7 @@ class ProbeApp(tk.Tk):
                 self.imgstitch_camera_image = tk.PhotoImage(data=f"P6 {width} {height} 255\n".encode("ascii") + rgb_live.tobytes(), format="PPM")
                 self.imgstitch_live_label.configure(image=self.imgstitch_camera_image, text="")
             if frame.focus_scores:
-                self._update_focus_scores(frame.focus_scores)
+                self._update_focus_scores(frame.focus_scores, timestamp=frame.captured_at)
 
         self.after(15, self._update_camera_frame)
 

@@ -45,7 +45,25 @@ class PixelCalibrationDialog(tk.Toplevel):
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         toolbar.columnconfigure(4, weight=1)
         ttk.Label(toolbar, text="Known distance (um)", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Entry(toolbar, textvariable=self.known_um_var, width=12).grid(row=0, column=1, sticky="w", padx=(0, 12))
+        known_um_validate = self.register(self._known_um_text_allowed)
+        tk.Entry(
+            toolbar,
+            textvariable=self.known_um_var,
+            width=12,
+            validate="key",
+            validatecommand=(known_um_validate, "%P"),
+            relief="flat",
+            bd=0,
+            bg=colors["surface_2"],
+            fg=colors["text"],
+            insertbackground=colors["text"],
+            selectbackground="#2563eb",
+            selectforeground="#f8fafc",
+            highlightthickness=1,
+            highlightbackground=colors["border"],
+            highlightcolor="#38bdf8",
+            font=("Segoe UI", 10),
+        ).grid(row=0, column=1, sticky="w", padx=(0, 12), ipady=5)
         ttk.Button(toolbar, text="Reset", command=self.reset_points).grid(row=0, column=2, sticky="w", padx=(0, 8))
         self.save_button = ttk.Button(toolbar, text="Save Calibration", style="Accent.TButton", command=self.save_result, state="disabled")
         self.save_button.grid(row=0, column=3, sticky="w")
@@ -112,6 +130,15 @@ class PixelCalibrationDialog(tk.Toplevel):
             messagebox.showerror("Pixel Calibration", "Complete three-point calibration before saving.", parent=self)
             return
         self.destroy()
+
+    @staticmethod
+    def _known_um_text_allowed(proposed: str) -> bool:
+        if proposed in {"", "."}:
+            return True
+        if proposed.count(".") > 1:
+            return False
+        digits = proposed.replace(".", "", 1)
+        return digits.isdigit()
 
     @staticmethod
     def _projection_foot(p1: tuple[float, float], p2: tuple[float, float], p3: tuple[float, float]) -> tuple[float, float]:

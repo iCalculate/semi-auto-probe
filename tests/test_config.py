@@ -3,12 +3,17 @@ import unittest
 from pathlib import Path
 
 from semi_auto_probe.config import (
+    AUTOFOCUS_PEAK_MODEL_LORENTZIAN,
     DEFAULT_CONFIG_FILENAME,
+    KEYBOARD_MOTION_SCHEME_ARROW_PAGE,
+    KEYBOARD_MOTION_SCHEME_WASD_QE,
     ProbeConfig,
     calibration_distance_px,
     calibration_key,
     derive_missing_calibrations,
+    format_jog_step_levels,
     load_probe_config,
+    parse_jog_step_levels_text,
     pulses_from_um,
     save_probe_config,
 )
@@ -87,6 +92,7 @@ class ProbeConfigTest(unittest.TestCase):
             config = ProbeConfig(
                 autofocus_settle_ms=150,
                 autofocus_sample_count=7,
+                autofocus_peak_model=AUTOFOCUS_PEAK_MODEL_LORENTZIAN,
                 imgstitch_settle_ms=175,
                 focus_threshold_yellow={"Laplacian": 700.0, "Tenengrad": 800.0, "Brenner": 900.0},
                 focus_threshold_green={"Laplacian": 1700.0, "Tenengrad": 1800.0, "Brenner": 1900.0},
@@ -97,9 +103,51 @@ class ProbeConfigTest(unittest.TestCase):
 
             self.assertEqual(loaded.autofocus_settle_ms, 150)
             self.assertEqual(loaded.autofocus_sample_count, 7)
+            self.assertEqual(loaded.autofocus_peak_model, AUTOFOCUS_PEAK_MODEL_LORENTZIAN)
             self.assertEqual(loaded.imgstitch_settle_ms, 175)
             self.assertEqual(loaded.focus_threshold_yellow["Laplacian"], 700.0)
             self.assertEqual(loaded.focus_threshold_green["Brenner"], 1900.0)
+
+    def test_keyboard_motion_scheme_defaults_and_round_trips(self) -> None:
+        self.assertEqual(ProbeConfig().keyboard_motion_scheme, KEYBOARD_MOTION_SCHEME_ARROW_PAGE)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / DEFAULT_CONFIG_FILENAME
+            config = ProbeConfig(keyboard_motion_scheme=KEYBOARD_MOTION_SCHEME_WASD_QE)
+
+            save_probe_config(config, path)
+            loaded = load_probe_config(path)
+
+            self.assertEqual(loaded.keyboard_motion_scheme, KEYBOARD_MOTION_SCHEME_WASD_QE)
+
+    def test_jog_step_levels_parse_and_format_text(self) -> None:
+        levels = parse_jog_step_levels_text("100, 1, 10, 10; 1000")
+
+        self.assertEqual(levels, (1, 10, 100, 1000))
+        self.assertEqual(format_jog_step_levels(levels), "1, 10, 100, 1000")
+
+    def test_jog_step_levels_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / DEFAULT_CONFIG_FILENAME
+            config = ProbeConfig(
+                jog_step_levels={
+                    "X": (1, 5, 25),
+                    "Y": (2, 10, 50),
+                    "Z": (3, 15, 75),
+                }
+            )
+
+            save_probe_config(config, path)
+            loaded = load_probe_config(path)
+
+            self.assertEqual(loaded.jog_step_levels["X"], (1, 5, 25))
+            self.assertEqual(loaded.jog_step_levels["Y"], (2, 10, 50))
+            self.assertEqual(loaded.jog_step_levels["Z"], (3, 15, 75))
+
+    def test_jog_step_levels_must_be_positive_integers(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_jog_step_levels_text("1, 0, 10")
+        with self.assertRaises(ValueError):
+            parse_jog_step_levels_text("1, 2.5")
 
     def test_green_threshold_must_not_be_below_yellow(self) -> None:
         config = ProbeConfig(

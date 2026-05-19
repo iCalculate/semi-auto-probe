@@ -330,17 +330,17 @@ class ControllerSerialClient:
 
     def move_relative(self, axis: Axis, reverse: bool, pulses: int, speed_percent: int = 100) -> bytes:
         command = build_relative_move_command(axis=axis, reverse=reverse, pulses=pulses, speed_percent=speed_percent)
-        self.write_command(command)
+        self.write_command(command, reset_input=True)
         return command
 
     def move_absolute(self, axis: Axis, target_position: int, speed_percent: int = 100) -> bytes:
         command = build_absolute_move_command(axis=axis, target_position=target_position, speed_percent=speed_percent)
-        self.write_command(command)
+        self.write_command(command, reset_input=True)
         return command
 
     def move_multi_axis_relative(self, axis_params: dict[Axis, tuple[bool, int, int, int]]) -> bytes:
         command = build_multi_axis_relative_move_command(axis_params)
-        self.write_command(command)
+        self.write_command(command, reset_input=True)
         return command
 
     def move_multi_axis_relative_and_wait(self, axis_params: dict[Axis, tuple[bool, int, int, int]], timeout: float = 10.0) -> tuple[bytes, bytes]:
