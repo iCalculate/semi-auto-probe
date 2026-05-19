@@ -36,6 +36,7 @@ class StitchSettings:
     seam_response_yellow: float = 0.10
     seam_response_green: float = 0.25
     use_green_edge_correction: bool = True
+    white_balance_correction: bool = True
 
     def normalized(self) -> "StitchSettings":
         yellow = max(0.0, float(self.seam_response_yellow))
@@ -49,6 +50,7 @@ class StitchSettings:
             seam_response_yellow=yellow,
             seam_response_green=green,
             use_green_edge_correction=bool(self.use_green_edge_correction),
+            white_balance_correction=bool(self.white_balance_correction),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -62,6 +64,7 @@ class StitchSettings:
             "seam_response_yellow": settings.seam_response_yellow,
             "seam_response_green": settings.seam_response_green,
             "use_green_edge_correction": settings.use_green_edge_correction,
+            "white_balance_correction": settings.white_balance_correction,
         }
 
     @classmethod
@@ -75,6 +78,7 @@ class StitchSettings:
             seam_response_yellow=float(data.get("seam_response_yellow", 0.10)),
             seam_response_green=float(data.get("seam_response_green", 0.25)),
             use_green_edge_correction=bool(data.get("use_green_edge_correction", True)),
+            white_balance_correction=bool(data.get("white_balance_correction", True)),
         ).normalized()
 
 
@@ -269,6 +273,34 @@ def flat_field_correct(image_bgr: np.ndarray, blur_kernel: int = 0) -> np.ndarra
     target = np.median(illumination.reshape(-1, 3), axis=0)
     corrected = image * (target / np.maximum(illumination, 1.0))
     return np.clip(corrected, 0, 255).astype(np.uint8)
+
+
+def white_balance_tile_set(
+    tile_images: dict[GridIndex, np.ndarray],
+    max_gain: float = 2.5,
+) -> dict[GridIndex, np.ndarray]:
+    if not tile_images:
+        return {}
+    channel_means: dict[GridIndex, np.ndarray] = {}
+    for key, image in tile_images.items():
+        if image.ndim != 3 or image.shape[2] != 3:
+            channel_means[key] = np.ones(1, dtype=np.float32)
+            continue
+        channel_means[key] = image.astype(np.float32).reshape(-1, 3).mean(axis=0)
+    valid_means = [mean for mean in channel_means.values() if mean.shape == (3,) and np.all(mean > 1.0)]
+    if not valid_means:
+        return dict(tile_images)
+    target = np.median(np.stack(valid_means, axis=0), axis=0)
+    corrected: dict[GridIndex, np.ndarray] = {}
+    for key, image in tile_images.items():
+        mean = channel_means[key]
+        if mean.shape != (3,):
+            corrected[key] = image
+            continue
+        gains = np.clip(target / np.maximum(mean, 1.0), 1.0 / max_gain, max_gain)
+        balanced = image.astype(np.float32) * gains.reshape(1, 1, 3)
+        corrected[key] = _restore_dtype(balanced, image.dtype)
+    return corrected
 
 
 def _restore_dtype(image: np.ndarray, dtype: np.dtype) -> np.ndarray:
@@ -798,6 +830,9 @@ def recompose_session(
             if image is None:
                 raise FileNotFoundError(tile.image_path)
             tile_images[tile.key] = image
+
+    if settings.white_balance_correction:
+        tile_images = white_balance_tile_set(tile_images)
 
     base_positions = stage_positions_from_um(session.tiles, session.um_per_px)
     initial_positions, _initial_path_edges = _path_positions_and_edges(session, settings, tile_images, base_positions)

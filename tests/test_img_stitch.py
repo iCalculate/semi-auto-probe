@@ -23,6 +23,7 @@ from semi_auto_probe.img_stitch import (
     recompose_session,
     serpentine_indices,
     stage_positions_from_um,
+    white_balance_tile_set,
     z_stack_positions,
 )
 from semi_auto_probe.config import ProbeConfig
@@ -48,6 +49,16 @@ class ImgStitchTest(unittest.TestCase):
         before_span = float(np.ptp(base.mean(axis=(0, 2))))
         after_span = float(np.ptp(corrected.mean(axis=(0, 2))))
         self.assertLess(after_span, before_span)
+
+    def test_white_balance_tile_set_equalizes_tile_brightness(self) -> None:
+        dark = np.full((8, 8, 3), (40, 50, 60), dtype=np.uint8)
+        bright = np.full((8, 8, 3), (120, 150, 180), dtype=np.uint8)
+
+        balanced = white_balance_tile_set({(0, 0): dark, (0, 1): bright})
+
+        dark_mean = balanced[(0, 0)].reshape(-1, 3).mean(axis=0)
+        bright_mean = balanced[(0, 1)].reshape(-1, 3).mean(axis=0)
+        self.assertLess(float(np.max(np.abs(dark_mean - bright_mean))), 2.0)
 
     def test_t_stack_average_preserves_dtype_and_averages(self) -> None:
         frames = [

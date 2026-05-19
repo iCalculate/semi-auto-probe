@@ -1,5 +1,6 @@
 pyserial>=3.5
 opencv-python>=4.8
 numpy>=1.26
+matplotlib>=3.8
 fastapi>=0.111
 uvicorn[standard]>=0.30
