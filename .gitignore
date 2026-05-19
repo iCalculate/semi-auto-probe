@@ -32,6 +32,7 @@ Thumbs.db
 probe_config.local.json
 last_focusmap_mapping.json
 last_imgstitch*.png
+assets/EBL-Mark-Array.gds
 imgstitch_session/
 last_autofocus_history*.csv
 tmp_check*

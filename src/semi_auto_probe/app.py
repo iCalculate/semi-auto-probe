@@ -47,6 +47,7 @@ from .config import (
     save_probe_config,
 )
 from .focusmap_3d import create_focusmap_3d_view
+from .gds_stage_mapper import GDSStageMapperPanel, stage_move_plan_from_um
 from .img_stitch import (
     StitchEdgeQuality,
     StitchSession,
@@ -161,6 +162,7 @@ class ProbeApp(tk.Tk):
         self.camera_rendering = False
         self.camera_image: tk.PhotoImage | None = None
         self.vision_panel: VisionPanel | None = None
+        self.gds_stage_mapper_panel: GDSStageMapperPanel | None = None
         self.latest_camera_frame = None
         self.camera_lock = threading.Lock()
         self.focus_lock = threading.Lock()
@@ -233,7 +235,9 @@ class ProbeApp(tk.Tk):
         self.focusmap_realtime_image: tk.PhotoImage | None = None
         self.af_plane_mesh_points: list[AFMeshPoint] = []
         self.af_plane_results: list[dict[str, object]] = []
+        self.af_plane_mesh_hitboxes: list[tuple[float, float, float, dict[str, object]]] = []
         self.af_plane_table_items: dict[int, str] = {}
+        self.af_plane_selected_index: int | None = None
         self.af_plane_eval_labels: dict[str, tk.Label] = {}
         self.af_plane_region_p1: tuple[int, int] | None = None
         self.af_plane_region_p2: tuple[int, int] | None = None
@@ -677,8 +681,8 @@ class ProbeApp(tk.Tk):
         self.tab_buttons: dict[str, tk.Label] = {}
         tab_bar = ttk.Frame(content, style="App.TFrame")
         tab_bar.grid(row=0, column=0, sticky="w")
-        for col, name in enumerate(("Main", "Communication", "AutoFocus", "FocusMap", "ImgStitch", "Config")):
-            tab_bar.columnconfigure(col, weight=1, uniform="top_tabs", minsize=156)
+        for col, name in enumerate(("Main", "Communication", "AutoFocus", "FocusMap", "ImgStitch", "GDS Stage Mapper", "Config")):
+            tab_bar.columnconfigure(col, weight=1, uniform="top_tabs", minsize=140)
             label = tk.Label(
                 tab_bar,
                 text=name,
@@ -708,6 +712,7 @@ class ProbeApp(tk.Tk):
         autofocus_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         af_plane_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         imgstitch_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
+        gds_stage_mapper_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         config_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         self.pages = {
             "Main": main_page,
@@ -715,6 +720,7 @@ class ProbeApp(tk.Tk):
             "AutoFocus": autofocus_page,
             "FocusMap": af_plane_page,
             "ImgStitch": imgstitch_page,
+            "GDS Stage Mapper": gds_stage_mapper_page,
             "Config": config_page,
         }
         for page in self.pages.values():
@@ -725,6 +731,7 @@ class ProbeApp(tk.Tk):
         self._build_autofocus_page(autofocus_page)
         self._build_af_plane_page(af_plane_page)
         self._build_imgstitch_page(imgstitch_page)
+        self._build_gds_stage_mapper_page(gds_stage_mapper_page)
         self._build_config_page(config_page)
         self._update_config_display()
         self._warm_page_layouts()
@@ -771,6 +778,8 @@ class ProbeApp(tk.Tk):
             self.vision_panel.draw_overlay()
         elif name == "FocusMap":
             self._draw_focusmap_all()
+        elif name == "GDS Stage Mapper" and self.gds_stage_mapper_panel is not None:
+            self.gds_stage_mapper_panel.viewer.redraw()
 
     def _build_main_page(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -817,6 +826,17 @@ class ProbeApp(tk.Tk):
         self.main_pane.add(controls_panel, weight=0)
         self.controls_panel = controls_panel
         self.after_idle(self._set_initial_main_pane)
+
+    def _build_gds_stage_mapper_page(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        self.gds_stage_mapper_panel = GDSStageMapperPanel(
+            parent,
+            self.colors,
+            get_stage_position_um=self._gds_mapper_current_stage_um,
+            move_to_stage_um=self.move_gds_mapper_target,
+            set_status=self.status_var.set,
+        )
 
     def _set_initial_main_pane(self) -> None:
         try:
@@ -963,6 +983,107 @@ class ProbeApp(tk.Tk):
             self.result_queue.put(("read_positions", entries, "vision", expected_targets))
         except Exception as exc:
             self.result_queue.put(("motor_error", "XY", exc))
+        finally:
+            self.result_queue.put(("motor_done",))
+
+    def _gds_mapper_current_stage_um(self) -> tuple[float, float]:
+        return (
+            self.current_position_values["X"] * self.probe_config.um_per_pulse("X"),
+            self.current_position_values["Y"] * self.probe_config.um_per_pulse("Y"),
+        )
+
+    def _gds_mapper_motion_blocker(self) -> str | None:
+        if self.motion_busy or self.keyboard_motion_busy:
+            return "Motion is busy; GDS mapper move skipped."
+        if self.autofocus_running:
+            return "AutoFocus is running; GDS mapper move skipped."
+        if self.af_plane_running:
+            return "FocusMap is running; GDS mapper move skipped."
+        if self.imgstitch_running:
+            return "ImgStitch is running; GDS mapper move skipped."
+        if self.position_read_pending:
+            return "Position read is pending; GDS mapper move skipped."
+        return None
+
+    def _set_gds_mapper_status(self, message: str) -> None:
+        self.status_var.set(message)
+        if self.gds_stage_mapper_panel is not None:
+            self.gds_stage_mapper_panel.set_motion_status(message)
+
+    def move_gds_mapper_target(self, target_x_um: float, target_y_um: float) -> None:
+        blocker = self._gds_mapper_motion_blocker()
+        if blocker:
+            self._set_gds_mapper_status(blocker)
+            logger.warning(blocker)
+            return
+
+        if not self.serial_client:
+            self.connect_serial()
+        if not self.serial_client:
+            self._set_gds_mapper_status("Serial is not connected; GDS mapper move skipped.")
+            return
+
+        try:
+            plan = stage_move_plan_from_um(
+                {"X": self.current_position_values["X"], "Y": self.current_position_values["Y"]},
+                target_x_um,
+                target_y_um,
+                self.probe_config.um_per_pulse("X"),
+                self.probe_config.um_per_pulse("Y"),
+            )
+        except ValueError as exc:
+            self._set_gds_mapper_status(f"GDS mapper target invalid: {exc}")
+            logger.warning("GDS mapper target rejected: %s", exc)
+            return
+
+        if not plan.has_motion:
+            self._set_gds_mapper_status("Stage is already at the selected GDS target.")
+            return
+
+        self.motion_busy = True
+        self.clear_position_edits()
+        self._show_target_positions(plan.target_pulses)
+        self._set_gds_mapper_status(
+            f"GDS mapper moving to X {target_x_um:.6g} um, Y {target_y_um:.6g} um."
+        )
+        threading.Thread(target=self._gds_mapper_move_worker, args=(target_x_um, target_y_um), daemon=True).start()
+
+    def _gds_mapper_move_worker(self, target_x_um: float, target_y_um: float) -> None:
+        assert self.serial_client is not None
+        try:
+            entries = self.serial_client.read_stable_xyz_positions()
+            running_axes = [entry[2].axis_name for entry in entries if entry[2].axis_name in {"X", "Y"} and entry[2].is_running]
+            if running_axes:
+                raise RuntimeError(f"Stage is currently moving on {', '.join(running_axes)}.")
+
+            current_pulses = {
+                "X": self._axis_from_position_entries(entries, Axis.X),
+                "Y": self._axis_from_position_entries(entries, Axis.Y),
+            }
+            plan = stage_move_plan_from_um(
+                current_pulses,
+                target_x_um,
+                target_y_um,
+                self.probe_config.um_per_pulse("X"),
+                self.probe_config.um_per_pulse("Y"),
+            )
+            if not plan.has_motion:
+                self.result_queue.put(("gds_mapper_status", "Stage is already at the selected GDS target."))
+                self.result_queue.put(("read_positions", entries, "gds_mapper"))
+                return
+
+            axis_params = {
+                Axis.X: self._cc_axis_param(plan.deltas["X"] < 0, abs(plan.deltas["X"])),
+                Axis.Y: self._cc_axis_param(plan.deltas["Y"] < 0, abs(plan.deltas["Y"])),
+            }
+            command, completed = self.serial_client.move_multi_axis_relative_and_wait(axis_params, timeout=self._cc_move_timeout(axis_params))
+            self.result_queue.put(("motor_command", "XY", "cc GDS mapper", command, "gds_mapper"))
+            self.result_queue.put(("cc_done", completed, "gds_mapper"))
+            self.result_queue.put(("moving",))
+            updated_entries = self.serial_client.read_xyz_positions()
+            self.result_queue.put(("read_positions", updated_entries, "gds_mapper", plan.target_pulses))
+        except Exception as exc:
+            self.result_queue.put(("motor_error", "GDS_MAPPER", exc))
         finally:
             self.result_queue.put(("motor_done",))
 
@@ -1248,6 +1369,7 @@ class ProbeApp(tk.Tk):
         self.focusmap_mesh_canvas = tk.Canvas(top_panel, bg="#071018", highlightthickness=1, highlightbackground="#334155")
         self.focusmap_mesh_canvas.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
         self.focusmap_mesh_canvas.bind("<Configure>", lambda _event: self._draw_af_plane_mesh())
+        self.focusmap_mesh_canvas.bind("<Button-1>", self._on_focusmap_mesh_click)
         self.focusmap_realtime_canvas = tk.Canvas(top_panel, bg="#071018", highlightthickness=1, highlightbackground="#334155")
         self.focusmap_realtime_canvas.grid(row=1, column=1, sticky="nsew", padx=(4, 4))
         self.focusmap_realtime_canvas.bind("<Configure>", lambda _event: self._draw_focusmap_realtime())
@@ -1283,17 +1405,20 @@ class ProbeApp(tk.Tk):
         table_frame.grid(row=0, column=0, sticky="nsew")
         table_frame.columnconfigure(0, weight=1)
         table_frame.rowconfigure(0, weight=1)
-        columns = ("index", "z", "fit", "residual", "status", "retry")
+        columns = ("index", "x", "y", "z", "fit", "residual", "status", "retry", "fit_enabled")
         self.af_plane_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=9, style="FocusMap.Treeview")
         headings = {
             "index": "#",
+            "x": "X",
+            "y": "Y",
             "z": "Z",
             "fit": "Z'",
             "residual": "\u0394",
             "status": "Status",
             "retry": "Retry",
+            "fit_enabled": "Fit",
         }
-        widths = {"index": 44, "z": 110, "fit": 110, "residual": 90, "status": 70, "retry": 66}
+        widths = {"index": 44, "x": 82, "y": 82, "z": 78, "fit": 78, "residual": 74, "status": 62, "retry": 54, "fit_enabled": 50}
         for column in columns:
             self.af_plane_tree.heading(column, text=headings[column])
             self.af_plane_tree.column(column, width=widths[column], minwidth=widths[column], stretch=True, anchor="center")
@@ -1303,6 +1428,8 @@ class ProbeApp(tk.Tk):
         self.af_plane_tree.tag_configure("residual_warn", foreground=self.colors["warning"])
         self.af_plane_tree.tag_configure("residual_bad", foreground=self.colors["danger"])
         self.af_plane_tree.tag_configure("residual_pending", foreground=self.colors["muted"])
+        self.af_plane_tree.tag_configure("selected_point", background="#1e3a5f")
+        self.af_plane_tree.bind("<Button-1>", self._on_af_plane_table_click)
         self.af_plane_tree.grid(row=0, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.af_plane_tree.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
@@ -1360,11 +1487,21 @@ class ProbeApp(tk.Tk):
         pick_p2_button.grid(row=row, column=1, sticky="ew", pady=(8, 0), padx=(5, 0))
         self.af_plane_pick_region_widgets.extend([pick_p1_button, pick_p2_button])
         row += 1
-        p1_label = ttk.Label(control_panel, textvariable=self.af_plane_p1_var, style="Value.TLabel", padding=6)
-        p1_label.grid(row=row, column=0, sticky="ew", pady=(5, 0), padx=(0, 5))
-        p2_label = ttk.Label(control_panel, textvariable=self.af_plane_p2_var, style="Value.TLabel", padding=6)
-        p2_label.grid(row=row, column=1, sticky="ew", pady=(5, 0), padx=(5, 0))
-        self.af_plane_pick_region_widgets.extend([p1_label, p2_label])
+        p1_frame = ttk.Frame(control_panel, style="Panel.TFrame")
+        p1_frame.grid(row=row, column=0, sticky="ew", pady=(5, 0), padx=(0, 5))
+        p1_frame.columnconfigure(0, weight=1)
+        p1_label = ttk.Label(p1_frame, textvariable=self.af_plane_p1_var, style="Value.TLabel", padding=6)
+        p1_label.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        p1_go = ttk.Button(p1_frame, text="Go", width=3, command=lambda: self.go_to_af_plane_region_point("p1"))
+        p1_go.grid(row=0, column=1, sticky="e")
+        p2_frame = ttk.Frame(control_panel, style="Panel.TFrame")
+        p2_frame.grid(row=row, column=1, sticky="ew", pady=(5, 0), padx=(5, 0))
+        p2_frame.columnconfigure(0, weight=1)
+        p2_label = ttk.Label(p2_frame, textvariable=self.af_plane_p2_var, style="Value.TLabel", padding=6)
+        p2_label.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        p2_go = ttk.Button(p2_frame, text="Go", width=3, command=lambda: self.go_to_af_plane_region_point("p2"))
+        p2_go.grid(row=0, column=1, sticky="e")
+        self.af_plane_pick_region_widgets.extend([p1_frame, p2_frame, p1_label, p2_label, p1_go, p2_go])
         row += 1
         add_spinbox(row, "Columns", self.af_plane_cols_var, 0, from_value=1)
         add_spinbox(row, "Rows", self.af_plane_rows_var, 1, from_value=1)
@@ -1394,6 +1531,8 @@ class ProbeApp(tk.Tk):
         ttk.Label(control_panel, text="EXECUTION", style="Section.TLabel").grid(row=row, column=0, columnspan=2, sticky="w", pady=(14, 0))
         row += 1
         ttk.Button(control_panel, text="Start FocusMap", style="Accent.TButton", command=self.start_af_plane_mapping).grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        row += 1
+        ttk.Button(control_panel, text="Re-Auto Focus", style="Accent.TButton", command=self.reauto_focus_selected_af_plane_point).grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         row += 1
         ttk.Button(control_panel, textvariable=self.af_plane_pause_button_var, command=self.toggle_af_plane_pause).grid(row=row, column=0, sticky="ew", pady=(8, 0), padx=(0, 5))
         ttk.Button(control_panel, text="Stop / Cancel", style="Danger.TButton", command=self.stop_af_plane_mapping).grid(row=row, column=1, sticky="ew", pady=(8, 0), padx=(5, 0))
@@ -2361,6 +2500,7 @@ class ProbeApp(tk.Tk):
             "autofocus manual",
             "button",
             "focusmap",
+            "gds_mapper",
             "go_zero",
             "imgstitch",
             "keyboard",
@@ -3443,6 +3583,54 @@ class ProbeApp(tk.Tk):
         self._sync_af_plane_center_range_from_picks()
         self.af_plane_status_var.set(f"{point_name.upper()} picked from current XY.")
 
+    def go_to_af_plane_region_point(self, point_name: str) -> None:
+        point = self.af_plane_region_p1 if point_name == "p1" else self.af_plane_region_p2
+        if point is None:
+            self.af_plane_status_var.set(f"Pick {point_name.upper()} before using Go.")
+            return
+        self._go_to_focusmap_xy(point[0], point[1], point_name.upper())
+
+    def _go_to_focusmap_xy(self, x_value: int, y_value: int, label: str = "FocusMap point") -> None:
+        if self.af_plane_running:
+            self.af_plane_status_var.set("Stop FocusMap before moving to a point.")
+            return
+        if self.motion_busy or self.keyboard_motion_busy:
+            self.af_plane_status_var.set("Motion is busy; point Go skipped.")
+            return
+        if not self.serial_client:
+            self.connect_serial()
+        if not self.serial_client:
+            return
+        target_z = self.current_position_values["Z"]
+        if self.main_focusmap_plane_var.get():
+            mapped_z = self._focusmap_z_target_at_xy(x_value, y_value)
+            if mapped_z is None:
+                self.status_var.set(self._focusmap_plane_missing_message())
+                return
+            target_z = mapped_z
+        targets = {"X": int(x_value), "Y": int(y_value)}
+        if self.main_focusmap_plane_var.get():
+            targets["Z"] = target_z
+        self.motion_busy = True
+        self._show_target_positions(targets)
+        self.af_plane_status_var.set(f"Moving to {label}: X={x_value} Y={y_value}.")
+        self.status_var.set(f"Moving to {label}: X={x_value} Y={y_value}.")
+        threading.Thread(target=self._focusmap_go_to_xy_worker, args=(int(x_value), int(y_value), int(target_z), label), daemon=True).start()
+
+    def _focusmap_go_to_xy_worker(self, x_value: int, y_value: int, z_value: int, label: str) -> None:
+        assert self.serial_client is not None
+        try:
+            entries = self._move_absolute_stage(x_value, y_value, z_value, source="focusmap")
+            targets = {"X": x_value, "Y": y_value}
+            if self.main_focusmap_plane_var.get():
+                targets["Z"] = z_value
+            self.result_queue.put(("read_positions", entries, "focusmap", targets))
+            self.result_queue.put(("focusmap_go_done", label, x_value, y_value))
+        except Exception as exc:
+            self.result_queue.put(("motor_error", "FOCUSMAP_GO", exc))
+        finally:
+            self.result_queue.put(("motor_done",))
+
     def _sync_af_plane_center_range_from_picks(self) -> None:
         if self.af_plane_region_p1 is None or self.af_plane_region_p2 is None:
             return
@@ -3503,6 +3691,7 @@ class ProbeApp(tk.Tk):
             return False
         self.af_plane_mesh_points = points
         self.af_plane_results = [self._new_af_plane_record(point) for point in points]
+        self.af_plane_selected_index = None
         self.sample_plane_model = None
         self.af_plane_model_stored = False
         self.af_plane_error_active = False
@@ -3528,6 +3717,7 @@ class ProbeApp(tk.Tk):
             "status": "pending",
             "retry_count": 0,
             "message": "",
+            "fit_enabled": True,
         }
 
     def start_af_plane_mapping(self) -> None:
@@ -3567,6 +3757,7 @@ class ProbeApp(tk.Tk):
             self.disable_home_signal_polling()
 
         self.af_plane_results = [self._new_af_plane_record(point) for point in self.af_plane_mesh_points]
+        self.af_plane_selected_index = None
         self.sample_plane_model = None
         self.af_plane_model_stored = False
         self.af_plane_error_active = False
@@ -3639,6 +3830,7 @@ class ProbeApp(tk.Tk):
             self.af_plane_status_var.set("Stop mapping before clearing results.")
             return
         self.af_plane_results = [self._new_af_plane_record(point) for point in self.af_plane_mesh_points]
+        self.af_plane_selected_index = None
         self.sample_plane_model = None
         self.af_plane_model_stored = False
         self.af_plane_error_active = False
@@ -3651,6 +3843,111 @@ class ProbeApp(tk.Tk):
         self._refresh_af_plane_table()
         self._draw_focusmap_all()
         self.af_plane_status_var.set("FocusMap results cleared.")
+
+    def reauto_focus_selected_af_plane_point(self) -> None:
+        if self.af_plane_running or self.motion_busy or self.autofocus_running or self.imgstitch_running:
+            self.af_plane_status_var.set("Another motion workflow is running.")
+            return
+        if self.af_plane_selected_index is None:
+            self.af_plane_status_var.set("Select a mesh point before Re-Auto Focus.")
+            return
+        record = self._af_plane_record_by_index(self.af_plane_selected_index)
+        if record is None:
+            self.af_plane_status_var.set("Selected FocusMap point is no longer available.")
+            return
+        try:
+            point = AFMeshPoint(
+                index=int(record["index"]),
+                row=int(record.get("row", 0)),
+                col=int(record.get("col", 0)),
+                x=int(record["x"]),
+                y=int(record["y"]),
+            )
+            af_params = {
+                "metric": self.focus_metric_var.get(),
+                "initial_step": int(float(self.autofocus_step_var.get())),
+                "min_step": int(float(self.autofocus_min_step_var.get())),
+                "search_range": int(float(self.autofocus_max_moves_var.get())),
+                "retry_count": int(float(self.af_plane_retry_count_var.get())),
+            }
+        except (KeyError, ValueError):
+            self.af_plane_status_var.set("Selected point or AF settings are invalid.")
+            return
+        if min(int(af_params["initial_step"]), int(af_params["min_step"]), int(af_params["search_range"])) <= 0 or int(af_params["retry_count"]) < 0:
+            self.af_plane_status_var.set("AF step/range must be positive and retries non-negative.")
+            return
+        dry_run = self.af_plane_dry_run_var.get()
+        if not dry_run:
+            if not self.serial_client:
+                self.connect_serial()
+            if not self.serial_client:
+                self.af_plane_status_var.set("Serial not connected. Enable dry run to test without hardware.")
+                return
+
+        self.af_plane_restore_realtime = self.realtime_enabled
+        if self.realtime_enabled:
+            self.disable_realtime_position()
+        self.af_plane_restore_home_signal = self.home_signal_enabled
+        if self.home_signal_enabled:
+            self.disable_home_signal_polling()
+
+        self.af_plane_stop_event.clear()
+        self.af_plane_pause_event.clear()
+        self.autofocus_stop_event.clear()
+        self.af_plane_paused = False
+        self.af_plane_pause_button_var.set("Pause")
+        self.af_plane_running = True
+        self.motion_busy = True
+        record["status"] = "running"
+        record["message"] = "Running AF"
+        self._update_af_plane_table_record(record)
+        self._draw_focusmap_all()
+        self.af_plane_status_var.set(f"Re-Auto Focus point {point.index}.")
+        threading.Thread(target=self._reauto_focus_af_plane_point_worker, args=(point, dict(record), af_params, dry_run), daemon=True).start()
+
+    def _reauto_focus_af_plane_point_worker(
+        self,
+        point: AFMeshPoint,
+        record: dict[str, object],
+        af_params: dict[str, object],
+        dry_run: bool,
+    ) -> None:
+        origin: tuple[int, int, int] | None = None
+        try:
+            assert dry_run or self.serial_client is not None
+            if dry_run:
+                origin = (
+                    self.current_position_values["X"],
+                    self.current_position_values["Y"],
+                    self.current_position_values["Z"],
+                )
+            else:
+                entries = self.serial_client.read_stable_xyz_positions()
+                origin = (
+                    self._axis_from_position_entries(entries, Axis.X),
+                    self._axis_from_position_entries(entries, Axis.Y),
+                    self._axis_from_position_entries(entries, Axis.Z),
+                )
+                self.result_queue.put(("read_positions", entries, "af_plane"))
+            measured_z, score, retry_count, message = self._measure_af_plane_point(point, origin, af_params, dry_run)
+            record["retry_count"] = retry_count
+            if measured_z is None:
+                record["status"] = "failed"
+                record["measured_z"] = None
+                record["message"] = message
+            else:
+                record["status"] = "success"
+                record["measured_z"] = measured_z
+                record["message"] = f"{af_params['metric']} {score:.2f}"
+            self.result_queue.put(("af_plane_reauto_point_done", dict(record)))
+        except Exception as exc:
+            self.result_queue.put(("af_plane_error", exc))
+        finally:
+            try:
+                self._write_autofocus_history_file()
+            except Exception as exc:
+                logger.warning("FocusMap re-AF history write failed: %s", exc)
+            self.result_queue.put(("af_plane_reauto_done", self.af_plane_stop_event.is_set()))
 
     def _af_plane_worker(
         self,
@@ -3789,9 +4086,10 @@ class ProbeApp(tk.Tk):
         valid_samples = [
             (float(record["x"]), float(record["y"]), float(record["measured_z"]))
             for record in records
-            if record.get("status") == "success" and record.get("measured_z") is not None
+            if record.get("status") == "success" and record.get("measured_z") is not None and bool(record.get("fit_enabled", True))
         ]
         if len(valid_samples) < 3:
+            self._clear_af_plane_fit_from_records(records)
             return None
         failed_points = sum(1 for record in records if record.get("status") == "failed")
         model = fit_sample_plane(valid_samples, failed_points=failed_points)
@@ -3808,6 +4106,39 @@ class ProbeApp(tk.Tk):
                 model.pv_residual,
             )
         return model
+
+    def _refit_af_plane_from_current_results(self, final: bool, status_prefix: str = "FocusMap refit") -> None:
+        for record in self.af_plane_results:
+            record.setdefault("fit_enabled", True)
+        model = self._fit_af_plane_records(self.af_plane_results, tuple(self.af_plane_mesh_points), final=final)
+        if model is None:
+            self.sample_plane_model = None
+            self.af_plane_model_stored = False
+            clear_sample_plane_model()
+            self._disable_focusmap_plane_z_controls_if_unavailable()
+            self.af_plane_equation_var.set("No fitted plane")
+            self.af_plane_eval_var.set("Need at least 3 included successful points to fit.")
+            self.af_plane_status_var.set(f"{status_prefix}; need at least 3 included successful points.")
+        else:
+            self.sample_plane_model = model
+            if final:
+                set_sample_plane_model(model)
+                self.af_plane_model_stored = True
+                try:
+                    self._autosave_af_plane_results()
+                except Exception as exc:
+                    logger.warning("FocusMap autosave failed after refit: %s", exc)
+            self._set_af_plane_fit_display(model)
+            self.af_plane_status_var.set(f"{status_prefix}; plane refit updated.")
+        self._refresh_af_plane_table()
+        self._update_af_plane_metrics()
+        self._draw_focusmap_all()
+
+    @staticmethod
+    def _clear_af_plane_fit_from_records(records: list[dict[str, object]]) -> None:
+        for record in records:
+            record["fitted_z"] = None
+            record["residual"] = None
 
     @staticmethod
     def _apply_af_plane_fit_to_records(model: SamplePlaneModel, records: list[dict[str, object]]) -> None:
@@ -3875,6 +4206,8 @@ class ProbeApp(tk.Tk):
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
             mesh_points = [AFMeshPoint.from_dict(item) for item in payload.get("mesh_points", [])]
             records = [dict(item) for item in payload.get("measured_points", [])]
+            for record in records:
+                record.setdefault("fit_enabled", True)
             model_payload = payload.get("sample_plane_model")
             model = SamplePlaneModel.from_dict(model_payload) if isinstance(model_payload, dict) else None
             mesh_settings = payload.get("mesh_settings", {})
@@ -3968,8 +4301,12 @@ class ProbeApp(tk.Tk):
         self.af_plane_tree.delete(*self.af_plane_tree.get_children())
         self.af_plane_table_items.clear()
         for record in self.af_plane_results:
+            record.setdefault("fit_enabled", True)
             item_id = self.af_plane_tree.insert("", "end", values=self._af_plane_table_values(record), tags=self._af_plane_table_tags(record))
             self.af_plane_table_items[int(record["index"])] = item_id
+            if self.af_plane_selected_index == int(record["index"]):
+                self.af_plane_tree.selection_set(item_id)
+                self.af_plane_tree.focus(item_id)
 
     def _update_af_plane_table_record(self, record: dict[str, object]) -> None:
         if not hasattr(self, "af_plane_tree"):
@@ -3985,16 +4322,22 @@ class ProbeApp(tk.Tk):
     def _af_plane_table_values(self, record: dict[str, object]) -> tuple[object, ...]:
         return (
             record.get("index", ""),
+            self._format_af_plane_value(record.get("x"), digits=0),
+            self._format_af_plane_value(record.get("y"), digits=0),
             self._format_af_plane_value(record.get("measured_z"), digits=0),
             self._format_af_plane_value(record.get("fitted_z"), digits=2),
             self._format_af_plane_value(record.get("residual"), digits=2),
             self._af_plane_status_symbol(str(record.get("status", ""))),
             record.get("retry_count", 0),
+            "\u2611" if bool(record.get("fit_enabled", True)) else "\u2610",
         )
 
-    def _af_plane_table_tags(self, record: dict[str, object]) -> tuple[str, str]:
+    def _af_plane_table_tags(self, record: dict[str, object]) -> tuple[str, ...]:
         parity_tag = "row_even" if int(record.get("index", 0)) % 2 == 0 else "row_odd"
-        return parity_tag, self._af_plane_residual_tag(record)
+        tags = [parity_tag, self._af_plane_residual_tag(record)]
+        if self.af_plane_selected_index == int(record.get("index", 0)):
+            tags.append("selected_point")
+        return tuple(tags)
 
     def _af_plane_residual_tag(self, record: dict[str, object]) -> str:
         status = str(record.get("status", "pending"))
@@ -4012,6 +4355,55 @@ class ProbeApp(tk.Tk):
         if abs_residual <= quality_unit * 2.0:
             return "residual_warn"
         return "residual_bad"
+
+    def _on_af_plane_table_click(self, event: tk.Event) -> str | None:
+        if not hasattr(self, "af_plane_tree"):
+            return None
+        item_id = self.af_plane_tree.identify_row(event.y)
+        if not item_id:
+            return None
+        column_id = self.af_plane_tree.identify_column(event.x)
+        index_text = self.af_plane_tree.set(item_id, "index")
+        if not index_text:
+            return None
+        index = int(index_text)
+        self._select_af_plane_point(index)
+        column_name = ""
+        if column_id.startswith("#") and column_id[1:].isdigit():
+            column_index = int(column_id[1:]) - 1
+            columns = tuple(self.af_plane_tree["columns"])
+            if 0 <= column_index < len(columns):
+                column_name = str(columns[column_index])
+        if column_name == "fit_enabled":
+            self._toggle_af_plane_record_fit_enabled(index)
+            return "break"
+        return None
+
+    def _select_af_plane_point(self, index: int) -> None:
+        self.af_plane_selected_index = index
+        item_id = self.af_plane_table_items.get(index)
+        if item_id is not None and hasattr(self, "af_plane_tree"):
+            self.af_plane_tree.selection_set(item_id)
+            self.af_plane_tree.focus(item_id)
+            self.af_plane_tree.see(item_id)
+        self._refresh_af_plane_table()
+        self._draw_af_plane_mesh()
+
+    def _af_plane_record_by_index(self, index: int) -> dict[str, object] | None:
+        for record in self.af_plane_results:
+            if int(record.get("index", 0)) == index:
+                return record
+        return None
+
+    def _toggle_af_plane_record_fit_enabled(self, index: int) -> None:
+        if self.af_plane_running:
+            self.af_plane_status_var.set("Stop FocusMap before changing fit inclusion.")
+            return
+        record = self._af_plane_record_by_index(index)
+        if record is None:
+            return
+        record["fit_enabled"] = not bool(record.get("fit_enabled", True))
+        self._refit_af_plane_from_current_results(final=True, status_prefix=f"Point {index} fit inclusion updated")
 
     @staticmethod
     def _af_plane_status_symbol(status: str) -> str:
@@ -4043,6 +4435,7 @@ class ProbeApp(tk.Tk):
             return
         canvas = self.focusmap_mesh_canvas
         canvas.delete("all")
+        self.af_plane_mesh_hitboxes = []
         records = self.af_plane_results
         if not records:
             canvas.create_text(16, 16, text="Generate a mesh to preview AF points", anchor="nw", fill=self.colors["muted"], font=("Segoe UI Semibold", 13))
@@ -4076,7 +4469,16 @@ class ProbeApp(tk.Tk):
             status = str(record.get("status", "pending"))
             color = status_colors.get(status, "#94a3b8")
             radius = 6 if status == "running" else 5
-            canvas.create_oval(px - radius, py - radius, px + radius, py + radius, fill=color, outline="#e5edf5" if status == "running" else color)
+            selected = self.af_plane_selected_index == int(record.get("index", 0))
+            if selected:
+                canvas.create_oval(px - radius - 5, py - radius - 5, px + radius + 5, py + radius + 5, fill="", outline="#38bdf8", width=2)
+            outline = "#e5edf5" if status == "running" else ("#38bdf8" if selected else color)
+            if not bool(record.get("fit_enabled", True)):
+                outline = "#94a3b8"
+            canvas.create_oval(px - radius, py - radius, px + radius, py + radius, fill=color, outline=outline, width=2 if selected else 1)
+            if not bool(record.get("fit_enabled", True)):
+                canvas.create_line(px - radius - 2, py + radius + 2, px + radius + 2, py - radius - 2, fill="#94a3b8", width=2)
+            self.af_plane_mesh_hitboxes.append((px, py, max(10.0, radius + 5.0), record))
             if len(records) <= 25:
                 canvas.create_text(px + 8, py - 8, text=str(record["index"]), anchor="w", fill="#cbd5e1", font=("Segoe UI", 8))
         valid_residuals = [float(record["residual"]) for record in records if record.get("residual") is not None]
@@ -4089,6 +4491,26 @@ class ProbeApp(tk.Tk):
                 fill="#cbd5e1",
                 font=("Segoe UI", 9),
             )
+
+    def _on_focusmap_mesh_click(self, event: tk.Event) -> str:
+        if not self.af_plane_mesh_hitboxes:
+            return "break"
+        best_record = None
+        best_distance = float("inf")
+        for px, py, radius, record in self.af_plane_mesh_hitboxes:
+            distance = math.hypot(float(event.x) - px, float(event.y) - py)
+            if distance <= radius and distance < best_distance:
+                best_distance = distance
+                best_record = record
+        if best_record is None:
+            return "break"
+        self._select_af_plane_point(int(best_record.get("index", 0)))
+        self._go_to_focusmap_xy(
+            int(round(float(best_record["x"]))),
+            int(round(float(best_record["y"]))),
+            f"FocusMap point #{best_record.get('index', '')}",
+        )
+        return "break"
 
     def _draw_focusmap_realtime(self) -> None:
         if not hasattr(self, "focusmap_realtime_canvas"):
@@ -4141,9 +4563,23 @@ class ProbeApp(tk.Tk):
         self._update_af_plane_metrics()
         self._draw_focusmap_all()
 
+    def _handle_af_plane_reauto_point_done(self, record: dict[str, object]) -> None:
+        index = int(record["index"])
+        existing = self._af_plane_record_by_index(index)
+        if existing is not None:
+            record["fit_enabled"] = bool(existing.get("fit_enabled", True))
+        if index - 1 < len(self.af_plane_results):
+            self.af_plane_results[index - 1] = record
+        else:
+            self.af_plane_results.append(record)
+        self.af_plane_selected_index = index
+        self._refit_af_plane_from_current_results(final=True, status_prefix=f"Point {index} Re-Auto Focus completed")
+
     def _handle_af_plane_fit_update(self, model_payload: dict[str, object], records: list[dict[str, object]], final: bool) -> None:
         model = SamplePlaneModel.from_dict(model_payload)
         self.sample_plane_model = model
+        for record in records:
+            record.setdefault("fit_enabled", True)
         self.af_plane_results = records
         if final:
             set_sample_plane_model(model)
@@ -5894,6 +6330,8 @@ class ProbeApp(tk.Tk):
                 self.status_var.set("FocusMap Z position checked.")
             elif source == "imgstitch":
                 self.imgstitch_status_var.set("Stage moved")
+            elif source == "gds_mapper":
+                self._set_gds_mapper_status("GDS Stage Mapper move completed.")
             elif source == "zero_z":
                 self.autofocus_status_var.set("Z set to 0")
                 self.status_var.set("Z position set to 0.")
@@ -5934,6 +6372,12 @@ class ProbeApp(tk.Tk):
                 self.status_var.set(f"FocusMap Z enabled; Z moved to mapped plane ({target_z}).")
             else:
                 self.status_var.set(f"FocusMap Z enabled; Z already matches mapped plane ({target_z}).")
+            return
+
+        if event_type == "focusmap_go_done":
+            _, label, x_value, y_value = event
+            self.af_plane_status_var.set(f"Arrived at {label}: X={x_value} Y={y_value}.")
+            self.status_var.set(f"Arrived at {label}: X={x_value} Y={y_value}.")
             return
 
         if event_type == "ports_refreshed":
@@ -5984,6 +6428,12 @@ class ProbeApp(tk.Tk):
 
         if event_type == "moving":
             self.status_var.set("Moving")
+            return
+
+        if event_type == "gds_mapper_status":
+            _, message = event
+            self._set_gds_mapper_status(str(message))
+            logger.info("GDS Stage Mapper: %s", message)
             return
 
         if event_type == "schedule_position_read":
@@ -6062,6 +6512,11 @@ class ProbeApp(tk.Tk):
             self._handle_af_plane_point_update(record, point_index, total_points)
             return
 
+        if event_type == "af_plane_reauto_point_done":
+            _, record = event
+            self._handle_af_plane_reauto_point_done(record)
+            return
+
         if event_type == "focusmap_af_reset":
             _, point_index = event
             self.af_plane_status_var.set(f"Point {point_index}: AF fit reset.")
@@ -6079,6 +6534,26 @@ class ProbeApp(tk.Tk):
             self.af_plane_status_var.set(f"Failed: {exc}")
             self.status_var.set(f"FocusMap failed: {exc}")
             logger.error("FocusMap failed: %s", exc)
+            return
+
+        if event_type == "af_plane_reauto_done":
+            _, stopped = event
+            self.af_plane_running = False
+            self.af_plane_paused = False
+            self.af_plane_pause_event.clear()
+            self.af_plane_pause_button_var.set("Pause")
+            self.motion_busy = False
+            with self.focus_lock:
+                self.autofocus_run_end_time = time.monotonic()
+            if stopped:
+                self.af_plane_status_var.set("Re-Auto Focus stopped.")
+                self.status_var.set("FocusMap Re-Auto Focus stopped.")
+            if self.af_plane_restore_realtime and not self.realtime_enabled and self.serial_client:
+                self.af_plane_restore_realtime = False
+                self.toggle_realtime_position()
+            if self.af_plane_restore_home_signal and not self.home_signal_enabled and self.serial_client:
+                self.af_plane_restore_home_signal = False
+                self.toggle_home_signal_polling()
             return
 
         if event_type == "af_plane_done":
@@ -6275,6 +6750,10 @@ class ProbeApp(tk.Tk):
             if axis == "FOCUSMAP_Z":
                 self.main_focusmap_plane_var.set(False)
                 self.clear_position_edits()
+            if axis == "GDS_MAPPER":
+                self._set_gds_mapper_status(f"GDS Stage Mapper move failed: {exc}")
+                logger.error("GDS Stage Mapper move failed: %s", exc)
+                return
             self.status_var.set(f"{axis} motor command failed: {exc}")
             logger.error("%s motor command failed: %s", axis, exc)
             return

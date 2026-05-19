@@ -122,6 +122,7 @@ The software is a Python desktop application for operating the semi-automatic st
 - Visual tools for point-to-point distance, point-to-line distance, polygon area, and image-point centering
 - Autofocus with coarse search, refinement, focus-history plots, and CSV export
 - Serpentine image stitching with flat-field correction and FFT phase-correlation registration
+- Read-only GDS layout viewing, affine GDS-to-stage calibration, live FOV overlay, and two-step click-to-move navigation
 - Optional four-corner plane compensation for tilted samples
 - Persistent local configuration for optical calibration and motor mapping
 - Raw TX/RX communication console for protocol debugging
@@ -133,6 +134,7 @@ The software is a Python desktop application for operating the semi-automatic st
 | `Main` | Live vision, visual measurement, image-point centering, position readout, jog controls, home-signal polling, zeroing |
 | `Communication` | Raw command entry, communication-test frame loading, last TX/RX display, hex history |
 | `AutoFocus` | Z autofocus, focus metric selection, score plots, manual Z jog, Z zeroing |
+| `GDS Stage Mapper` | Read-only GDS viewer, layer toggles, GDS/stage calibration, current FOV overlay, selected-target movement |
 | `ImgStitch` | Serpentine mosaic capture, overlap settings, stitch preview, optional four-corner plane AF |
 | `Config` | Objective/eyepiece selection, pixel calibration, motor mapping, conversion display |
 
@@ -162,10 +164,8 @@ The software is a Python desktop application for operating the semi-automatic st
 
 - Python `>=3.10`
 - Recommended dependency manager: `uv`
-- Python packages:
-  - `pyserial`
-  - `opencv-python`
-  - `numpy`
+- Python packages are declared in `pyproject.toml` and mirrored in `requirements.txt` for pip-based installs.
+- GDS layout loading requires `gdstk`. If it is missing, the application still starts, but the `GDS Stage Mapper` page will ask you to install it.
 
 ### Installation
 
@@ -173,6 +173,19 @@ Create the local environment and install dependencies:
 
 ```powershell
 uv sync
+```
+
+After dependency changes, refresh the uv lockfile and environment:
+
+```powershell
+uv lock
+uv sync
+```
+
+If you only need to add the GDS dependency in an existing checkout, use:
+
+```powershell
+uv add gdstk
 ```
 
 Run the GUI:
@@ -282,6 +295,7 @@ uv run python -m unittest discover -s tests
 ```
 
 If you run tests outside the project environment, make sure the active interpreter has `opencv-python`, `numpy`, and `pyserial` installed. Importing the GUI stack also imports stitching code, so OpenCV is required even for some non-camera tests.
+For GDS viewer tests or manual GDS loading, the interpreter also needs `gdstk`.
 
 ## Troubleshooting
 
@@ -302,6 +316,12 @@ If you run tests outside the project environment, make sure the active interpret
 - Try another camera index
 - Close other applications already using the camera
 - Click `Restart`
+
+### GDS loading says gdstk is missing
+
+- If you use `uv`, run `uv sync` after pulling the latest dependency files.
+- If the lockfile has not been updated yet, run `uv lock` and then `uv sync`.
+- For a local one-off fix, run `uv add gdstk`; this writes the dependency to `pyproject.toml` and updates the uv environment.
 
 ### Vision move is disabled
 
