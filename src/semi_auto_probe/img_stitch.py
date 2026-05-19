@@ -35,6 +35,7 @@ class StitchSettings:
     show_seams: bool = True
     seam_response_yellow: float = 0.10
     seam_response_green: float = 0.25
+    use_green_edge_correction: bool = True
 
     def normalized(self) -> "StitchSettings":
         yellow = max(0.0, float(self.seam_response_yellow))
@@ -47,6 +48,7 @@ class StitchSettings:
             show_seams=bool(self.show_seams),
             seam_response_yellow=yellow,
             seam_response_green=green,
+            use_green_edge_correction=bool(self.use_green_edge_correction),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -59,6 +61,7 @@ class StitchSettings:
             "show_seams": settings.show_seams,
             "seam_response_yellow": settings.seam_response_yellow,
             "seam_response_green": settings.seam_response_green,
+            "use_green_edge_correction": settings.use_green_edge_correction,
         }
 
     @classmethod
@@ -71,6 +74,7 @@ class StitchSettings:
             show_seams=bool(data.get("show_seams", True)),
             seam_response_yellow=float(data.get("seam_response_yellow", 0.10)),
             seam_response_green=float(data.get("seam_response_green", 0.25)),
+            use_green_edge_correction=bool(data.get("use_green_edge_correction", True)),
         ).normalized()
 
 
@@ -129,6 +133,9 @@ class StitchEdgeQuality:
     response: float
     correction_um: float
     quality: str
+    raw_shift_px: tuple[float, float] | None = None
+    corrected_shift_px: tuple[float, float] | None = None
+    was_corrected: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -141,6 +148,9 @@ class StitchEdgeQuality:
             "response": self.response,
             "correction_um": self.correction_um,
             "quality": self.quality,
+            "raw_shift_px": list(self.raw_shift_px or self.measured_shift_px),
+            "corrected_shift_px": list(self.corrected_shift_px or self.measured_shift_px),
+            "was_corrected": self.was_corrected,
         }
 
     @classmethod
@@ -155,6 +165,9 @@ class StitchEdgeQuality:
             response=float(data["response"]),
             correction_um=float(data["correction_um"]),
             quality=str(data["quality"]),
+            raw_shift_px=tuple(data.get("raw_shift_px", data["measured_shift_px"])),  # type: ignore[arg-type]
+            corrected_shift_px=tuple(data.get("corrected_shift_px", data["measured_shift_px"])),  # type: ignore[arg-type]
+            was_corrected=bool(data.get("was_corrected", False)),
         )
 
 
@@ -256,6 +269,145 @@ def flat_field_correct(image_bgr: np.ndarray, blur_kernel: int = 0) -> np.ndarra
     target = np.median(illumination.reshape(-1, 3), axis=0)
     corrected = image * (target / np.maximum(illumination, 1.0))
     return np.clip(corrected, 0, 255).astype(np.uint8)
+
+
+def _restore_dtype(image: np.ndarray, dtype: np.dtype) -> np.ndarray:
+    if np.issubdtype(dtype, np.integer):
+        info = np.iinfo(dtype)
+        return np.clip(image, info.min, info.max).astype(dtype)
+    return image.astype(dtype)
+
+
+def _validate_frames(frames: Iterable[np.ndarray]) -> list[np.ndarray]:
+    frame_list = [np.asarray(frame) for frame in frames]
+    if not frame_list:
+        raise ValueError("At least one frame is required.")
+    first_shape = frame_list[0].shape
+    for frame in frame_list:
+        if frame.shape != first_shape:
+            raise ValueError("All frames must have the same shape.")
+    return frame_list
+
+
+def _gray_float(image: np.ndarray) -> np.ndarray:
+    cv2_module = require_cv2()
+    if image.ndim == 2:
+        return image.astype(np.float32)
+    if image.ndim == 3 and image.shape[2] == 3:
+        return cv2_module.cvtColor(image, cv2_module.COLOR_BGR2GRAY).astype(np.float32)
+    raise ValueError("Expected grayscale or BGR image.")
+
+
+def _translate_image(image: np.ndarray, shift_x: float, shift_y: float) -> np.ndarray:
+    cv2_module = require_cv2()
+    matrix = np.array([[1.0, 0.0, shift_x], [0.0, 1.0, shift_y]], dtype=np.float32)
+    height, width = image.shape[:2]
+    return cv2_module.warpAffine(
+        image,
+        matrix,
+        (width, height),
+        flags=cv2_module.INTER_LINEAR,
+        borderMode=cv2_module.BORDER_REFLECT,
+    )
+
+
+def _registered_t_stack_frames(frame_list: list[np.ndarray]) -> list[np.ndarray]:
+    cv2_module = require_cv2()
+    reference = frame_list[0]
+    reference_gray = _gray_float(reference)
+    window = cv2_module.createHanningWindow((reference_gray.shape[1], reference_gray.shape[0]), cv2_module.CV_32F)
+    aligned = [reference]
+    for frame in frame_list[1:]:
+        try:
+            shift, response = cv2_module.phaseCorrelate(reference_gray, _gray_float(frame), window)
+            if response <= 0:
+                aligned.append(frame)
+                continue
+            shift_x, shift_y = shift
+            aligned.append(_translate_image(frame, -shift_x, -shift_y))
+        except Exception:
+            aligned.append(frame)
+    return aligned
+
+
+def fuse_t_stack(frames: Iterable[np.ndarray], method: str = "average") -> np.ndarray:
+    frame_list = _validate_frames(frames)
+    dtype = frame_list[0].dtype
+    method_name = method.lower()
+    if method_name == "average":
+        fused = np.mean([frame.astype(np.float32) for frame in frame_list], axis=0)
+        return _restore_dtype(fused, dtype)
+    if method_name not in ("registered_average", "sharpness_fusion"):
+        raise ValueError(f"Unsupported T-stack fusion method: {method}")
+
+    aligned = _registered_t_stack_frames(frame_list)
+    if method_name == "registered_average":
+        return _restore_dtype(np.mean([frame.astype(np.float32) for frame in aligned], axis=0), dtype)
+
+    sharpness = np.stack([focus_sharpness_map(frame, "tenengrad", blur_kernel=9) for frame in aligned], axis=0)
+    weights = sharpness + 1e-6
+    weights /= np.maximum(weights.sum(axis=0, keepdims=True), 1e-6)
+    stack = np.stack([frame.astype(np.float32) for frame in aligned], axis=0)
+    if stack.ndim == 4:
+        weights = weights[:, :, :, None]
+    fused = (stack * weights).sum(axis=0)
+    return _restore_dtype(fused, dtype)
+
+
+def focus_sharpness_map(image: np.ndarray, method: str = "laplacian", blur_kernel: int = 5) -> np.ndarray:
+    cv2_module = require_cv2()
+    gray = _gray_float(image)
+    method_name = method.lower()
+    if method_name == "laplacian":
+        score = np.abs(cv2_module.Laplacian(gray, cv2_module.CV_32F, ksize=3))
+    elif method_name == "tenengrad":
+        sobel_x = cv2_module.Sobel(gray, cv2_module.CV_32F, 1, 0, ksize=3)
+        sobel_y = cv2_module.Sobel(gray, cv2_module.CV_32F, 0, 1, ksize=3)
+        score = sobel_x * sobel_x + sobel_y * sobel_y
+    else:
+        raise ValueError(f"Unsupported focus fusion method: {method}")
+    if blur_kernel > 1:
+        if blur_kernel % 2 == 0:
+            blur_kernel += 1
+        score = cv2_module.GaussianBlur(score, (blur_kernel, blur_kernel), 0)
+    return score.astype(np.float32)
+
+
+def fuse_z_stack(frames: Iterable[np.ndarray], method: str = "laplacian") -> np.ndarray:
+    frame_list = _validate_frames(frames)
+    dtype = frame_list[0].dtype
+    sharpness = np.stack([focus_sharpness_map(frame, method) for frame in frame_list], axis=0)
+    indices = np.argmax(sharpness, axis=0)
+    stack = np.stack(frame_list, axis=0)
+    if stack.ndim == 3:
+        fused = np.take_along_axis(stack, indices[None, :, :], axis=0)[0]
+    else:
+        expanded_indices = indices[None, :, :, None]
+        fused = np.take_along_axis(stack, expanded_indices, axis=0)[0]
+    return _restore_dtype(fused.astype(np.float32), dtype)
+
+
+def z_stack_positions(center_z: int, z_range_um: float, z_step_um: float, config) -> list[int]:
+    from .config import pulses_from_um
+
+    if z_step_um <= 0:
+        raise ValueError("Z step must be positive.")
+    if z_range_um < 0:
+        raise ValueError("Z range must be non-negative.")
+    step_pulses = abs(pulses_from_um(z_step_um, config, "Z"))
+    range_pulses = abs(pulses_from_um(z_range_um, config, "Z"))
+    if step_pulses <= 0:
+        raise ValueError("Z step is too small for the current Z calibration.")
+    if range_pulses == 0:
+        return [center_z]
+    offsets = [0]
+    distance = step_pulses
+    while distance <= range_pulses:
+        offsets.extend((distance, -distance))
+        distance += step_pulses
+    if len(offsets) == 1 or offsets[-2] != range_pulses:
+        offsets.extend((range_pulses, -range_pulses))
+    return [center_z + offset for offset in offsets]
 
 
 def estimate_overlap_shift(
@@ -375,6 +527,112 @@ def _quality_from_metrics(response: float, correction_um: float, settings: Stitc
     return "bad"
 
 
+def _edge_direction_group(direction: str) -> str:
+    return "horizontal" if direction in ("right", "left") else "vertical"
+
+
+def _measure_edge_shift(
+    previous_key: GridIndex,
+    current_key: GridIndex,
+    settings: StitchSettings,
+    tile_images: dict[GridIndex, np.ndarray],
+    base_positions: dict[GridIndex, tuple[float, float]],
+) -> tuple[str, tuple[float, float], tuple[float, float], float]:
+    direction = _direction_between(previous_key, current_key)
+    expected_shift = (
+        base_positions[current_key][0] - base_positions[previous_key][0],
+        base_positions[current_key][1] - base_positions[previous_key][1],
+    )
+    try:
+        measured_dx, measured_dy, response = estimate_overlap_shift(
+            tile_images[previous_key],
+            tile_images[current_key],
+            direction,
+            settings.overlap_x,
+            settings.overlap_y,
+        )
+        return direction, expected_shift, (measured_dx, measured_dy), float(response)
+    except Exception:
+        return direction, expected_shift, expected_shift, 0.0
+
+
+def _position_from_shift(
+    previous_position: tuple[float, float],
+    base_position: tuple[float, float],
+    shift: tuple[float, float],
+    max_correction_px: float,
+    registration_weight: float,
+) -> tuple[float, float]:
+    measured_position = (
+        previous_position[0] + shift[0],
+        previous_position[1] + shift[1],
+    )
+    raw_correction = (
+        measured_position[0] - base_position[0],
+        measured_position[1] - base_position[1],
+    )
+    clamped_correction = _clamp_vector(raw_correction[0], raw_correction[1], max_correction_px)
+    return (
+        base_position[0] + clamped_correction[0] * registration_weight,
+        base_position[1] + clamped_correction[1] * registration_weight,
+    )
+
+
+def _green_edge_centers(edges: Iterable[StitchEdgeQuality], minimum_edges: int = 2) -> dict[str, tuple[float, float, float, int]]:
+    # Keep direction signs separate. Serpentine scans can move left, which must
+    # use the opposite of a right-edge center rather than the same horizontal vector.
+    centers: dict[str, tuple[float, float, float, int]] = {}
+    grouped: dict[str, list[tuple[float, float]]] = {}
+    for edge in edges:
+        if edge.quality != "good":
+            continue
+        grouped.setdefault(edge.direction, []).append(edge.raw_shift_px or edge.measured_shift_px)
+    for direction, shifts in grouped.items():
+        if len(shifts) < minimum_edges:
+            continue
+        values = np.array(shifts, dtype=np.float64)
+        center = np.median(values, axis=0)
+        mad = np.median(np.abs(values - center), axis=0)
+        centers[direction] = (float(center[0]), float(center[1]), float(np.hypot(mad[0], mad[1])), len(shifts))
+    return centers
+
+
+def _center_for_direction(
+    direction: str,
+    centers: dict[str, tuple[float, float, float, int]],
+) -> tuple[float, float, float, int] | None:
+    center = centers.get(direction)
+    if center is not None:
+        return center
+    opposite = {
+        "left": "right",
+        "right": "left",
+        "down": "up",
+        "up": "down",
+    }.get(direction)
+    if opposite is None or opposite not in centers:
+        return None
+    dx, dy, mad, count = centers[opposite]
+    return -dx, -dy, mad, count
+
+
+def stitch_displacement_diagnostics(edges: Iterable[StitchEdgeQuality]) -> dict[str, object]:
+    edge_list = list(edges)
+    counts = {
+        "good": sum(1 for edge in edge_list if edge.quality == "good"),
+        "warning": sum(1 for edge in edge_list if edge.quality == "warning"),
+        "bad": sum(1 for edge in edge_list if edge.quality == "bad"),
+    }
+    centers = _green_edge_centers(edge_list)
+    corrected = sum(1 for edge in edge_list if edge.was_corrected)
+    return {
+        "counts": counts,
+        "centers": centers,
+        "corrected": corrected,
+        "applied": corrected > 0,
+    }
+
+
 def compose_mosaic_from_stage_positions(
     tiles: dict[GridIndex, np.ndarray],
     records: Iterable[TileRecord],
@@ -392,31 +650,22 @@ def _edge_quality_between(
     tile_images: dict[GridIndex, np.ndarray],
     base_positions: dict[GridIndex, tuple[float, float]],
     positions: dict[GridIndex, tuple[float, float]],
+    correction_centers: dict[str, tuple[float, float, float, int]] | None = None,
 ) -> StitchEdgeQuality:
-    direction = _direction_between(previous_key, current_key)
-    expected_shift = (
-        base_positions[current_key][0] - base_positions[previous_key][0],
-        base_positions[current_key][1] - base_positions[previous_key][1],
-    )
-    measured_shift = expected_shift
-    response = 0.0
-    try:
-        measured_dx, measured_dy, response = estimate_overlap_shift(
-            tile_images[previous_key],
-            tile_images[current_key],
-            direction,
-            settings.overlap_x,
-            settings.overlap_y,
-        )
-        measured_shift = (measured_dx, measured_dy)
-    except Exception:
-        measured_shift = expected_shift
-        response = 0.0
+    direction, expected_shift, measured_shift, response = _measure_edge_shift(previous_key, current_key, settings, tile_images, base_positions)
     applied_shift = (
         positions[current_key][0] - positions[previous_key][0],
         positions[current_key][1] - positions[previous_key][1],
     )
     correction_um = float(np.hypot(applied_shift[0] - expected_shift[0], applied_shift[1] - expected_shift[1]) * session.um_per_px)
+    quality = _quality_from_metrics(float(response), correction_um, settings)
+    corrected_shift = measured_shift
+    was_corrected = False
+    if settings.use_green_edge_correction and correction_centers and quality != "good":
+        center = _center_for_direction(direction, correction_centers)
+        if center is not None:
+            corrected_shift = (center[0], center[1])
+            was_corrected = True
     return StitchEdgeQuality(
         previous=previous_key,
         current=current_key,
@@ -426,7 +675,10 @@ def _edge_quality_between(
         applied_shift_px=applied_shift,
         response=float(response),
         correction_um=correction_um,
-        quality=_quality_from_metrics(float(response), correction_um, settings),
+        quality=quality,
+        raw_shift_px=measured_shift,
+        corrected_shift_px=corrected_shift,
+        was_corrected=was_corrected,
     )
 
 
@@ -436,6 +688,7 @@ def _all_adjacent_edges(
     tile_images: dict[GridIndex, np.ndarray],
     base_positions: dict[GridIndex, tuple[float, float]],
     positions: dict[GridIndex, tuple[float, float]],
+    correction_centers: dict[str, tuple[float, float, float, int]] | None = None,
 ) -> list[StitchEdgeQuality]:
     available = {tile.key for tile in session.tiles if tile.key in tile_images and tile.key in positions}
     edges: list[StitchEdgeQuality] = []
@@ -444,10 +697,91 @@ def _all_adjacent_edges(
         right_key = (row, col + 1)
         lower_key = (row + 1, col)
         if right_key in available:
-            edges.append(_edge_quality_between(key, right_key, settings, session, tile_images, base_positions, positions))
+            edges.append(_edge_quality_between(key, right_key, settings, session, tile_images, base_positions, positions, correction_centers))
         if lower_key in available:
-            edges.append(_edge_quality_between(key, lower_key, settings, session, tile_images, base_positions, positions))
+            edges.append(_edge_quality_between(key, lower_key, settings, session, tile_images, base_positions, positions, correction_centers))
     return edges
+
+
+def _path_positions_and_edges(
+    session: StitchSession,
+    settings: StitchSettings,
+    tile_images: dict[GridIndex, np.ndarray],
+    base_positions: dict[GridIndex, tuple[float, float]],
+    correction_centers: dict[str, tuple[float, float, float, int]] | None = None,
+) -> tuple[dict[GridIndex, tuple[float, float]], list[StitchEdgeQuality]]:
+    positions: dict[GridIndex, tuple[float, float]] = {}
+    path_edges: list[StitchEdgeQuality] = []
+    max_correction_px = settings.max_correction_um / session.um_per_px if session.um_per_px > 0 else 0.0
+    ordered_keys = [tile.key for tile in sorted(session.tiles, key=lambda tile: tile.order)]
+    previous_key: GridIndex | None = None
+
+    for key in ordered_keys:
+        if key not in tile_images:
+            raise KeyError(f"Missing image for tile {key}.")
+        if previous_key is None:
+            positions[key] = base_positions[key]
+            previous_key = key
+            continue
+
+        direction, expected_shift, measured_shift, response = _measure_edge_shift(previous_key, key, settings, tile_images, base_positions)
+        provisional_position = _position_from_shift(
+            positions[previous_key],
+            base_positions[key],
+            measured_shift,
+            max_correction_px,
+            settings.registration_weight,
+        )
+        provisional_shift = (
+            provisional_position[0] - positions[previous_key][0],
+            provisional_position[1] - positions[previous_key][1],
+        )
+        provisional_correction_um = float(
+            np.hypot(provisional_shift[0] - expected_shift[0], provisional_shift[1] - expected_shift[1]) * session.um_per_px
+        )
+        quality = _quality_from_metrics(float(response), provisional_correction_um, settings)
+        corrected_shift = measured_shift
+        was_corrected = False
+        # Low-confidence path edges borrow the robust green-edge displacement
+        # only when the user enables the conservative correction mode.
+        if settings.use_green_edge_correction and correction_centers and quality != "good":
+            center = _center_for_direction(direction, correction_centers)
+            if center is not None:
+                corrected_shift = (center[0], center[1])
+                was_corrected = True
+
+        layout_weight = 1.0 if was_corrected else settings.registration_weight
+        final_position = _position_from_shift(
+            positions[previous_key],
+            base_positions[key],
+            corrected_shift,
+            max_correction_px,
+            layout_weight,
+        )
+        applied_shift = (
+            final_position[0] - positions[previous_key][0],
+            final_position[1] - positions[previous_key][1],
+        )
+        correction_um = float(np.hypot(applied_shift[0] - expected_shift[0], applied_shift[1] - expected_shift[1]) * session.um_per_px)
+        positions[key] = final_position
+        path_edges.append(
+            StitchEdgeQuality(
+                previous=previous_key,
+                current=key,
+                direction=direction,
+                expected_shift_px=expected_shift,
+                measured_shift_px=measured_shift,
+                applied_shift_px=applied_shift,
+                response=float(response),
+                correction_um=correction_um,
+                quality=quality,
+                raw_shift_px=measured_shift,
+                corrected_shift_px=corrected_shift,
+                was_corrected=was_corrected,
+            )
+        )
+        previous_key = key
+    return positions, path_edges
 
 
 def recompose_session(
@@ -466,59 +800,11 @@ def recompose_session(
             tile_images[tile.key] = image
 
     base_positions = stage_positions_from_um(session.tiles, session.um_per_px)
-    positions: dict[GridIndex, tuple[float, float]] = {}
-    max_correction_px = settings.max_correction_um / session.um_per_px if session.um_per_px > 0 else 0.0
-    ordered_keys = [tile.key for tile in sorted(session.tiles, key=lambda tile: tile.order)]
-    previous_key: GridIndex | None = None
-
-    for key in ordered_keys:
-        if key not in tile_images:
-            raise KeyError(f"Missing image for tile {key}.")
-        if previous_key is None:
-            positions[key] = base_positions[key]
-            previous_key = key
-            continue
-
-        direction = _direction_between(previous_key, key)
-        expected_shift = (
-            base_positions[key][0] - base_positions[previous_key][0],
-            base_positions[key][1] - base_positions[previous_key][1],
-        )
-        measured_shift = expected_shift
-        response = 0.0
-        try:
-            measured_dx, measured_dy, response = estimate_overlap_shift(
-                tile_images[previous_key],
-                tile_images[key],
-                direction,
-                settings.overlap_x,
-                settings.overlap_y,
-            )
-            measured_shift = (measured_dx, measured_dy)
-        except Exception:
-            measured_shift = expected_shift
-            response = 0.0
-
-        measured_position = (
-            positions[previous_key][0] + measured_shift[0],
-            positions[previous_key][1] + measured_shift[1],
-        )
-        raw_correction = (
-            measured_position[0] - base_positions[key][0],
-            measured_position[1] - base_positions[key][1],
-        )
-        clamped_correction = _clamp_vector(raw_correction[0], raw_correction[1], max_correction_px)
-        applied_correction = (
-            clamped_correction[0] * settings.registration_weight,
-            clamped_correction[1] * settings.registration_weight,
-        )
-        positions[key] = (
-            base_positions[key][0] + applied_correction[0],
-            base_positions[key][1] + applied_correction[1],
-        )
-        previous_key = key
-
-    edges = _all_adjacent_edges(session, settings, tile_images, base_positions, positions)
+    initial_positions, _initial_path_edges = _path_positions_and_edges(session, settings, tile_images, base_positions)
+    initial_edges = _all_adjacent_edges(session, settings, tile_images, base_positions, initial_positions)
+    correction_centers = _green_edge_centers(initial_edges) if settings.use_green_edge_correction else {}
+    positions, _path_edges = _path_positions_and_edges(session, settings, tile_images, base_positions, correction_centers)
+    edges = _all_adjacent_edges(session, settings, tile_images, base_positions, positions, correction_centers)
     return compose_mosaic(tile_images, positions), positions, edges
 
 
