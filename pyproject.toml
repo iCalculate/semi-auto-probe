@@ -24,4 +24,4 @@ semi-auto-probe-web = "semi_auto_probe.web_app:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-semi_auto_probe = ["web/static/*"]
+semi_auto_probe = ["assets/*", "web/static/*"]

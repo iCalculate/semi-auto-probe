@@ -51,6 +51,8 @@ class ProbeApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Semi Auto Probe")
+        self.window_icon: tk.PhotoImage | None = None
+        self._set_window_icon()
         self.geometry("1400x880")
         self.minsize(1040, 600)
         self.configure(bg="#0b0f14")
@@ -217,6 +219,19 @@ class ProbeApp(tk.Tk):
         self.start_camera()
         self.after(300, self.connect_and_test_serial)
         self.after(RESULT_POLL_INTERVAL_MS, self._poll_result_queue)
+
+    def _set_window_icon(self) -> None:
+        icon_path = Path(__file__).parent / "assets" / "logo-system-diagram.png"
+        if not icon_path.exists():
+            icon_path = Path.cwd() / "assets" / "logo-system-diagram.png"
+        if not icon_path.exists():
+            logger.warning("Window icon asset not found.")
+            return
+        try:
+            self.window_icon = tk.PhotoImage(file=str(icon_path))
+            self.iconphoto(True, self.window_icon)
+        except tk.TclError as exc:
+            logger.warning("Failed to load window icon from %s: %s", icon_path, exc)
 
     def _configure_theme(self) -> None:
         self.colors = {

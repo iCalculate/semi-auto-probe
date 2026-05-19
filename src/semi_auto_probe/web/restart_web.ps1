@@ -6,6 +6,7 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectDir = (Resolve-Path (Join-Path $ScriptDir "..\..\..")).Path
 $PidFile = Join-Path $ProjectDir ".runtime\semi-auto-probe-web.pid"
 $RuntimeDir = Split-Path -Parent $PidFile
+$PythonExe = Join-Path $ProjectDir ".venv\Scripts\python.exe"
 $WebToken = [Environment]::GetEnvironmentVariable("SEMI_AUTO_PROBE_WEB_TOKEN", "User")
 if ([string]::IsNullOrWhiteSpace($WebToken)) {
     $WebToken = "GEMsE70403"
@@ -105,7 +106,11 @@ Write-Host "      Runtime directory ready" -ForegroundColor Green
 Write-Log "INFO" "Runtime directory ready"
 
 Write-Step "3/4" "Starting new web service"
-$command = "Set-Location -LiteralPath '$ProjectDir'; `$env:SEMI_AUTO_PROBE_WEB_TOKEN='$WebToken'; `$env:SEMI_AUTO_PROBE_WEB_PORT='$WebPort'; uv run semi-auto-probe-web"
+if (-not (Test-Path -LiteralPath $PythonExe)) {
+    Write-Log "ERROR" "Python executable not found: $PythonExe"
+    throw "Python executable not found: $PythonExe. Run 'uv sync' once before starting the tray service."
+}
+$command = "Set-Location -LiteralPath '$ProjectDir'; `$env:SEMI_AUTO_PROBE_WEB_TOKEN='$WebToken'; `$env:SEMI_AUTO_PROBE_WEB_PORT='$WebPort'; & '$PythonExe' -m semi_auto_probe.web_app"
 Start-Process -FilePath "powershell" `
     -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $command) `
     -WindowStyle Hidden `

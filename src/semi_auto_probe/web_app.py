@@ -513,3 +513,7 @@ def main() -> None:
     host = os.environ.get("SEMI_AUTO_PROBE_WEB_HOST", "127.0.0.1")
     port = int(os.environ.get("SEMI_AUTO_PROBE_WEB_PORT", "8000"))
     uvicorn.run("semi_auto_probe.web_app:app", host=host, port=port, reload=False)
+
+
+if __name__ == "__main__":
+    main()

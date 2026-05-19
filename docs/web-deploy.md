@@ -24,7 +24,7 @@ Start the web server:
 
 ```powershell
 $env:SEMI_AUTO_PROBE_WEB_TOKEN="change-this-token"
-uv run semi-auto-probe-web
+.\.venv\Scripts\python.exe -m semi_auto_probe.web_app
 ```
 
 The web service writes its current process ID to:
@@ -49,7 +49,7 @@ if (Test-Path $pidPath) {
   Stop-Process -Id (Get-Content $pidPath) -ErrorAction SilentlyContinue
 }
 $env:SEMI_AUTO_PROBE_WEB_TOKEN="GEMsE70403"
-uv run semi-auto-probe-web
+.\.venv\Scripts\python.exe -m semi_auto_probe.web_app
 ```
 
 Or double-click:
@@ -103,14 +103,14 @@ The server listens on `127.0.0.1` by default. To listen on all LAN interfaces:
 
 ```powershell
 $env:SEMI_AUTO_PROBE_WEB_HOST="0.0.0.0"
-uv run semi-auto-probe-web
+.\.venv\Scripts\python.exe -m semi_auto_probe.web_app
 ```
 
 To monitor XYZ positions, configure the serial port before startup:
 
 ```powershell
 $env:SEMI_AUTO_PROBE_WEB_SERIAL_PORT="COM3"
-uv run semi-auto-probe-web
+.\.venv\Scripts\python.exe -m semi_auto_probe.web_app
 ```
 
 Start the local desktop app to publish camera frames:
@@ -185,7 +185,7 @@ the local machine does not need a public IP or router port forwarding.
    ```powershell
    $env:SEMI_AUTO_PROBE_WEB_TOKEN="change-this-token"
    $env:SEMI_AUTO_PROBE_WEB_SERIAL_PORT="COM3"
-   uv run semi-auto-probe-web
+   .\.venv\Scripts\python.exe -m semi_auto_probe.web_app
    cloudflared tunnel run semi-auto-probe
    ```
 

@@ -44,6 +44,14 @@ The physical build uses a 4-axis controller, but the application intentionally o
 - Use optional four-corner autofocus plane fitting for tilted samples
 - Expose raw communication tools for controller debugging
 
+### Strategic roadmap
+
+The project roadmap focuses on three core technological enhancements:
+
+- **Mechanical micro-nanofabrication:** develop an automated mobile platform for non-chemical-contact pattern processing, enabling precision patterning of 2D materials inside a controlled glovebox environment while reducing chemical contamination and interface damage.
+- **Integrated optical systems:** upgrade the platform with multi-channel monochromatic light sources and DMD-based spatial light modulation, expanding the system toward PL in-situ testing and high-resolution photocurrent mapping.
+- **High-stability electrical control:** transition toward a robust modular architecture with standardized wire-bonding array boards, moving beyond traditional probe-based workflows to improve testing efficiency and signal stability for multi-array devices.
+
 ## Hardware
 
 The tables below list the hardware actually used in this build. Purchase links are intentionally omitted; the goal is to document the bill of materials and the rough cost of reproducing a comparable setup.
