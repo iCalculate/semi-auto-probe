@@ -1,134 +1,88 @@
-# AI Agent Function Specification
+# AI Agent Capability And Output Contract
 
-This document is the function catalog supplied to the external LLM planner. The planner may choose one supported high-level action and produce a user-reviewable plan. The application, not the LLM, performs final safety checks and execution.
+This document is the static template supplied to the external LLM planner. The application also generates a live Markdown capability brief before every LLM call. The live brief is authoritative for current availability, blockers, positions, selected GDS target, API state, and recent outputs.
+
+## Runtime Capability Brief
+
+Before each LLM request, the application sends:
+
+- Current stage controller pulses and physical `X/Y/Z` micrometer coordinates.
+- Current mapped GDS `U/V` coordinates when LayoutBond mapping is fitted.
+- Selected GDS `U/V` and selected target stage coordinates when available.
+- Serial, camera, frame, motion, AutoFocus, FocusMap, and ImgStitch state.
+- Current model, API configuration state, current page, and recent image output path.
+- A catalog of supported high-level `action_id` values, each with purpose, owning module, prerequisites, hardware effects, confirmation policy, visualization hint, availability, and current blockers.
 
 ## Output Contract
 
-The planner must return one JSON object with:
+The planner must return one JSON object only:
 
-- `action`: one of `move_gds_target`, `autofocus_current_position`, `image_capture_sequence`, `layout_image_overlay`, `clarify`
-- `title`: short plan title
-- `understanding`: plain-language interpretation of the user request
-- `steps`: ordered list of plan steps with `title`, `module`, `detail`, `involves_motion`, `involves_autofocus`, `involves_capture`
-- `requires_confirmation`: true for any operation that changes experiment state
-- `involves_motion`, `involves_autofocus`, `involves_capture`: plan-level flags
-- `risks`: user-visible risk notes
-- `blockers`: known reasons the plan should not run
-- `recovery_suggestions`: short recovery guidance
+```json
+{
+  "title": "short plan title",
+  "understanding": "plain-language interpretation",
+  "reply_markdown": "Markdown shown to the user",
+  "needs_clarification": false,
+  "visualization_hint": "summary",
+  "plan": {
+    "steps": [
+      {
+        "action_id": "autofocus_current_position",
+        "title": "Run autofocus",
+        "module": "AutoFocus",
+        "detail": "Use current AutoFocus settings.",
+        "parameters": {},
+        "requires_confirmation": true,
+        "involves_motion": true,
+        "involves_autofocus": true,
+        "involves_capture": false,
+        "changes_experiment_state": true,
+        "visualization_hint": "autofocus",
+        "risks": ["Moves Z axis."],
+        "blockers": [],
+        "recovery_suggestions": []
+      }
+    ]
+  },
+  "blockers": [],
+  "recovery_suggestions": []
+}
+```
 
-## Available Actions
+`reply_markdown` may use headings, lists, bold text, code blocks, and simple tables. Program execution is driven only by `plan.steps[*].action_id`, not by prose.
 
-## Coordinate Semantics
+User-visible `reply_markdown` should be English by default unless the user explicitly asks for another language.
 
-- Controller coordinates are raw motor pulses.
-- Stage physical coordinates are derived micrometers from controller pulses and motor configuration.
-- GDS coordinates are layout `u/v` coordinates.
-- The current stage has no current GDS coordinate until a GDS-to-stage binding has been fitted.
-- A selected GDS point can exist before binding, but it has no executable stage target until the binding is ready.
+## Supported High-Level Actions
 
-### `move_gds_target`
+The live capability brief lists availability for these actions:
 
-Purpose: Move the XY stage to the currently selected GDS/LayoutBond target.
+| `action_id` | Module | Purpose |
+| --- | --- | --- |
+| `status_summary` | Agent Panel | Explain current state without changing hardware. |
+| `move_gds_target` | LayoutBond | Move to the currently selected GDS target through fitted mapping. |
+| `stage_move` | Stage Control | Move selected stage axes to zero/origin, absolute pulse targets, or relative pulse deltas without requiring GDS binding. |
+| `autofocus_current_position` | AutoFocus | Run the existing Z autofocus workflow. |
+| `capture_single_frame` | ImgStitch | Capture the current camera frame and save it to existing ImgStitch output locations. |
+| `image_capture_sequence` | ImgStitch | Run current XY stitch, T-stack, or Z-stack settings. |
+| `focusmap_current_settings` | FocusMap | Run FocusMap with the current generated mesh and UI settings. |
+| `layout_image_overlay` | LayoutBond | Associate the latest saved image with LayoutBond context. |
+| `clarify` | Agent Panel | Ask for clarification when a safe mapping is not possible. |
 
-Existing app entrypoint:
+## Safety Boundaries
 
-- `ProbeApp.move_gds_mapper_target(target_x_um, target_y_um)`
-
-Required context:
-
-- Serial connected
-- No active motion, AutoFocus, FocusMap, or ImgStitch
-- GDS target selected
-- GDS-to-stage binding ready
-
-Safety:
-
-- Requires confirmation
-- Involves XY motion
-- Must not construct serial commands directly
-
-### `autofocus_current_position`
-
-Purpose: Run the existing Z-axis autofocus workflow at the current XY position.
-
-Existing app entrypoint:
-
-- `ProbeApp.start_autofocus()`
-
-Required context:
-
-- Serial connected
-- Camera running with a current frame
-- No active motion, AutoFocus, FocusMap, or ImgStitch
-
-Safety:
-
-- Requires confirmation
-- Involves Z motion
-- Uses current AutoFocus UI settings
-
-### `image_capture_sequence`
-
-Purpose: Run the current ImgStitch or image-stack acquisition settings.
-
-Existing app entrypoint:
-
-- `ProbeApp.start_imgstitch()`
-
-Required context:
-
-- Serial connected
-- Camera running with a current frame
-- No active motion, AutoFocus, FocusMap, or ImgStitch
-- Current ImgStitch or stack settings are valid
-
-Safety:
-
-- Requires confirmation
-- May involve XY and Z motion
-- May involve autofocus if current acquisition settings enable focus sampling
-- Uses current ImgStitch UI settings
-
-### `layout_image_overlay`
-
-Purpose: Associate the latest stitched image output with the current LayoutBond context for inspection.
-
-Existing app behavior:
-
-- Set LayoutBond status text with the latest image path
-- Navigate to the LayoutBond page
-
-Required context:
-
-- GDS-to-stage binding ready
-- Recent stitched image exists
-- No active workflow
-
-Safety:
-
-- Requires confirmation because it changes the current inspection context
-- Does not perform pixel-level image registration in v1
-- Does not move hardware
-
-### `clarify`
-
-Purpose: Ask the user for a clearer or supported task.
-
-Use when:
-
-- The request does not map to a supported action
-- The request asks for an unsupported hardware operation
-- The request is ambiguous enough that choosing an action would be unsafe
-
-Safety:
-
-- Does not require confirmation
-- Does not execute anything
-
-## Hard Boundaries
-
-- The LLM must never send or propose raw serial/controller commands.
+- The LLM must never output raw serial/controller commands or protocol frames.
 - The LLM must never bypass confirmation.
-- The LLM must not claim that an operation has already executed.
-- The LLM may describe only high-level app workflows listed above.
-- The application will recompute blockers locally before enabling confirmation and again before execution.
+- Hardware or experiment-state-changing steps must set `requires_confirmation` to `true`.
+- The app re-checks blockers locally before enabling confirmation and again before each confirmed step executes.
+- The Agent may call only existing high-level application workflows.
+
+For `stage_move`, use these parameter shapes:
+
+```json
+{"mode": "zero", "axes": ["X", "Y"]}
+{"mode": "absolute", "targets": {"X": 0, "Y": 0}}
+{"mode": "relative", "deltas": {"X": 100, "Y": -50}}
+```
+
+Values are controller pulses unless a future application layer explicitly provides a unit converter.

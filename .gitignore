@@ -35,6 +35,7 @@ last_layoutbond_mapping.json
 last_imgstitch*.png
 assets/EBL-Mark-Array.gds
 imgstitch_session/
+imgmatrix_session/
 last_autofocus_history*.csv
 tmp_check*
 tmp_output*

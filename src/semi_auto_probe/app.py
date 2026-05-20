@@ -26,12 +26,18 @@ from .af_plane import (
 )
 from .agent import (
     AGENT_ACTION_AUTOFOCUS,
+    AGENT_ACTION_FOCUSMAP,
     AGENT_ACTION_IMAGE_CAPTURE,
     AGENT_ACTION_LAYOUT_OVERLAY,
     AGENT_ACTION_MOVE_GDS,
+    AGENT_ACTION_SINGLE_CAPTURE,
+    AGENT_ACTION_STAGE_MOVE,
+    AGENT_ACTION_STATUS,
     AgentContext,
     AgentPlan,
     build_agent_planner_from_config,
+    stage_move_axes,
+    stage_move_parameter_blockers,
 )
 from .camera import CameraSettings, UsbCamera
 from .config import (
@@ -68,6 +74,7 @@ from .config import (
 )
 from .focusmap_3d import create_focusmap_3d_view
 from .gds_stage_mapper import GDSStageMapperPanel, stage_move_plan_from_um, stage_xyz_move_plan_from_um
+from .img_matrix import ImgMatrixPanel, ImgMatrixPoint, ImgMatrixSettings, generate_imgmatrix_points, session_manifest_path
 from .img_stitch import (
     StitchEdgeQuality,
     StitchSession,
@@ -187,6 +194,7 @@ class ProbeApp(tk.Tk):
         self.camera_image: tk.PhotoImage | None = None
         self.vision_panel: VisionPanel | None = None
         self.gds_stage_mapper_panel: GDSStageMapperPanel | None = None
+        self.imgmatrix_panel: ImgMatrixPanel | None = None
         self.agent_panel: AgentPanel | None = None
         self.agent_function_spec_path = Path.cwd() / "docs" / "agent-function-spec.md"
         self.agent_planner = None
@@ -212,6 +220,11 @@ class ProbeApp(tk.Tk):
         self.imgstitch_restore_realtime = False
         self.imgstitch_restore_home_signal = False
         self.imgstitch_focus_sampling_required = False
+        self.imgmatrix_stop_event = threading.Event()
+        self.imgmatrix_thread: threading.Thread | None = None
+        self.imgmatrix_running = False
+        self.imgmatrix_restore_realtime = False
+        self.imgmatrix_restore_home_signal = False
         self.latest_stitch_frame = None
         self.current_page = "Main"
         self.active_page_name: str | None = None
@@ -286,6 +299,7 @@ class ProbeApp(tk.Tk):
         self.imgstitch_point1: tuple[int, int] | None = None
         self.imgstitch_point2: tuple[int, int] | None = None
         self.imgstitch_session_dir = Path.cwd() / "imgstitch_session"
+        self.imgmatrix_session_root = Path.cwd() / "imgmatrix_session"
         self.position_vars = {
             "X": tk.StringVar(value="0"),
             "Y": tk.StringVar(value="0"),
@@ -772,9 +786,10 @@ class ProbeApp(tk.Tk):
             "Communication": "🔌 SerialIO",
             "Config": "⚙ Settings",
         }
+        module_tab_labels["ImgMatrix"] = "ImgMatrix"
         tab_bar = ttk.Frame(content, style="App.TFrame")
         tab_bar.grid(row=0, column=0, sticky="w")
-        for col, name in enumerate(("Main", "AutoFocus", "FocusMap", "ImgStitch", "LayoutBond", "AI Agent", "Communication", "Config")):
+        for col, name in enumerate(("Main", "AutoFocus", "FocusMap", "ImgStitch", "LayoutBond", "ImgMatrix", "AI Agent", "Communication", "Config")):
             tab_bar.columnconfigure(col, minsize=124, uniform="top_tabs")
             label = tk.Label(
                 tab_bar,
@@ -808,6 +823,7 @@ class ProbeApp(tk.Tk):
         af_plane_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         imgstitch_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         gds_stage_mapper_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
+        imgmatrix_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         agent_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         config_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         self.pages = {
@@ -817,6 +833,7 @@ class ProbeApp(tk.Tk):
             "FocusMap": af_plane_page,
             "ImgStitch": imgstitch_page,
             "LayoutBond": gds_stage_mapper_page,
+            "ImgMatrix": imgmatrix_page,
             "AI Agent": agent_page,
             "Config": config_page,
         }
@@ -829,6 +846,7 @@ class ProbeApp(tk.Tk):
         self._build_af_plane_page(af_plane_page)
         self._build_imgstitch_page(imgstitch_page)
         self._build_gds_stage_mapper_page(gds_stage_mapper_page)
+        self._build_imgmatrix_page(imgmatrix_page)
         self._build_agent_page(agent_page)
         self._build_config_page(config_page)
         self._update_config_display()
@@ -889,6 +907,9 @@ class ProbeApp(tk.Tk):
             self._draw_focusmap_all()
         elif name == "LayoutBond" and self.gds_stage_mapper_panel is not None:
             self.gds_stage_mapper_panel.viewer.redraw()
+        elif name == "ImgMatrix" and self.imgmatrix_panel is not None:
+            self._sync_imgmatrix_from_layoutbond()
+            self.imgmatrix_panel.viewer.redraw()
         elif name == "AI Agent" and self.agent_panel is not None:
             self.agent_panel.refresh_context()
 
@@ -953,8 +974,38 @@ class ProbeApp(tk.Tk):
             fov_height_var=self.layoutbond_fov_height_var,
             use_focus_z_var=self.main_focusmap_plane_var,
             on_focus_z_toggle=self._on_main_focusmap_plane_toggle,
+            on_layout_changed=self._sync_imgmatrix_from_layoutbond,
             set_status=self.status_var.set,
         )
+
+    def _build_imgmatrix_page(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        self.imgmatrix_panel = ImgMatrixPanel(
+            parent,
+            self.colors,
+            get_stage_position_um=self._gds_mapper_current_stage_um,
+            get_mapper=self._imgmatrix_mapper,
+            get_microscope_preview=self.agent_microscope_preview,
+            fov_width_var=self.layoutbond_fov_width_var,
+            fov_height_var=self.layoutbond_fov_height_var,
+            start_run=self.start_imgmatrix,
+            stop_run=self.stop_imgmatrix,
+            set_status=self.status_var.set,
+        )
+        self._sync_imgmatrix_from_layoutbond()
+
+    def _imgmatrix_mapper(self):
+        if self.gds_stage_mapper_panel is None:
+            return None
+        return self.gds_stage_mapper_panel.mapper
+
+    def _sync_imgmatrix_from_layoutbond(self) -> None:
+        if self.imgmatrix_panel is None or self.gds_stage_mapper_panel is None:
+            return
+        model = self.gds_stage_mapper_panel.model
+        layer_visibility = dict(self.gds_stage_mapper_panel.viewer.layer_visibility)
+        self.imgmatrix_panel.set_layout_context(model, layer_visibility)
 
     def _build_agent_planner(self):
         return build_agent_planner_from_config(
@@ -971,11 +1022,15 @@ class ProbeApp(tk.Tk):
             self.colors,
             get_context=self.agent_context,
             get_microscope_preview=self.agent_microscope_preview,
+            draw_autofocus_plot=self.draw_agent_autofocus_plot,
             plan_instruction=self.plan_agent_instruction,
             execute_plan=self.execute_agent_plan,
             cancel_plan=self.cancel_agent_plan,
             stop_task=self.stop_agent_task,
         )
+
+    def draw_agent_autofocus_plot(self, canvas: tk.Canvas) -> None:
+        self._draw_af_z_score_plot(canvas, compact=True)
 
     def agent_context(self) -> AgentContext:
         gds_target_stage_um: tuple[float, float] | None = None
@@ -1000,6 +1055,9 @@ class ProbeApp(tk.Tk):
                     current_mapped_gds_uv = None
 
         last_stitch = self._latest_stitch_image_path()
+        with self.camera_lock:
+            agent_frame_available = self.latest_stitch_frame is not None
+        focusmap_model = get_sample_plane_model()
         return AgentContext(
             positions=dict(self.current_position_values),
             serial_connected=bool(self.serial_client and self.serial_client.is_open),
@@ -1007,7 +1065,7 @@ class ProbeApp(tk.Tk):
             keyboard_motion_busy=self.keyboard_motion_busy,
             position_read_pending=self.position_read_pending,
             camera_running=self.camera_running,
-            camera_frame_available=self.latest_camera_frame is not None,
+            camera_frame_available=agent_frame_available,
             autofocus_running=self.autofocus_running,
             focusmap_running=self.af_plane_running,
             imgstitch_running=self.imgstitch_running,
@@ -1027,7 +1085,26 @@ class ProbeApp(tk.Tk):
                 "Motor speed profile": self._motor_speed_profile_label(self.probe_config.active_motor_speed_profile),
                 "Motor speed percent": f"{self.probe_config.motor_speed_percent()}",
             },
+            agent_model=self.probe_config.agent_model,
+            agent_base_url=self.probe_config.agent_base_url,
+            agent_api_configured=bool(self.probe_config.agent_api_key.strip() or os.environ.get("SEMI_AUTO_PROBE_AGENT_API_KEY", "").strip()),
+            focus_metric=self.focus_metric_var.get(),
+            focus_sample_count=self.probe_config.autofocus_sample_count,
+            imgstitch_mode=self.imgstack_mode_var.get(),
+            imgstitch_tile_mode=self.imgstitch_tile_acquisition_var.get(),
+            imgstitch_rows=self._agent_int_var(self.imgstitch_rows_var),
+            imgstitch_cols=self._agent_int_var(self.imgstitch_cols_var),
+            focusmap_points=len(self.af_plane_mesh_points),
+            focusmap_valid_points=sum(1 for record in self.af_plane_results if record.get("measured_z") is not None),
+            focusmap_has_plane=focusmap_model is not None,
         )
+
+    @staticmethod
+    def _agent_int_var(variable: tk.StringVar) -> int | None:
+        try:
+            return int(float(variable.get()))
+        except (TypeError, ValueError, tk.TclError):
+            return None
 
     def _latest_stitch_image_path(self) -> Path | None:
         candidates = (
@@ -1091,40 +1168,148 @@ class ProbeApp(tk.Tk):
         return message
 
     def execute_agent_plan(self, plan: AgentPlan) -> str:
-        blockers = self._agent_execution_blockers(plan.action)
+        step_index = plan.next_pending_step_index()
+        if step_index is None:
+            message = "Agent plan has no pending executable step."
+            self.status_var.set(message)
+            return message
+        step = plan.steps[step_index]
+        blockers = self._agent_execution_blockers(step.action_id)
         if blockers:
-            message = "Agent plan blocked: " + "; ".join(blockers)
+            message = f"Agent step blocked ({step.title}): " + "; ".join(blockers)
             self.status_var.set(message)
             return message
 
         context = self.agent_context()
-        if plan.action == AGENT_ACTION_MOVE_GDS:
+        if step.action_id == AGENT_ACTION_MOVE_GDS:
             assert context.gds_target_stage_um is not None
             self.move_gds_mapper_target(*context.gds_target_stage_um)
             return "Agent started LayoutBond move to selected GDS target."
-        if plan.action == AGENT_ACTION_AUTOFOCUS:
+        if step.action_id == AGENT_ACTION_STAGE_MOVE:
+            return self.move_agent_stage(step.parameters)
+        if step.action_id == AGENT_ACTION_AUTOFOCUS:
             self.start_autofocus()
             return "Agent started AutoFocus at the current position."
-        if plan.action == AGENT_ACTION_IMAGE_CAPTURE:
+        if step.action_id == AGENT_ACTION_SINGLE_CAPTURE:
+            return self.capture_agent_single_frame()
+        if step.action_id == AGENT_ACTION_IMAGE_CAPTURE:
             self.start_imgstitch()
             return "Agent started the current image acquisition sequence."
-        if plan.action == AGENT_ACTION_LAYOUT_OVERLAY:
+        if step.action_id == AGENT_ACTION_FOCUSMAP:
+            self.start_af_plane_mapping()
+            return "Agent started FocusMap with the current settings."
+        if step.action_id == AGENT_ACTION_LAYOUT_OVERLAY:
             last_stitch = context.last_stitch_path or "-"
             message = f"Latest image associated with LayoutBond context: {last_stitch}"
             self._set_gds_mapper_status(message)
             self.show_page("LayoutBond")
             return message
+        if step.action_id == AGENT_ACTION_STATUS:
+            message = "Agent status summary refreshed."
+            self.status_var.set(message)
+            return message
 
-        message = "Agent plan is not executable."
+        message = "Agent step is not executable."
         self.status_var.set(message)
         return message
+
+    def capture_agent_single_frame(self) -> str:
+        with self.camera_lock:
+            frame_available = self.latest_stitch_frame is not None
+        if not self.camera_running or not frame_available:
+            message = "Agent single-frame capture blocked: camera frame is not available."
+            self.status_var.set(message)
+            return message
+        try:
+            import cv2
+
+            self._prepare_imgstitch_session_dir()
+            with self.camera_lock:
+                frame = None if self.latest_stitch_frame is None else self.latest_stitch_frame.copy()
+            if frame is None:
+                raise RuntimeError("No current microscope frame is available.")
+
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            output_path = Path.cwd() / "last_imgstitch.png"
+            session_last_path = self.imgstitch_session_dir / "last_imgstitch.png"
+            stack_path = self.imgstitch_session_dir / "stack_result.png"
+            capture_path = self.imgstitch_session_dir / f"agent_single_frame_{timestamp}.png"
+            for path in (output_path, session_last_path, stack_path, capture_path):
+                cv2.imwrite(str(path), frame)
+            self.result_queue.put(("imgstitch_preview", frame))
+            self.result_queue.put(("imgstitch_done", output_path))
+        except Exception as exc:
+            message = f"Agent single-frame capture failed: {exc}"
+            self.status_var.set(message)
+            self._set_agent_status(message)
+            return message
+        message = f"Agent captured one frame: {output_path}"
+        self.status_var.set(message)
+        self._set_agent_status(message)
+        return message
+
+    def move_agent_stage(self, parameters: dict[str, object]) -> str:
+        blockers = stage_move_parameter_blockers(parameters)
+        if blockers:
+            message = "Agent stage move blocked: " + "; ".join(blockers)
+            self.status_var.set(message)
+            return message
+        if not self.serial_client:
+            message = "Agent stage move blocked: serial port is not connected."
+            self.status_var.set(message)
+            return message
+        mode = str(parameters.get("mode", "")).lower()
+        axes = stage_move_axes(parameters)
+        modes: dict[str, str] = {}
+        values: dict[str, int] = {}
+        targets: dict[str, int] = {}
+        if mode == "zero":
+            for axis in axes:
+                modes[axis] = "Absolute"
+                values[axis] = 0
+                targets[axis] = 0
+        elif mode == "absolute":
+            raw_targets = parameters.get("targets")
+            assert isinstance(raw_targets, dict)
+            for axis in axes:
+                target = int(round(float(raw_targets[axis])))
+                modes[axis] = "Absolute"
+                values[axis] = target
+                targets[axis] = target
+        elif mode == "relative":
+            raw_deltas = parameters.get("deltas")
+            assert isinstance(raw_deltas, dict)
+            for axis in axes:
+                delta = int(round(float(raw_deltas[axis])))
+                modes[axis] = "Relative"
+                values[axis] = delta
+                targets[axis] = self.current_position_values[axis] + delta
+        axes_to_move = tuple(
+            axis
+            for axis in axes
+            if (modes[axis] == "Absolute" and values[axis] != self.current_position_values[axis])
+            or (modes[axis] == "Relative" and values[axis] != 0)
+        )
+        if not axes_to_move:
+            message = "Agent stage move skipped: stage is already at the requested target."
+            self.status_var.set(message)
+            return message
+        self.motion_busy = True
+        self._show_target_positions({axis: targets[axis] for axis in axes_to_move})
+        self.status_var.set(f"Agent moving stage ({mode}): " + ", ".join(f"{axis}->{targets[axis]}" for axis in axes_to_move))
+        threading.Thread(
+            target=self._move_edited_positions_worker,
+            args=(axes_to_move, modes, values, {axis: targets[axis] for axis in axes_to_move}, "agent_stage"),
+            daemon=True,
+        ).start()
+        return "Agent started stage move: " + ", ".join(f"{axis}->{targets[axis]}" for axis in axes_to_move)
 
     def _agent_execution_blockers(self, action: str) -> list[str]:
         context = self.agent_context()
         blockers: list[str] = []
         motion_workflow_running = context.motion_busy or context.keyboard_motion_busy or context.position_read_pending
         other_workflow_running = context.autofocus_running or context.focusmap_running or context.imgstitch_running
-        if action in {AGENT_ACTION_MOVE_GDS, AGENT_ACTION_AUTOFOCUS, AGENT_ACTION_IMAGE_CAPTURE}:
+        if action in {AGENT_ACTION_MOVE_GDS, AGENT_ACTION_STAGE_MOVE, AGENT_ACTION_AUTOFOCUS, AGENT_ACTION_IMAGE_CAPTURE, AGENT_ACTION_FOCUSMAP}:
             if motion_workflow_running:
                 blockers.append("motion is busy")
             if context.autofocus_running:
@@ -1135,6 +1320,9 @@ class ProbeApp(tk.Tk):
                 blockers.append("ImgStitch is already running")
             if not context.serial_connected:
                 blockers.append("serial port is not connected")
+        elif action == AGENT_ACTION_SINGLE_CAPTURE:
+            if motion_workflow_running or other_workflow_running:
+                blockers.append("another workflow is running")
         elif action == AGENT_ACTION_LAYOUT_OVERLAY:
             if motion_workflow_running or other_workflow_running:
                 blockers.append("another workflow is running")
@@ -1144,17 +1332,29 @@ class ProbeApp(tk.Tk):
                 blockers.append("no GDS target is selected")
             if not context.gds_mapping_ready:
                 blockers.append("GDS binding is not ready")
+        elif action == AGENT_ACTION_STAGE_MOVE:
+            pass
         elif action == AGENT_ACTION_AUTOFOCUS:
             if not context.camera_running or not context.camera_frame_available:
                 blockers.append("camera frame is not available")
         elif action == AGENT_ACTION_IMAGE_CAPTURE:
             if not context.camera_running or not context.camera_frame_available:
                 blockers.append("camera frame is not available")
+        elif action == AGENT_ACTION_SINGLE_CAPTURE:
+            if not context.camera_running or not context.camera_frame_available:
+                blockers.append("camera frame is not available")
+        elif action == AGENT_ACTION_FOCUSMAP:
+            if not context.camera_running or not context.camera_frame_available:
+                blockers.append("camera frame is not available")
+            if context.focusmap_points < 1:
+                blockers.append("no FocusMap mesh is generated")
         elif action == AGENT_ACTION_LAYOUT_OVERLAY:
             if not context.gds_mapping_ready:
                 blockers.append("GDS binding is not ready")
             if not context.last_stitch_path:
                 blockers.append("no recent stitched image is available")
+        elif action == AGENT_ACTION_STATUS:
+            pass
         else:
             blockers.append("unsupported Agent action")
         return blockers
@@ -1331,6 +1531,8 @@ class ProbeApp(tk.Tk):
             return "FocusMap is running; LayoutBond move skipped."
         if self.imgstitch_running:
             return "ImgStitch is running; LayoutBond move skipped."
+        if self.imgmatrix_running:
+            return "ImgMatrix is running; LayoutBond move skipped."
         if self.position_read_pending:
             return "Position read is pending; LayoutBond move skipped."
         return None
@@ -5705,6 +5907,153 @@ class ProbeApp(tk.Tk):
             shutil.rmtree(self.imgstitch_session_dir)
         (self.imgstitch_session_dir / "tiles").mkdir(parents=True, exist_ok=True)
 
+    def _prepare_imgmatrix_session_dir(self) -> Path:
+        root = self.imgmatrix_session_root.resolve()
+        workspace = Path.cwd().resolve()
+        if workspace not in (root, *root.parents):
+            raise RuntimeError(f"Refusing to use ImgMatrix session directory outside workspace: {root}")
+        session_dir = self.imgmatrix_session_root / time.strftime("%Y%m%d_%H%M%S")
+        images_dir = session_dir / "images"
+        suffix = 1
+        while session_dir.exists():
+            session_dir = self.imgmatrix_session_root / f"{time.strftime('%Y%m%d_%H%M%S')}_{suffix:02d}"
+            images_dir = session_dir / "images"
+            suffix += 1
+        images_dir.mkdir(parents=True, exist_ok=False)
+        return session_dir
+
+    def start_imgmatrix(self, settings: ImgMatrixSettings) -> None:
+        if self.imgmatrix_running or self.motion_busy:
+            if self.imgmatrix_panel is not None:
+                self.imgmatrix_panel.set_status("Motion is busy; ImgMatrix skipped.")
+            return
+        if self.gds_stage_mapper_panel is None or self.gds_stage_mapper_panel.mapper is None:
+            if self.imgmatrix_panel is not None:
+                self.imgmatrix_panel.set_status("Bind LayoutMap mapping before running ImgMatrix.")
+            return
+        if not self.serial_client:
+            self.connect_serial()
+        if not self.serial_client:
+            if self.imgmatrix_panel is not None:
+                self.imgmatrix_panel.set_status("Serial is not connected; ImgMatrix skipped.")
+            return
+        with self.camera_lock:
+            frame_available = self.latest_stitch_frame is not None
+        if not frame_available:
+            if self.imgmatrix_panel is not None:
+                self.imgmatrix_panel.set_status("No camera frame available for ImgMatrix.")
+            return
+        try:
+            points = generate_imgmatrix_points(settings, self.gds_stage_mapper_panel.mapper)
+            session_dir = self._prepare_imgmatrix_session_dir()
+        except Exception as exc:
+            if self.imgmatrix_panel is not None:
+                self.imgmatrix_panel.set_status(f"Invalid ImgMatrix settings: {exc}")
+            return
+
+        self.imgmatrix_restore_realtime = self.realtime_enabled
+        if self.realtime_enabled:
+            self.disable_realtime_position()
+        self.imgmatrix_restore_home_signal = self.home_signal_enabled
+        if self.home_signal_enabled:
+            self.disable_home_signal_polling()
+        self.imgmatrix_running = True
+        self.motion_busy = True
+        self.imgmatrix_stop_event.clear()
+        if self.imgmatrix_panel is not None:
+            self.imgmatrix_panel.set_running(True)
+            self.imgmatrix_panel.set_session_path(session_dir)
+            self.imgmatrix_panel.set_status(f"ImgMatrix running: {len(points)} shots.")
+        self.status_var.set(f"ImgMatrix running: {len(points)} shots.")
+        self.imgmatrix_thread = threading.Thread(
+            target=self._imgmatrix_worker,
+            args=(settings, points, session_dir),
+            daemon=True,
+        )
+        self.imgmatrix_thread.start()
+
+    def stop_imgmatrix(self) -> None:
+        self.imgmatrix_stop_event.set()
+        if self.imgmatrix_panel is not None:
+            self.imgmatrix_panel.set_status("Stopping ImgMatrix.")
+
+    def _imgmatrix_worker(self, settings: ImgMatrixSettings, points: tuple[ImgMatrixPoint, ...], session_dir: Path) -> None:
+        assert self.serial_client is not None
+        records: list[dict[str, object]] = []
+        try:
+            import cv2
+
+            entries = self.serial_client.read_stable_xyz_positions()
+            origin_z = self._axis_from_position_entries(entries, Axis.Z)
+            total = len(points)
+            for index, point in enumerate(points, start=1):
+                if self.imgmatrix_stop_event.is_set():
+                    self.result_queue.put(("imgmatrix_status", f"Stopped after {index - 1}/{total} shots."))
+                    break
+                target_x = int(round(point.stage_x_um / self.probe_config.um_per_pulse("X")))
+                target_y = int(round(point.stage_y_um / self.probe_config.um_per_pulse("Y")))
+                target_z = origin_z
+                if self.main_focusmap_plane_var.get():
+                    focus_z = self._focusmap_z_target_at_xy(target_x, target_y)
+                    if focus_z is None:
+                        raise RuntimeError("FocusMap Z is enabled, but no FocusMap plane is stored.")
+                    target_z = focus_z
+                self.result_queue.put(("imgmatrix_progress", index, total, f"Moving to r{point.row} c{point.col}"))
+                moved_entries = self._move_absolute_stage(target_x, target_y, target_z, source="imgmatrix")
+                actual_x = self._axis_from_position_entries(moved_entries, Axis.X)
+                actual_y = self._axis_from_position_entries(moved_entries, Axis.Y)
+                actual_z = self._axis_from_position_entries(moved_entries, Axis.Z)
+                settle_seconds = max(0, self.probe_config.imgstitch_settle_ms) / 1000.0
+                if settle_seconds > 0 and self.imgmatrix_stop_event.wait(settle_seconds):
+                    break
+                image = self._capture_imgmatrix_frame()
+                output_path = session_dir / "images" / point.filename
+                cv2.imwrite(str(output_path), image)
+                record = {
+                    "row": point.row,
+                    "col": point.col,
+                    "order": point.order,
+                    "u": point.u,
+                    "v": point.v,
+                    "stage_x_um": point.stage_x_um,
+                    "stage_y_um": point.stage_y_um,
+                    "stage_x": actual_x,
+                    "stage_y": actual_y,
+                    "stage_z": actual_z,
+                    "image_path": str(output_path),
+                }
+                records.append(record)
+                self._write_imgmatrix_manifest(settings, session_dir, records, completed=False)
+                self.result_queue.put(("imgmatrix_progress", index, total, f"Saved {output_path.name}"))
+            self._write_imgmatrix_manifest(settings, session_dir, records, completed=not self.imgmatrix_stop_event.is_set())
+            if not self.imgmatrix_stop_event.is_set():
+                self.result_queue.put(("imgmatrix_done", session_dir, len(records)))
+        except Exception as exc:
+            self.result_queue.put(("imgmatrix_error", exc))
+        finally:
+            self.result_queue.put(("imgmatrix_finished",))
+
+    def _capture_imgmatrix_frame(self):
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and not self.imgmatrix_stop_event.is_set():
+            with self.camera_lock:
+                frame = self.latest_stitch_frame
+            if frame is not None:
+                return frame.copy()
+            time.sleep(0.03)
+        raise RuntimeError("No camera frame available for ImgMatrix.")
+
+    @staticmethod
+    def _write_imgmatrix_manifest(settings: ImgMatrixSettings, session_dir: Path, records: list[dict[str, object]], *, completed: bool) -> None:
+        payload = {
+            "version": 1,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "completed": completed,
+            "settings": settings.normalized().__dict__,
+            "images": records,
+        }
+        session_manifest_path(session_dir).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
     def _imgstitch_quality_summary(self, edges: list[StitchEdgeQuality]) -> str:
         if not edges:
             return "No seam data"
@@ -6845,7 +7194,14 @@ class ProbeApp(tk.Tk):
         finally:
             self.result_queue.put(("motor_done",))
 
-    def _move_edited_positions_worker(self, axes: tuple[str, ...], modes: dict[str, str], values: dict[str, int], expected_targets: dict[str, int]) -> None:
+    def _move_edited_positions_worker(
+        self,
+        axes: tuple[str, ...],
+        modes: dict[str, str],
+        values: dict[str, int],
+        expected_targets: dict[str, int],
+        source: str = "button",
+    ) -> None:
         assert self.serial_client is not None
         try:
             speed_percent = self._motion_speed_percent()
@@ -6863,10 +7219,10 @@ class ProbeApp(tk.Tk):
                         raise ValueError("Relative move value must be non-zero.")
                     command = self.serial_client.move_relative(axis=controller_axis, reverse=value < 0, pulses=abs(value), speed_percent=speed_percent)
                     action = "relative"
-                self.result_queue.put(("motor_command", axis_name, action, command, "button"))
+                self.result_queue.put(("motor_command", axis_name, action, command, source))
                 wait_pulses = abs(value) if modes[axis_name] == "Relative" else abs(value - self.current_position_values[axis_name])
                 reached = self.serial_client.wait_axis_reached(controller_axis, timeout=self._axis_move_timeout(wait_pulses, speed_percent))
-                self.result_queue.put(("axis_done", axis_name, reached, "button"))
+                self.result_queue.put(("axis_done", axis_name, reached, source))
             else:
                 axis_params: dict[Axis, tuple[bool, int, int, int]] = {}
                 for axis_name in axes:
@@ -6881,12 +7237,12 @@ class ProbeApp(tk.Tk):
                 if not any(params[1] for params in axis_params.values()):
                     raise ValueError("CC move requires at least one non-zero relative delta.")
                 command, completed = self.serial_client.move_multi_axis_relative_and_wait(axis_params, timeout=self._cc_move_timeout(axis_params))
-                self.result_queue.put(("motor_command", "XYZ", "cc relative", command, "button"))
-                self.result_queue.put(("cc_done", completed, "button"))
+                self.result_queue.put(("motor_command", "XYZ", "cc relative", command, source))
+                self.result_queue.put(("cc_done", completed, source))
 
             self.result_queue.put(("moving",))
             entries = self.serial_client.read_xyz_positions()
-            self.result_queue.put(("read_positions", entries, "button", expected_targets))
+            self.result_queue.put(("read_positions", entries, source, expected_targets))
         except Exception as exc:
             self.result_queue.put(("motor_error", "MOVE", exc))
         finally:
@@ -7090,9 +7446,15 @@ class ProbeApp(tk.Tk):
             elif source == "imgstitch":
                 self.imgstitch_status_var.set("Stage moved")
                 self._set_agent_status("ImgStitch stage moved.")
+            elif source == "imgmatrix":
+                if self.imgmatrix_panel is not None:
+                    self.imgmatrix_panel.set_status("ImgMatrix stage moved.")
             elif source == "gds_mapper":
                 self._set_gds_mapper_status("LayoutBond move completed.")
                 self._set_agent_status("LayoutBond move completed.")
+            elif source == "agent_stage":
+                self.status_var.set("Agent stage move completed.")
+                self._set_agent_status("Agent stage move completed.")
             elif source == "zero_z":
                 self.autofocus_status_var.set("Z set to 0")
                 self.status_var.set("Z position set to 0.")
@@ -7517,6 +7879,54 @@ class ProbeApp(tk.Tk):
             self._set_agent_status(self.imgstitch_status_var.get())
             return
 
+        if event_type == "imgmatrix_status":
+            _, message = event
+            if self.imgmatrix_panel is not None:
+                self.imgmatrix_panel.set_status(str(message))
+            self.status_var.set(str(message))
+            logger.info("ImgMatrix: %s", message)
+            return
+
+        if event_type == "imgmatrix_progress":
+            _, current, total, message = event
+            if self.imgmatrix_panel is not None:
+                self.imgmatrix_panel.set_progress(int(current), int(total), str(message))
+            self.status_var.set(str(message))
+            logger.info("ImgMatrix: %s (%s/%s)", message, current, total)
+            return
+
+        if event_type == "imgmatrix_done":
+            _, session_dir, count = event
+            message = f"ImgMatrix saved {count} image(s): {session_dir}"
+            if self.imgmatrix_panel is not None:
+                self.imgmatrix_panel.set_status(message)
+                self.imgmatrix_panel.set_session_path(session_dir)
+            self.status_var.set(message)
+            logger.info(message)
+            return
+
+        if event_type == "imgmatrix_error":
+            _, exc = event
+            message = f"ImgMatrix failed: {exc}"
+            if self.imgmatrix_panel is not None:
+                self.imgmatrix_panel.set_status(message)
+            self.status_var.set(message)
+            logger.error("ImgMatrix failed: %s", exc)
+            return
+
+        if event_type == "imgmatrix_finished":
+            self.imgmatrix_running = False
+            self.motion_busy = False
+            if self.imgmatrix_panel is not None:
+                self.imgmatrix_panel.set_running(False)
+            if self.imgmatrix_restore_realtime and not self.realtime_enabled and self.serial_client:
+                self.imgmatrix_restore_realtime = False
+                self.toggle_realtime_position()
+            if self.imgmatrix_restore_home_signal and not self.home_signal_enabled and self.serial_client:
+                self.imgmatrix_restore_home_signal = False
+                self.toggle_home_signal_polling()
+            return
+
         if event_type == "motor_command":
             _, axis, action, command, source = event
             command_hex = hex_bytes(command)
@@ -7696,6 +8106,7 @@ class ProbeApp(tk.Tk):
         self.autofocus_stop_event.set()
         self.af_plane_stop_event.set()
         self.imgstitch_stop_event.set()
+        self.imgmatrix_stop_event.set()
         self.realtime_stop_event.set()
         self.home_signal_stop_event.set()
         if self.realtime_enabled and self.serial_client:
