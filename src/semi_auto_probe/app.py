@@ -22,6 +22,15 @@ from .af_plane import (
     get_focus_z_at_xy,
     set_sample_plane_model,
 )
+from .agent import (
+    AGENT_ACTION_AUTOFOCUS,
+    AGENT_ACTION_IMAGE_CAPTURE,
+    AGENT_ACTION_LAYOUT_OVERLAY,
+    AGENT_ACTION_MOVE_GDS,
+    AgentContext,
+    AgentPlan,
+    build_agent_planner_from_config,
+)
 from .camera import UsbCamera
 from .config import (
     AUTOFOCUS_PEAK_MODEL_GAUSSIAN,
@@ -30,6 +39,9 @@ from .config import (
     AUTOFOCUS_PEAK_MODELS,
     AUTOFOCUS_PEAK_MODEL_PARABOLIC,
     AUTOFOCUS_PEAK_MODEL_PSEUDO_VOIGT,
+    DEFAULT_AGENT_BASE_URL,
+    DEFAULT_AGENT_MODEL,
+    DEFAULT_AGENT_TIMEOUT_SECONDS,
     DEFAULT_CONFIG_FILENAME,
     EYEPIECE_OPTIONS,
     JOG_STEP_AXES,
@@ -68,6 +80,7 @@ from .monitor_feed import publish_camera_frame, request_web_fallback_camera_rele
 from .protocol import COMM_TEST_COMMAND, FUNCTION_READ_POSITION, RESPONSE_HEAD, Axis, AxisPosition, IoStatus, hex_bytes, parse_axis_position_response
 from .serial_client import ControllerSerialClient, CommunicationTestResult, list_serial_ports
 from .ui.calibration_dialog import PixelCalibrationDialog
+from .ui.agent_panel import AgentPanel
 from .ui.vision import VisionPanel
 
 
@@ -163,6 +176,9 @@ class ProbeApp(tk.Tk):
         self.camera_image: tk.PhotoImage | None = None
         self.vision_panel: VisionPanel | None = None
         self.gds_stage_mapper_panel: GDSStageMapperPanel | None = None
+        self.agent_panel: AgentPanel | None = None
+        self.agent_function_spec_path = Path.cwd() / "docs" / "agent-function-spec.md"
+        self.agent_planner = None
         self.latest_camera_frame = None
         self.camera_lock = threading.Lock()
         self.focus_lock = threading.Lock()
@@ -194,6 +210,7 @@ class ProbeApp(tk.Tk):
         except Exception as exc:
             self.probe_config = ProbeConfig()
             logger.error("Failed to load probe config from %s: %s", self.config_path, exc)
+        self.agent_planner = self._build_agent_planner()
 
         self.port_var = tk.StringVar(value=DEFAULT_SERIAL_PORT)
         self.camera_index_var = tk.StringVar(value="0")
@@ -374,6 +391,10 @@ class ProbeApp(tk.Tk):
         self.calibration_status_var = tk.StringVar(value="")
         self.motor_conversion_var = tk.StringVar(value="")
         self.config_status_var = tk.StringVar(value=f"Config: {self.config_path.name}")
+        self.agent_api_key_var = tk.StringVar(value=self.probe_config.agent_api_key)
+        self.agent_base_url_var = tk.StringVar(value=self.probe_config.agent_base_url)
+        self.agent_model_var = tk.StringVar(value=self.probe_config.agent_model)
+        self.agent_timeout_var = tk.StringVar(value=f"{self.probe_config.agent_timeout_seconds:g}")
 
         self._configure_theme()
         self._build_ui()
@@ -681,8 +702,8 @@ class ProbeApp(tk.Tk):
         self.tab_buttons: dict[str, tk.Label] = {}
         tab_bar = ttk.Frame(content, style="App.TFrame")
         tab_bar.grid(row=0, column=0, sticky="w")
-        for col, name in enumerate(("Main", "Communication", "AutoFocus", "FocusMap", "ImgStitch", "GDS Stage Mapper", "Config")):
-            tab_bar.columnconfigure(col, weight=1, uniform="top_tabs", minsize=140)
+        for col, name in enumerate(("Main", "Communication", "AutoFocus", "FocusMap", "ImgStitch", "LayoutBond", "AI Agent", "Config")):
+            tab_bar.columnconfigure(col, weight=1, uniform="top_tabs", minsize=125)
             label = tk.Label(
                 tab_bar,
                 text=name,
@@ -713,6 +734,7 @@ class ProbeApp(tk.Tk):
         af_plane_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         imgstitch_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         gds_stage_mapper_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
+        agent_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         config_page = ttk.Frame(page_container, style="App.TFrame", padding=(0, 10, 0, 0))
         self.pages = {
             "Main": main_page,
@@ -720,7 +742,8 @@ class ProbeApp(tk.Tk):
             "AutoFocus": autofocus_page,
             "FocusMap": af_plane_page,
             "ImgStitch": imgstitch_page,
-            "GDS Stage Mapper": gds_stage_mapper_page,
+            "LayoutBond": gds_stage_mapper_page,
+            "AI Agent": agent_page,
             "Config": config_page,
         }
         for page in self.pages.values():
@@ -732,6 +755,7 @@ class ProbeApp(tk.Tk):
         self._build_af_plane_page(af_plane_page)
         self._build_imgstitch_page(imgstitch_page)
         self._build_gds_stage_mapper_page(gds_stage_mapper_page)
+        self._build_agent_page(agent_page)
         self._build_config_page(config_page)
         self._update_config_display()
         self._warm_page_layouts()
@@ -778,8 +802,10 @@ class ProbeApp(tk.Tk):
             self.vision_panel.draw_overlay()
         elif name == "FocusMap":
             self._draw_focusmap_all()
-        elif name == "GDS Stage Mapper" and self.gds_stage_mapper_panel is not None:
+        elif name == "LayoutBond" and self.gds_stage_mapper_panel is not None:
             self.gds_stage_mapper_panel.viewer.redraw()
+        elif name == "AI Agent" and self.agent_panel is not None:
+            self.agent_panel.refresh_context()
 
     def _build_main_page(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -837,6 +863,207 @@ class ProbeApp(tk.Tk):
             move_to_stage_um=self.move_gds_mapper_target,
             set_status=self.status_var.set,
         )
+
+    def _build_agent_planner(self):
+        return build_agent_planner_from_config(
+            api_key=self.probe_config.agent_api_key,
+            model=self.probe_config.agent_model,
+            base_url=self.probe_config.agent_base_url,
+            timeout_seconds=self.probe_config.agent_timeout_seconds,
+            spec_path=self.agent_function_spec_path,
+        )
+
+    def _build_agent_page(self, parent: ttk.Frame) -> None:
+        self.agent_panel = AgentPanel(
+            parent,
+            self.colors,
+            get_context=self.agent_context,
+            get_microscope_preview=self.agent_microscope_preview,
+            plan_instruction=self.plan_agent_instruction,
+            execute_plan=self.execute_agent_plan,
+            cancel_plan=self.cancel_agent_plan,
+            stop_task=self.stop_agent_task,
+        )
+
+    def agent_context(self) -> AgentContext:
+        gds_target_stage_um: tuple[float, float] | None = None
+        gds_selected_uv: tuple[float, float] | None = None
+        current_mapped_gds_uv: tuple[float, float] | None = None
+        gds_mapping_ready = False
+        gds_target_selected = False
+        stage_position_um = {
+            "X": self.current_position_values["X"] * self.probe_config.um_per_pulse("X"),
+            "Y": self.current_position_values["Y"] * self.probe_config.um_per_pulse("Y"),
+            "Z": self.current_position_values["Z"] * self.probe_config.um_per_pulse("Z"),
+        }
+        if self.gds_stage_mapper_panel is not None:
+            gds_selected_uv = self.gds_stage_mapper_panel.selected_target_gds
+            gds_target_stage_um = self.gds_stage_mapper_panel.selected_target_stage_um
+            gds_mapping_ready = self.gds_stage_mapper_panel.mapper is not None
+            gds_target_selected = gds_selected_uv is not None
+            if self.gds_stage_mapper_panel.mapper is not None:
+                try:
+                    current_mapped_gds_uv = self.gds_stage_mapper_panel.mapper.stage_to_gds(stage_position_um["X"], stage_position_um["Y"])
+                except Exception:
+                    current_mapped_gds_uv = None
+
+        last_stitch = self._latest_stitch_image_path()
+        return AgentContext(
+            positions=dict(self.current_position_values),
+            serial_connected=bool(self.serial_client and self.serial_client.is_open),
+            motion_busy=self.motion_busy,
+            keyboard_motion_busy=self.keyboard_motion_busy,
+            position_read_pending=self.position_read_pending,
+            camera_running=self.camera_running,
+            camera_frame_available=self.latest_camera_frame is not None,
+            autofocus_running=self.autofocus_running,
+            focusmap_running=self.af_plane_running,
+            imgstitch_running=self.imgstitch_running,
+            gds_target_selected=gds_target_selected,
+            gds_mapping_ready=gds_mapping_ready,
+            stage_position_um=stage_position_um,
+            gds_selected_uv=gds_selected_uv,
+            current_mapped_gds_uv=current_mapped_gds_uv,
+            gds_target_stage_um=gds_target_stage_um,
+            last_stitch_path=str(last_stitch) if last_stitch is not None else None,
+            current_page=self.current_page,
+            config_summary={
+                "Objective": f"{self.probe_config.objective:g}x",
+                "Eyepiece": f"{self.probe_config.eyepiece:g}x",
+                "XY um/pulse": f"{self.probe_config.um_per_pulse('X'):.6g}",
+                "Z um/pulse": f"{self.probe_config.um_per_pulse('Z'):.6g}",
+            },
+        )
+
+    def _latest_stitch_image_path(self) -> Path | None:
+        candidates = (
+            Path.cwd() / "last_imgstitch.png",
+            self.imgstitch_session_dir / "last_imgstitch.png",
+            self.imgstitch_session_dir / "stack_result.png",
+        )
+        for path in candidates:
+            if path.exists():
+                return path
+        return None
+
+    def agent_microscope_preview(self) -> bytes | None:
+        with self.camera_lock:
+            frame = None if self.latest_stitch_frame is None else self.latest_stitch_frame.copy()
+        if frame is None:
+            return None
+        try:
+            import cv2
+
+            height, width = frame.shape[:2]
+            scale = min(520 / max(width, 1), 292 / max(height, 1), 1.0)
+            if scale < 1.0:
+                frame = cv2.resize(frame, (int(width * scale), int(height * scale)), interpolation=cv2.INTER_AREA)
+            height, width = frame.shape[:2]
+            center_x = width // 2
+            center_y = height // 2
+            cv2.line(frame, (center_x - 18, center_y), (center_x + 18, center_y), (45, 212, 191), 1, cv2.LINE_AA)
+            cv2.line(frame, (center_x, center_y - 18), (center_x, center_y + 18), (45, 212, 191), 1, cv2.LINE_AA)
+            cv2.rectangle(frame, (8, 8), (width - 9, height - 9), (51, 65, 85), 1)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            return f"P6 {width} {height} 255\n".encode("ascii") + rgb.tobytes()
+        except Exception:
+            return None
+
+    def plan_agent_instruction(self, instruction: str) -> AgentPlan:
+        plan = self.agent_planner.plan(instruction, self.agent_context())
+        self.status_var.set(f"Agent plan: {plan.title}")
+        return plan
+
+    def cancel_agent_plan(self) -> str:
+        self.status_var.set("Agent plan cancelled.")
+        return "Pending Agent plan cancelled."
+
+    def stop_agent_task(self) -> str:
+        stopped: list[str] = []
+        if self.imgstitch_running:
+            self.stop_imgstitch()
+            stopped.append("ImgStitch")
+        if self.autofocus_running:
+            self.stop_autofocus()
+            stopped.append("AutoFocus")
+        if self.af_plane_running:
+            self.stop_af_plane_mapping()
+            stopped.append("FocusMap")
+        if stopped:
+            message = f"Agent stop requested for {', '.join(stopped)}."
+        else:
+            message = "No Agent-controlled workflow is currently running."
+        self.status_var.set(message)
+        return message
+
+    def execute_agent_plan(self, plan: AgentPlan) -> str:
+        blockers = self._agent_execution_blockers(plan.action)
+        if blockers:
+            message = "Agent plan blocked: " + "; ".join(blockers)
+            self.status_var.set(message)
+            return message
+
+        context = self.agent_context()
+        if plan.action == AGENT_ACTION_MOVE_GDS:
+            assert context.gds_target_stage_um is not None
+            self.move_gds_mapper_target(*context.gds_target_stage_um)
+            return "Agent started LayoutBond move to selected GDS target."
+        if plan.action == AGENT_ACTION_AUTOFOCUS:
+            self.start_autofocus()
+            return "Agent started AutoFocus at the current position."
+        if plan.action == AGENT_ACTION_IMAGE_CAPTURE:
+            self.start_imgstitch()
+            return "Agent started the current image acquisition sequence."
+        if plan.action == AGENT_ACTION_LAYOUT_OVERLAY:
+            last_stitch = context.last_stitch_path or "-"
+            message = f"Latest image associated with LayoutBond context: {last_stitch}"
+            self._set_gds_mapper_status(message)
+            self.show_page("LayoutBond")
+            return message
+
+        message = "Agent plan is not executable."
+        self.status_var.set(message)
+        return message
+
+    def _agent_execution_blockers(self, action: str) -> list[str]:
+        context = self.agent_context()
+        blockers: list[str] = []
+        motion_workflow_running = context.motion_busy or context.keyboard_motion_busy or context.position_read_pending
+        other_workflow_running = context.autofocus_running or context.focusmap_running or context.imgstitch_running
+        if action in {AGENT_ACTION_MOVE_GDS, AGENT_ACTION_AUTOFOCUS, AGENT_ACTION_IMAGE_CAPTURE}:
+            if motion_workflow_running:
+                blockers.append("motion is busy")
+            if context.autofocus_running:
+                blockers.append("AutoFocus is already running")
+            if context.focusmap_running:
+                blockers.append("FocusMap is already running")
+            if context.imgstitch_running:
+                blockers.append("ImgStitch is already running")
+            if not context.serial_connected:
+                blockers.append("serial port is not connected")
+        elif action == AGENT_ACTION_LAYOUT_OVERLAY:
+            if motion_workflow_running or other_workflow_running:
+                blockers.append("another workflow is running")
+
+        if action == AGENT_ACTION_MOVE_GDS:
+            if not context.gds_target_selected or context.gds_target_stage_um is None:
+                blockers.append("no GDS target is selected")
+            if not context.gds_mapping_ready:
+                blockers.append("GDS binding is not ready")
+        elif action == AGENT_ACTION_AUTOFOCUS:
+            if not context.camera_running or not context.camera_frame_available:
+                blockers.append("camera frame is not available")
+        elif action == AGENT_ACTION_IMAGE_CAPTURE:
+            if not context.camera_running or not context.camera_frame_available:
+                blockers.append("camera frame is not available")
+        elif action == AGENT_ACTION_LAYOUT_OVERLAY:
+            if not context.gds_mapping_ready:
+                blockers.append("GDS binding is not ready")
+            if not context.last_stitch_path:
+                blockers.append("no recent stitched image is available")
+        else:
+            blockers.append("unsupported Agent action")
+        return blockers
 
     def _set_initial_main_pane(self) -> None:
         try:
@@ -994,15 +1221,15 @@ class ProbeApp(tk.Tk):
 
     def _gds_mapper_motion_blocker(self) -> str | None:
         if self.motion_busy or self.keyboard_motion_busy:
-            return "Motion is busy; GDS mapper move skipped."
+            return "Motion is busy; LayoutBond move skipped."
         if self.autofocus_running:
-            return "AutoFocus is running; GDS mapper move skipped."
+            return "AutoFocus is running; LayoutBond move skipped."
         if self.af_plane_running:
-            return "FocusMap is running; GDS mapper move skipped."
+            return "FocusMap is running; LayoutBond move skipped."
         if self.imgstitch_running:
-            return "ImgStitch is running; GDS mapper move skipped."
+            return "ImgStitch is running; LayoutBond move skipped."
         if self.position_read_pending:
-            return "Position read is pending; GDS mapper move skipped."
+            return "Position read is pending; LayoutBond move skipped."
         return None
 
     def _set_gds_mapper_status(self, message: str) -> None:
@@ -1020,7 +1247,7 @@ class ProbeApp(tk.Tk):
         if not self.serial_client:
             self.connect_serial()
         if not self.serial_client:
-            self._set_gds_mapper_status("Serial is not connected; GDS mapper move skipped.")
+            self._set_gds_mapper_status("Serial is not connected; LayoutBond move skipped.")
             return
 
         try:
@@ -1032,8 +1259,8 @@ class ProbeApp(tk.Tk):
                 self.probe_config.um_per_pulse("Y"),
             )
         except ValueError as exc:
-            self._set_gds_mapper_status(f"GDS mapper target invalid: {exc}")
-            logger.warning("GDS mapper target rejected: %s", exc)
+            self._set_gds_mapper_status(f"LayoutBond target invalid: {exc}")
+            logger.warning("LayoutBond target rejected: %s", exc)
             return
 
         if not plan.has_motion:
@@ -1044,7 +1271,7 @@ class ProbeApp(tk.Tk):
         self.clear_position_edits()
         self._show_target_positions(plan.target_pulses)
         self._set_gds_mapper_status(
-            f"GDS mapper moving to X {target_x_um:.6g} um, Y {target_y_um:.6g} um."
+            f"LayoutBond moving to X {target_x_um:.6g} um, Y {target_y_um:.6g} um."
         )
         threading.Thread(target=self._gds_mapper_move_worker, args=(target_x_um, target_y_um), daemon=True).start()
 
@@ -1077,7 +1304,7 @@ class ProbeApp(tk.Tk):
                 Axis.Y: self._cc_axis_param(plan.deltas["Y"] < 0, abs(plan.deltas["Y"])),
             }
             command, completed = self.serial_client.move_multi_axis_relative_and_wait(axis_params, timeout=self._cc_move_timeout(axis_params))
-            self.result_queue.put(("motor_command", "XY", "cc GDS mapper", command, "gds_mapper"))
+            self.result_queue.put(("motor_command", "XY", "cc LayoutBond", command, "gds_mapper"))
             self.result_queue.put(("cc_done", completed, "gds_mapper"))
             self.result_queue.put(("moving",))
             updated_entries = self.serial_client.read_xyz_positions()
@@ -1841,6 +2068,35 @@ class ProbeApp(tk.Tk):
             ttk.Label(main_control_panel, text=f"Alt+{axis} levels", style="Muted.TLabel").grid(row=row_index, column=0, sticky="w", pady=2)
             self._jog_step_levels_entry(main_control_panel, self.jog_step_level_vars[axis]).grid(row=row_index, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
 
+        agent_config_panel = ttk.Frame(optical_panel, style="Panel.TFrame")
+        agent_config_panel.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(24, 0))
+        agent_config_panel.columnconfigure(1, weight=1)
+        ttk.Label(agent_config_panel, text="AI AGENT API", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        ttk.Label(agent_config_panel, text="Provider", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Label(agent_config_panel, text="DeepSeek / OpenAI-compatible", style="Value.TLabel", padding=(8, 4)).grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=2)
+        ttk.Label(agent_config_panel, text="API key", style="Muted.TLabel").grid(row=2, column=0, sticky="w", pady=2)
+        tk.Entry(
+            agent_config_panel,
+            textvariable=self.agent_api_key_var,
+            show="*",
+            **self._numeric_widget_options(),
+        ).grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+        ttk.Label(agent_config_panel, text="Base URL", style="Muted.TLabel").grid(row=3, column=0, sticky="w", pady=2)
+        tk.Entry(
+            agent_config_panel,
+            textvariable=self.agent_base_url_var,
+            **self._numeric_widget_options(),
+        ).grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+        ttk.Label(agent_config_panel, text="Model", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=2)
+        tk.Entry(
+            agent_config_panel,
+            textvariable=self.agent_model_var,
+            **self._numeric_widget_options(),
+        ).grid(row=4, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+        ttk.Label(agent_config_panel, text="Timeout (s)", style="Muted.TLabel").grid(row=5, column=0, sticky="w", pady=2)
+        self._numeric_entry(agent_config_panel, self.agent_timeout_var, kind="float", minimum=1, maximum=300).grid(row=5, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+        ttk.Button(agent_config_panel, text="Save Agent API", style="Accent.TButton", command=self.apply_config).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+
         motor_panel = ttk.Frame(parent, style="Panel.TFrame", padding=16)
         motor_panel.grid(row=0, column=1, sticky="nsew")
         motor_panel.columnconfigure(0, weight=1)
@@ -2341,6 +2597,10 @@ class ProbeApp(tk.Tk):
                     for metric in ("Laplacian", "Tenengrad", "Brenner")
                 },
                 calibrations=dict(self.probe_config.calibrations),
+                agent_api_key=self.agent_api_key_var.get(),
+                agent_base_url=self.agent_base_url_var.get() or DEFAULT_AGENT_BASE_URL,
+                agent_model=self.agent_model_var.get() or DEFAULT_AGENT_MODEL,
+                agent_timeout_seconds=float(self.agent_timeout_var.get() or DEFAULT_AGENT_TIMEOUT_SECONDS),
             )
             updated.validate()
         except ValueError as exc:
@@ -2351,6 +2611,7 @@ class ProbeApp(tk.Tk):
         self.probe_config = updated
         derive_missing_calibrations(self.probe_config)
         self._sync_config_vars_from_config()
+        self.agent_planner = self._build_agent_planner()
         self._update_config_display()
         self._refresh_keyboard_bindings()
         if save:
@@ -2388,6 +2649,10 @@ class ProbeApp(tk.Tk):
         for metric in ("Laplacian", "Tenengrad", "Brenner"):
             self.focus_threshold_yellow_vars[metric].set(f"{self.probe_config.focus_threshold_yellow[metric]:g}")
             self.focus_threshold_green_vars[metric].set(f"{self.probe_config.focus_threshold_green[metric]:g}")
+        self.agent_api_key_var.set(self.probe_config.agent_api_key)
+        self.agent_base_url_var.set(self.probe_config.agent_base_url)
+        self.agent_model_var.set(self.probe_config.agent_model)
+        self.agent_timeout_var.set(f"{self.probe_config.agent_timeout_seconds:g}")
 
     @staticmethod
     def _autofocus_peak_model_label(model: str) -> str:
@@ -6301,6 +6566,11 @@ class ProbeApp(tk.Tk):
         next_interval = 1 if not self.result_queue.empty() else RESULT_POLL_INTERVAL_MS
         self.after(next_interval, self._poll_result_queue)
 
+    def _set_agent_status(self, message: str) -> None:
+        agent_panel = self.__dict__.get("agent_panel")
+        if agent_panel is not None:
+            agent_panel.set_status(message)
+
     def _handle_worker_event(self, event: tuple) -> None:
         event_type = event[0]
         if event_type == "read_positions":
@@ -6330,8 +6600,10 @@ class ProbeApp(tk.Tk):
                 self.status_var.set("FocusMap Z position checked.")
             elif source == "imgstitch":
                 self.imgstitch_status_var.set("Stage moved")
+                self._set_agent_status("ImgStitch stage moved.")
             elif source == "gds_mapper":
-                self._set_gds_mapper_status("GDS Stage Mapper move completed.")
+                self._set_gds_mapper_status("LayoutBond move completed.")
+                self._set_agent_status("LayoutBond move completed.")
             elif source == "zero_z":
                 self.autofocus_status_var.set("Z set to 0")
                 self.status_var.set("Z position set to 0.")
@@ -6433,7 +6705,8 @@ class ProbeApp(tk.Tk):
         if event_type == "gds_mapper_status":
             _, message = event
             self._set_gds_mapper_status(str(message))
-            logger.info("GDS Stage Mapper: %s", message)
+            self._set_agent_status(str(message))
+            logger.info("LayoutBond: %s", message)
             return
 
         if event_type == "schedule_position_read":
@@ -6504,6 +6777,7 @@ class ProbeApp(tk.Tk):
             _, message = event
             self.af_plane_status_var.set(str(message))
             self.status_var.set(str(message))
+            self._set_agent_status(str(message))
             logger.info("FocusMap: %s", message)
             return
 
@@ -6589,6 +6863,7 @@ class ProbeApp(tk.Tk):
             _, message = event
             self.autofocus_status_var.set(str(message))
             self.status_var.set(str(message))
+            self._set_agent_status(str(message))
             logger.info("AutoFocus: %s", message)
             return
 
@@ -6612,6 +6887,7 @@ class ProbeApp(tk.Tk):
             _, exc = event
             self.autofocus_status_var.set(f"Failed: {exc}")
             self.status_var.set(f"AutoFocus failed: {exc}")
+            self._set_agent_status(f"AutoFocus failed: {exc}")
             logger.error("AutoFocus failed: %s", exc)
             return
 
@@ -6628,6 +6904,7 @@ class ProbeApp(tk.Tk):
             if self.autofocus_restore_home_signal and not self.home_signal_enabled and self.serial_client:
                 self.autofocus_restore_home_signal = False
                 self.toggle_home_signal_polling()
+            self._set_agent_status(self.autofocus_status_var.get())
             logger.info("AutoFocus stopped.")
             return
 
@@ -6635,6 +6912,7 @@ class ProbeApp(tk.Tk):
             _, message = event
             self.imgstitch_status_var.set(str(message))
             self.status_var.set(str(message))
+            self._set_agent_status(str(message))
             logger.info("ImgStitch: %s", message)
             return
 
@@ -6677,6 +6955,7 @@ class ProbeApp(tk.Tk):
             _, output_path = event
             self.imgstitch_status_var.set(f"Saved {output_path.name}")
             self.status_var.set(f"ImgStitch saved: {output_path}")
+            self._set_agent_status(f"ImgStitch saved: {output_path}")
             logger.info("ImgStitch saved to %s.", output_path)
             return
 
@@ -6684,6 +6963,7 @@ class ProbeApp(tk.Tk):
             _, exc = event
             self.imgstitch_status_var.set(f"Failed: {exc}")
             self.status_var.set(f"ImgStitch failed: {exc}")
+            self._set_agent_status(f"ImgStitch failed: {exc}")
             logger.error("ImgStitch failed: %s", exc)
             return
 
@@ -6699,6 +6979,7 @@ class ProbeApp(tk.Tk):
             if self.imgstitch_restore_home_signal and not self.home_signal_enabled and self.serial_client:
                 self.imgstitch_restore_home_signal = False
                 self.toggle_home_signal_polling()
+            self._set_agent_status(self.imgstitch_status_var.get())
             return
 
         if event_type == "motor_command":
@@ -6751,8 +7032,9 @@ class ProbeApp(tk.Tk):
                 self.main_focusmap_plane_var.set(False)
                 self.clear_position_edits()
             if axis == "GDS_MAPPER":
-                self._set_gds_mapper_status(f"GDS Stage Mapper move failed: {exc}")
-                logger.error("GDS Stage Mapper move failed: %s", exc)
+                self._set_gds_mapper_status(f"LayoutBond move failed: {exc}")
+                self._set_agent_status(f"LayoutBond move failed: {exc}")
+                logger.error("LayoutBond move failed: %s", exc)
                 return
             self.status_var.set(f"{axis} motor command failed: {exc}")
             logger.error("%s motor command failed: %s", axis, exc)

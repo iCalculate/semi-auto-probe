@@ -134,7 +134,7 @@ The software is a Python desktop application for operating the semi-automatic st
 | `Main` | Live vision, visual measurement, image-point centering, position readout, jog controls, home-signal polling, zeroing |
 | `Communication` | Raw command entry, communication-test frame loading, last TX/RX display, hex history |
 | `AutoFocus` | Z autofocus, focus metric selection, score plots, manual Z jog, Z zeroing |
-| `GDS Stage Mapper` | Read-only GDS viewer, layer toggles, GDS/stage calibration, current FOV overlay, selected-target movement |
+| `LayoutBond` | Read-only GDS viewer, layer toggles, GDS/stage calibration, current FOV overlay, selected-target movement |
 | `ImgStitch` | Serpentine mosaic capture, overlap settings, stitch preview, optional four-corner plane AF |
 | `Config` | Objective/eyepiece selection, pixel calibration, motor mapping, conversion display |
 
@@ -165,7 +165,7 @@ The software is a Python desktop application for operating the semi-automatic st
 - Python `>=3.10`
 - Recommended dependency manager: `uv`
 - Python packages are declared in `pyproject.toml` and mirrored in `requirements.txt` for pip-based installs.
-- GDS layout loading requires `gdstk`. If it is missing, the application still starts, but the `GDS Stage Mapper` page will ask you to install it.
+- GDS layout loading requires `gdstk`. If it is missing, the application still starts, but the `LayoutBond` page will ask you to install it.
 
 ### Installation
 
@@ -219,6 +219,14 @@ uv run python -m semi_auto_probe.cli test --port COM3
 - Double-click a coordinate cell to enter an absolute target
 - `Move`, `Read`, `Continue`, jog controls, home-signal polling, zeroing, and emergency stop are all available from the main motion panel
 - Vision tools include `Center +`, `Point-Point`, `Point-Line`, `Polygon Area`, and `Move Center`
+
+### LayoutBond
+
+- Load read-only `.gds` files, display the selected top cell, toggle layers, zoom, pan, and fit the layout to view
+- Cursor coordinates are snapped to a selectable GDS grid: `100 nm`, `1 um`, `5 um`, or `10 um`
+- Calibration points `P1` to `P4` can be typed manually, set from the current stage position, or picked from the layout
+- Click `Set GDS` to enter pick mode; the active button turns amber, then double-click a snapped layout point to fill the GDS coordinate and restore the button color
+- After fitting the affine mapping, LayoutBond previews selected GDS targets in stage micrometers and moves only after `Move to Selected Target`
 
 ### AutoFocus
 

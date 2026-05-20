@@ -16,7 +16,10 @@ import numpy as np
 
 
 GDS_MISSING_MESSAGE = "gdstk is required for GDS loading. Please install it with: pip install gdstk"
-DEFAULT_MAX_GDS_SHAPES = 50000
+DEFAULT_MAX_GDS_SHAPES: int | None = None
+LARGE_GDS_WARNING_SHAPES = 50000
+LAYER_TOGGLE_COLUMNS = 5
+GDS_VIEW_MARGIN_PX = 40
 
 
 @dataclass(frozen=True)
@@ -82,6 +85,76 @@ def stage_move_plan_from_um(
         for axis in ("X", "Y")
     }
     return StageMovePlan(target_pulses=target_pulses, deltas=deltas)
+
+
+def snap_gds_point(point: tuple[float, float], grid_um: float) -> tuple[float, float]:
+    if grid_um <= 0:
+        return point
+    u, v = point
+    return round(u / grid_um) * grid_um, round(v / grid_um) * grid_um
+
+
+def layer_grid_position(index: int, columns: int = LAYER_TOGGLE_COLUMNS) -> tuple[int, int]:
+    if columns <= 0:
+        raise ValueError("Layer toggle column count must be positive.")
+    if index < 0:
+        raise ValueError("Layer toggle index must be non-negative.")
+    return index // columns, index % columns
+
+
+def shape_visible_in_view(shape: "GDSShape", transform: "CanvasTransform", width: int, height: int, *, margin: int = GDS_VIEW_MARGIN_PX) -> bool:
+    min_u, min_v, max_u, max_v = shape.bbox
+    x1, y1 = transform.gds_to_canvas(min_u, max_v)
+    x2, y2 = transform.gds_to_canvas(max_u, min_v)
+    left, right = sorted((x1, x2))
+    top, bottom = sorted((y1, y2))
+    return right >= -margin and left <= width + margin and bottom >= -margin and top <= height + margin
+
+
+def render_gds_preview_ppm(
+    model: "GDSLayoutModel",
+    transform: "CanvasTransform",
+    width: int,
+    height: int,
+    layer_visibility: dict[tuple[int, int], bool],
+    layer_colors: dict[tuple[int, int], str],
+) -> tuple[bytes, int] | None:
+    """Rasterize visible GDS geometry into a PPM image for fast Tk display."""
+    try:
+        import cv2  # type: ignore[import-not-found]
+    except Exception:
+        return None
+
+    width = max(int(width), 1)
+    height = max(int(height), 1)
+    image = np.zeros((height, width, 3), dtype=np.uint8)
+    image[:, :] = _hex_to_rgb("#05070a")
+    rendered = 0
+    scale = float(transform.scale)
+    offset_x = float(transform.offset_x)
+    offset_y = float(transform.offset_y)
+
+    for shape in model.shapes:
+        if not layer_visibility.get(shape.layer_key, False):
+            continue
+        if not shape_visible_in_view(shape, transform, width, height):
+            continue
+        points = np.asarray(shape.points, dtype=float)
+        if points.shape[0] < 3:
+            continue
+        coords = np.empty((points.shape[0], 2), dtype=np.int32)
+        coords[:, 0] = np.rint(offset_x + points[:, 0] * scale).astype(np.int32)
+        coords[:, 1] = np.rint(offset_y - points[:, 1] * scale).astype(np.int32)
+        color = _hex_to_rgb(layer_colors.get(shape.layer_key, "#60a5fa"))
+        try:
+            cv2.fillPoly(image, [coords], color=color, lineType=cv2.LINE_8)
+            cv2.polylines(image, [coords], isClosed=True, color=color, thickness=1, lineType=cv2.LINE_8)
+        except Exception:
+            continue
+        rendered += 1
+
+    header = f"P6 {width} {height} 255\n".encode("ascii")
+    return header + image.tobytes(), rendered
 
 
 class AffineCoordinateMapper:
@@ -242,7 +315,7 @@ class GDSLayoutModel:
         return tuple(sorted({shape.layer_key for shape in self.shapes}))
 
     @classmethod
-    def load(cls, path: str | Path, top_cell_name: str | None = None, *, max_shapes: int = DEFAULT_MAX_GDS_SHAPES) -> "GDSLayoutModel":
+    def load(cls, path: str | Path, top_cell_name: str | None = None, *, max_shapes: int | None = DEFAULT_MAX_GDS_SHAPES) -> "GDSLayoutModel":
         if importlib.util.find_spec("gdstk") is None:
             raise RuntimeError(GDS_MISSING_MESSAGE)
         import gdstk  # type: ignore[import-not-found]
@@ -281,9 +354,12 @@ class GDSLayoutModel:
                 bbox=_points_bbox(points),
             )
             shapes.append(shape)
-            if len(shapes) >= max_shapes:
+            if max_shapes is not None and len(shapes) >= max_shapes:
                 warning = f"GDS contains more than {max_shapes} polygons/paths; rendering is limited to the first {max_shapes}."
                 break
+
+        if warning is None and len(shapes) > LARGE_GDS_WARNING_SHAPES:
+            warning = f"Large GDS: {len(shapes)} polygons/paths loaded. Raster preview is enabled for faster display."
 
         labels = []
         for label in list(getattr(working_cell, "labels", []))[:2000]:
@@ -347,23 +423,31 @@ class GDSCanvasViewer:
         self.layer_visibility: dict[tuple[int, int], bool] = {}
         self.layer_order: list[tuple[int, int]] = []
         self.selected_gds: tuple[float, float] | None = None
+        self.cursor_gds: tuple[float, float] | None = None
         self.stage_center_gds: tuple[float, float] | None = None
         self.fov_polygon_gds: list[tuple[float, float]] | None = None
+        self.snap_grid_um = 1.0
+        self.require_double_click_pick = False
+        self.ignore_next_release = False
         self.drag_start: tuple[int, int, float, float] | None = None
+        self.drag_last: tuple[int, int] | None = None
         self.dragging = False
         self.configure_job: str | None = None
+        self.geometry_photo: tk.PhotoImage | None = None
+        self.last_rendered_shape_count = 0
 
         self.canvas = tk.Canvas(parent, bg="#05070a", highlightthickness=1, highlightbackground=colors["border"], bd=0, cursor="crosshair")
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.canvas.bind("<Configure>", self._on_configure)
         self.canvas.bind("<Motion>", self._on_motion)
-        self.canvas.bind("<Leave>", lambda _event: self.on_cursor_gds(None))
+        self.canvas.bind("<Leave>", self._on_leave)
         self.canvas.bind("<MouseWheel>", self._on_mouse_wheel)
         self.canvas.bind("<Button-4>", self._on_mouse_wheel)
         self.canvas.bind("<Button-5>", self._on_mouse_wheel)
         self.canvas.bind("<ButtonPress-1>", self._on_button_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_button_release)
+        self.canvas.bind("<Double-Button-1>", self._on_double_click)
         self.draw_message("Load a GDS file to begin.")
 
     def set_model(self, model: GDSLayoutModel) -> None:
@@ -372,12 +456,19 @@ class GDSCanvasViewer:
         self.stage_center_gds = None
         self.fov_polygon_gds = None
         self.layer_order = list(model.layers)
-        self.layer_visibility = {layer: True for layer in self.layer_order}
+        self.layer_visibility = {layer: False for layer in self.layer_order}
         self.fit_to_view()
 
     def set_layer_visibility(self, layer: tuple[int, int], visible: bool) -> None:
         self.layer_visibility[layer] = bool(visible)
         self.redraw()
+
+    def set_snap_grid_um(self, grid_um: float) -> None:
+        self.snap_grid_um = max(float(grid_um), 0.0)
+
+    def set_pick_mode(self, active: bool) -> None:
+        self.require_double_click_pick = bool(active)
+        self.canvas.configure(cursor="tcross" if active else "crosshair")
 
     def fit_to_view(self) -> None:
         if self.model is None or self.model.bounds is None:
@@ -411,6 +502,8 @@ class GDSCanvasViewer:
 
     def redraw(self) -> None:
         self.canvas.delete("all")
+        self.geometry_photo = None
+        self.last_rendered_shape_count = 0
         if self.model is None:
             self.draw_message("Load a GDS file to begin.")
             return
@@ -420,8 +513,13 @@ class GDSCanvasViewer:
 
         width = max(self.canvas.winfo_width(), 1)
         height = max(self.canvas.winfo_height(), 1)
+        if self._draw_geometry_raster(width, height):
+            self._draw_labels(width, height)
+            self._draw_overlay_items()
+            return
+
         for shape in self.model.shapes:
-            if not self.layer_visibility.get(shape.layer_key, True):
+            if not self.layer_visibility.get(shape.layer_key, False):
                 continue
             if not self._shape_visible(shape, width, height):
                 continue
@@ -436,16 +534,37 @@ class GDSCanvasViewer:
                 except tk.TclError:
                     continue
 
-        if self.transform.scale > 0.02:
-            for label in self.model.labels[:300]:
-                x, y = self.transform.gds_to_canvas(*label.origin)
-                if -40 <= x <= width + 40 and -20 <= y <= height + 20:
-                    self.canvas.create_text(x, y, text=label.text, fill="#e5e7eb", anchor="center", font=("Segoe UI", 8), tags="gds_labels")
-
+        self._draw_labels(width, height)
         self._draw_overlay_items()
+
+    def _draw_geometry_raster(self, width: int, height: int) -> bool:
+        if self.model is None:
+            return False
+        layer_colors = {layer: self._layer_color(layer) for layer in self.layer_order}
+        rendered = render_gds_preview_ppm(self.model, self.transform, width, height, self.layer_visibility, layer_colors)
+        if rendered is None:
+            return False
+        ppm_bytes, rendered_count = rendered
+        try:
+            self.geometry_photo = tk.PhotoImage(data=ppm_bytes, format="PPM")
+            self.canvas.create_image(0, 0, image=self.geometry_photo, anchor="nw", tags="gds_geometry")
+            self.last_rendered_shape_count = rendered_count
+        except tk.TclError:
+            self.geometry_photo = None
+            return False
+        return True
+
+    def _draw_labels(self, width: int, height: int) -> None:
+        if self.model is None or self.transform.scale <= 0.02:
+            return
+        for label in self.model.labels[:300]:
+            x, y = self.transform.gds_to_canvas(*label.origin)
+            if -40 <= x <= width + 40 and -20 <= y <= height + 20:
+                self.canvas.create_text(x, y, text=label.text, fill="#e5e7eb", anchor="center", font=("Segoe UI", 8), tags="gds_labels")
 
     def _draw_overlay_items(self) -> None:
         try:
+            self.canvas.delete("gds_cursor")
             self.canvas.delete("gds_overlay")
             self.canvas.delete("gds_selection")
             if self.fov_polygon_gds and len(self.fov_polygon_gds) >= 3:
@@ -465,6 +584,8 @@ class GDSCanvasViewer:
                 self._draw_cross(self.stage_center_gds, "#86efac", "gds_overlay", radius=7)
             if self.selected_gds is not None:
                 self._draw_cross(self.selected_gds, "#fbbf24", "gds_selection", radius=8)
+            if self.cursor_gds is not None:
+                self._draw_cursor_crosshair(self.cursor_gds)
         except tk.TclError:
             return
 
@@ -474,13 +595,17 @@ class GDSCanvasViewer:
         self.canvas.create_line(x, y - radius, x, y + radius, fill=color, width=2, tags=tag)
         self.canvas.create_oval(x - 3, y - 3, x + 3, y + 3, outline=color, width=1, tags=tag)
 
+    def _draw_cursor_crosshair(self, point: tuple[float, float]) -> None:
+        x, y = self.transform.gds_to_canvas(*point)
+        width = max(self.canvas.winfo_width(), 1)
+        height = max(self.canvas.winfo_height(), 1)
+        color = "#e0f2fe"
+        self.canvas.create_line(0, y, width, y, fill=color, width=1, dash=(4, 5), tags="gds_cursor")
+        self.canvas.create_line(x, 0, x, height, fill=color, width=1, dash=(4, 5), tags="gds_cursor")
+        self.canvas.create_oval(x - 4, y - 4, x + 4, y + 4, outline=color, width=1, tags="gds_cursor")
+
     def _shape_visible(self, shape: GDSShape, width: int, height: int) -> bool:
-        min_u, min_v, max_u, max_v = shape.bbox
-        x1, y1 = self.transform.gds_to_canvas(min_u, max_v)
-        x2, y2 = self.transform.gds_to_canvas(max_u, min_v)
-        left, right = sorted((x1, x2))
-        top, bottom = sorted((y1, y2))
-        return right >= -40 and left <= width + 40 and bottom >= -40 and top <= height + 40
+        return shape_visible_in_view(shape, self.transform, width, height)
 
     def _layer_color(self, layer: tuple[int, int]) -> str:
         palette = (
@@ -518,9 +643,18 @@ class GDSCanvasViewer:
 
     def _on_motion(self, event: tk.Event) -> None:
         if self.model is None:
+            self.cursor_gds = None
+            self._draw_overlay_items()
             self.on_cursor_gds(None)
             return
-        self.on_cursor_gds(self.transform.canvas_to_gds(event.x, event.y))
+        self.cursor_gds = snap_gds_point(self.transform.canvas_to_gds(event.x, event.y), self.snap_grid_um)
+        self.on_cursor_gds(self.cursor_gds)
+        self._draw_overlay_items()
+
+    def _on_leave(self, _event: tk.Event) -> None:
+        self.cursor_gds = None
+        self.on_cursor_gds(None)
+        self._draw_overlay_items()
 
     def _on_mouse_wheel(self, event: tk.Event) -> str:
         if self.model is None:
@@ -535,6 +669,7 @@ class GDSCanvasViewer:
 
     def _on_button_press(self, event: tk.Event) -> str:
         self.drag_start = (event.x, event.y, self.transform.offset_x, self.transform.offset_y)
+        self.drag_last = (event.x, event.y)
         self.dragging = False
         return "break"
 
@@ -548,16 +683,41 @@ class GDSCanvasViewer:
             self.dragging = True
             self.transform.offset_x = offset_x + dx
             self.transform.offset_y = offset_y + dy
-            self.redraw()
+            if self.drag_last is not None:
+                last_x, last_y = self.drag_last
+                self.canvas.move("all", event.x - last_x, event.y - last_y)
+            self.drag_last = (event.x, event.y)
         return "break"
 
     def _on_button_release(self, event: tk.Event) -> str:
+        if self.ignore_next_release:
+            self.ignore_next_release = False
+            self.drag_start = None
+            self.drag_last = None
+            self.dragging = False
+            return "break"
+        was_dragging = self.dragging
+        if self.model is not None and not self.dragging and not self.require_double_click_pick:
+            point = snap_gds_point(self.transform.canvas_to_gds(event.x, event.y), self.snap_grid_um)
+            self.selected_gds = point
+            self.on_select_gds(point[0], point[1])
+            self._draw_overlay_items()
+            self.ignore_next_release = True
+        self.drag_start = None
+        self.drag_last = None
+        self.dragging = False
+        if was_dragging:
+            self.redraw()
+        return "break"
+
+    def _on_double_click(self, event: tk.Event) -> str:
         if self.model is not None and not self.dragging:
-            point = self.transform.canvas_to_gds(event.x, event.y)
+            point = snap_gds_point(self.transform.canvas_to_gds(event.x, event.y), self.snap_grid_um)
             self.selected_gds = point
             self.on_select_gds(point[0], point[1])
             self._draw_overlay_items()
         self.drag_start = None
+        self.drag_last = None
         self.dragging = False
         return "break"
 
@@ -587,6 +747,13 @@ class GDSStageMapperPanel:
         self.loader_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.loader_poll_job: str | None = None
 
+        self.snap_grid_options = {
+            "100 nm": 0.1,
+            "1 um": 1.0,
+            "5 um": 5.0,
+            "10 um": 10.0,
+        }
+        self.snap_grid_var = tk.StringVar(value="1 um")
         self.cursor_var = tk.StringVar(value="Cursor u, v: -")
         self.selection_var = tk.StringVar(value="Selected target: -")
         self.target_stage_var = tk.StringVar(value="Target stage: -")
@@ -604,6 +771,7 @@ class GDSStageMapperPanel:
         self.current_gds_var = tk.StringVar(value="Current GDS: -")
         self.motion_status_var = tk.StringVar(value="Idle")
         self.layer_vars: dict[tuple[int, int], tk.BooleanVar] = {}
+        self.gds_point_buttons: dict[str, tk.Button] = {}
         self.point_vars: dict[str, dict[str, tk.StringVar]] = {
             name: {
                 "u": tk.StringVar(value=""),
@@ -619,6 +787,7 @@ class GDSStageMapperPanel:
         self.frame.columnconfigure(0, weight=1)
         self.frame.rowconfigure(0, weight=1)
         self._build_ui()
+        self._update_snap_grid()
         if importlib.util.find_spec("gdstk") is None:
             self.load_status_var.set(GDS_MISSING_MESSAGE)
         self._schedule_overlay_poll()
@@ -689,8 +858,26 @@ class GDSStageMapperPanel:
 
     def _build_cursor_section(self, parent: ttk.Frame, row: int) -> int:
         section = self._section(parent, "Cursor and Selection", row)
-        for index, variable in enumerate((self.cursor_var, self.selection_var, self.target_stage_var, self.move_distance_var)):
-            ttk.Label(section, textvariable=variable, style="Value.TLabel", wraplength=390, padding=7).grid(row=index, column=0, sticky="ew", pady=(0 if index == 0 else 5, 0))
+        snap_row = ttk.Frame(section, style="Panel.TFrame")
+        snap_row.grid(row=0, column=0, sticky="ew")
+        snap_row.columnconfigure(1, weight=1)
+        ttk.Label(snap_row, text="Grid snap", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        snap_combo = ttk.Combobox(
+            snap_row,
+            textvariable=self.snap_grid_var,
+            values=tuple(self.snap_grid_options),
+            state="readonly",
+            width=12,
+        )
+        snap_combo.grid(row=0, column=1, sticky="ew")
+        snap_combo.bind("<<ComboboxSelected>>", lambda _event: self._update_snap_grid())
+        readouts = ttk.Frame(section, style="Panel.TFrame")
+        readouts.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        readouts.columnconfigure((0, 1), weight=1, uniform="layoutbond_cursor")
+        ttk.Label(readouts, textvariable=self.cursor_var, style="Value.TLabel", wraplength=190, padding=6).grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        ttk.Label(readouts, textvariable=self.selection_var, style="Value.TLabel", wraplength=190, padding=6).grid(row=0, column=1, sticky="ew", padx=(3, 0))
+        ttk.Label(readouts, textvariable=self.target_stage_var, style="Value.TLabel", wraplength=190, padding=6).grid(row=1, column=0, sticky="ew", padx=(0, 3), pady=(5, 0))
+        ttk.Label(readouts, textvariable=self.move_distance_var, style="Value.TLabel", wraplength=190, padding=6).grid(row=1, column=1, sticky="ew", padx=(3, 0), pady=(5, 0))
         return row + 1
 
     def _build_calibration_section(self, parent: ttk.Frame, row: int) -> int:
@@ -707,7 +894,23 @@ class GDSStageMapperPanel:
                 ttk.Entry(section, textvariable=self.point_vars[name][key], width=9).grid(row=row_index, column=col, sticky="ew", padx=(0, 5), pady=(5, 0))
             button_row = ttk.Frame(section, style="Panel.TFrame")
             button_row.grid(row=row_index, column=5, sticky="ew", pady=(5, 0))
-            ttk.Button(button_row, text="Set GDS", command=lambda point=name: self._arm_gds_point_capture(point)).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+            set_gds_button = tk.Button(
+                button_row,
+                text="Set GDS",
+                command=lambda point=name: self._arm_gds_point_capture(point),
+                bg=self.colors["surface_3"],
+                fg=self.colors["text"],
+                activebackground="#223144",
+                activeforeground=self.colors["text"],
+                relief="flat",
+                bd=0,
+                padx=8,
+                pady=5,
+                font=("Segoe UI", 9),
+                cursor="hand2",
+            )
+            set_gds_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+            self.gds_point_buttons[name] = set_gds_button
             ttk.Button(button_row, text="Set Stage", command=lambda point=name: self._set_point_stage_from_current(point)).grid(row=0, column=1, sticky="ew")
         return row + 1
 
@@ -814,19 +1017,29 @@ class GDSStageMapperPanel:
         if self.model is None:
             return
         ttk.Label(self.layer_frame, text="Layers", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        grid = ttk.Frame(self.layer_frame, style="Panel.TFrame")
+        grid.grid(row=1, column=0, sticky="ew")
+        for column in range(LAYER_TOGGLE_COLUMNS):
+            grid.columnconfigure(column, weight=1, uniform="layoutbond_layers")
         visible_layers = self.model.layers[:48]
-        for index, layer in enumerate(visible_layers, start=1):
-            variable = tk.BooleanVar(value=True)
+        for index, layer in enumerate(visible_layers):
+            variable = tk.BooleanVar(value=False)
             self.layer_vars[layer] = variable
             text = f"L{layer[0]} / D{layer[1]}"
+            grid_row, grid_column = layer_grid_position(index)
             ttk.Checkbutton(
-                self.layer_frame,
+                grid,
                 text=text,
                 variable=variable,
                 command=lambda key=layer, var=variable: self.viewer.set_layer_visibility(key, var.get()),
-            ).grid(row=index, column=0, sticky="w")
+            ).grid(row=grid_row, column=grid_column, sticky="w", padx=(0, 10), pady=(0, 3))
         if len(self.model.layers) > len(visible_layers):
-            ttk.Label(self.layer_frame, text=f"{len(self.model.layers) - len(visible_layers)} more layers are visible by default.", style="Muted.TLabel", wraplength=360).grid(row=len(visible_layers) + 1, column=0, sticky="w", pady=(4, 0))
+            ttk.Label(self.layer_frame, text=f"{len(self.model.layers) - len(visible_layers)} more layers are visible by default.", style="Muted.TLabel", wraplength=360).grid(row=2, column=0, sticky="w", pady=(4, 0))
+
+    def _update_snap_grid(self) -> None:
+        grid_um = self.snap_grid_options.get(self.snap_grid_var.get(), 1.0)
+        self.viewer.set_snap_grid_um(grid_um)
+        self.motion_status_var.set(f"Cursor grid snap: {self.snap_grid_var.get()}.")
 
     def _set_cursor_gds(self, point: tuple[float, float] | None) -> None:
         if point is None:
@@ -838,9 +1051,11 @@ class GDSStageMapperPanel:
         if self.pending_gds_point:
             point_name = self.pending_gds_point
             self.pending_gds_point = None
+            self.viewer.set_pick_mode(False)
+            self._reset_gds_point_buttons()
             self.point_vars[point_name]["u"].set(f"{u:.12g}")
             self.point_vars[point_name]["v"].set(f"{v:.12g}")
-            self.motion_status_var.set(f"{point_name} GDS coordinate set from click.")
+            self.motion_status_var.set(f"{point_name} GDS coordinate set from double-click pick.")
             self._set_status(f"{point_name} GDS coordinate set.")
             return
 
@@ -850,8 +1065,25 @@ class GDSStageMapperPanel:
 
     def _arm_gds_point_capture(self, point_name: str) -> None:
         self.pending_gds_point = point_name
-        self.motion_status_var.set(f"Click a GDS location for {point_name}.")
-        self._set_status(f"GDS Stage Mapper: click a GDS location for {point_name}.")
+        self.viewer.set_pick_mode(True)
+        self._highlight_gds_point_button(point_name)
+        self.motion_status_var.set(f"Double-click a snapped GDS location for {point_name}.")
+        self._set_status(f"LayoutBond: double-click a snapped GDS location for {point_name}.")
+
+    def _highlight_gds_point_button(self, point_name: str) -> None:
+        self._reset_gds_point_buttons()
+        button = self.gds_point_buttons.get(point_name)
+        if button is not None:
+            button.configure(bg="#f59e0b", fg="#111827", activebackground="#fbbf24", activeforeground="#111827")
+
+    def _reset_gds_point_buttons(self) -> None:
+        for button in self.gds_point_buttons.values():
+            button.configure(
+                bg=self.colors["surface_3"],
+                fg=self.colors["text"],
+                activebackground="#223144",
+                activeforeground=self.colors["text"],
+            )
 
     def _set_point_stage_from_current(self, point_name: str) -> None:
         try:
@@ -873,7 +1105,7 @@ class GDSStageMapperPanel:
             self.mapping_matrix_var.set("No affine transform.")
             self.residuals_var.set("Residuals: -")
             self.viewer.set_stage_overlay(None, None)
-            self._set_status(f"GDS mapping invalid: {exc}")
+            self._set_status(f"LayoutBond mapping invalid: {exc}")
             return False
 
         self.mapper = mapper
@@ -913,7 +1145,7 @@ class GDSStageMapperPanel:
         )
         residual_text = " | ".join(f"{name}: {value:.4g} um" for name, value in sorted(self.mapper.residuals_um.items()))
         self.residuals_var.set(f"Residuals: {residual_text}")
-        self._set_status("GDS affine mapping updated.")
+        self._set_status("LayoutBond affine mapping updated.")
 
     def _residual_threshold_um(self) -> float:
         try:
@@ -1119,6 +1351,13 @@ def _points_bbox(points: tuple[tuple[float, float], ...]) -> tuple[float, float,
     xs = [point[0] for point in points]
     ys = [point[1] for point in points]
     return min(xs), min(ys), max(xs), max(ys)
+
+
+def _hex_to_rgb(color: str) -> tuple[int, int, int]:
+    value = color.strip().lstrip("#")
+    if len(value) != 6:
+        return (96, 165, 250)
+    return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
 
 
 def _shapes_bbox(shapes: list[GDSShape]) -> tuple[float, float, float, float] | None:

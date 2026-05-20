@@ -4,6 +4,8 @@ from pathlib import Path
 
 from semi_auto_probe.config import (
     AUTOFOCUS_PEAK_MODEL_LORENTZIAN,
+    DEFAULT_AGENT_BASE_URL,
+    DEFAULT_AGENT_MODEL,
     DEFAULT_CONFIG_FILENAME,
     KEYBOARD_MOTION_SCHEME_ARROW_PAGE,
     KEYBOARD_MOTION_SCHEME_WASD_QE,
@@ -118,6 +120,26 @@ class ProbeConfigTest(unittest.TestCase):
             loaded = load_probe_config(path)
 
             self.assertEqual(loaded.keyboard_motion_scheme, KEYBOARD_MOTION_SCHEME_WASD_QE)
+
+    def test_agent_api_defaults_and_round_trip(self) -> None:
+        self.assertEqual(ProbeConfig().agent_base_url, DEFAULT_AGENT_BASE_URL)
+        self.assertEqual(ProbeConfig().agent_model, DEFAULT_AGENT_MODEL)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / DEFAULT_CONFIG_FILENAME
+            config = ProbeConfig(
+                agent_api_key="sk-test",
+                agent_base_url="https://api.deepseek.com",
+                agent_model="deepseek-chat",
+                agent_timeout_seconds=12.5,
+            )
+
+            save_probe_config(config, path)
+            loaded = load_probe_config(path)
+
+            self.assertEqual(loaded.agent_api_key, "sk-test")
+            self.assertEqual(loaded.agent_base_url, "https://api.deepseek.com")
+            self.assertEqual(loaded.agent_model, "deepseek-chat")
+            self.assertAlmostEqual(loaded.agent_timeout_seconds, 12.5)
 
     def test_jog_step_levels_parse_and_format_text(self) -> None:
         levels = parse_jog_step_levels_text("100, 1, 10, 10; 1000")

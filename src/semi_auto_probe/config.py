@@ -41,6 +41,9 @@ AUTOFOCUS_PEAK_MODEL_LABELS = {
 }
 JOG_STEP_AXES = ("X", "Y", "Z")
 DEFAULT_JOG_STEP_LEVELS = {axis: (1, 10, 100, 1000) for axis in JOG_STEP_AXES}
+DEFAULT_AGENT_BASE_URL = "https://api.deepseek.com"
+DEFAULT_AGENT_MODEL = "deepseek-chat"
+DEFAULT_AGENT_TIMEOUT_SECONDS = 30.0
 
 
 def parse_jog_step_levels_text(text: str) -> tuple[int, ...]:
@@ -160,6 +163,10 @@ class ProbeConfig:
     focus_threshold_yellow: dict[str, float] = field(default_factory=lambda: {"Laplacian": 1000.0, "Tenengrad": 20000.0, "Brenner": 1000.0})
     focus_threshold_green: dict[str, float] = field(default_factory=lambda: {"Laplacian": 2000.0, "Tenengrad": 40000.0, "Brenner": 2000.0})
     calibrations: dict[str, float] = field(default_factory=dict)
+    agent_api_key: str = ""
+    agent_base_url: str = DEFAULT_AGENT_BASE_URL
+    agent_model: str = DEFAULT_AGENT_MODEL
+    agent_timeout_seconds: float = DEFAULT_AGENT_TIMEOUT_SECONDS
 
     def validate(self) -> None:
         if self.objective not in OBJECTIVE_OPTIONS:
@@ -200,6 +207,15 @@ class ProbeConfig:
         for value in self.calibrations.values():
             if value <= 0:
                 raise ValueError("Calibration values must be positive.")
+        self.agent_api_key = str(self.agent_api_key or "").strip()
+        self.agent_base_url = str(self.agent_base_url or DEFAULT_AGENT_BASE_URL).strip().rstrip("/")
+        self.agent_model = str(self.agent_model or DEFAULT_AGENT_MODEL).strip()
+        if not self.agent_base_url.startswith(("http://", "https://")):
+            raise ValueError("Agent API base URL must start with http:// or https://.")
+        if not self.agent_model:
+            raise ValueError("Agent model cannot be empty.")
+        if self.agent_timeout_seconds <= 0 or self.agent_timeout_seconds > 300:
+            raise ValueError("Agent API timeout must be in range 0..300 seconds.")
 
     def cc_acceleration_units(self) -> int:
         return int(round(self.cc_accel_time_s * 100.0))
@@ -262,6 +278,10 @@ class ProbeConfig:
             "focus_threshold_yellow": dict(sorted(self.focus_threshold_yellow.items())),
             "focus_threshold_green": dict(sorted(self.focus_threshold_green.items())),
             "calibrations": dict(sorted(self.calibrations.items())),
+            "agent_api_key": self.agent_api_key,
+            "agent_base_url": self.agent_base_url,
+            "agent_model": self.agent_model,
+            "agent_timeout_seconds": self.agent_timeout_seconds,
         }
 
     @classmethod
@@ -292,6 +312,10 @@ class ProbeConfig:
                 **{str(key): float(value) for key, value in data.get("focus_threshold_green", {}).items()},
             },
             calibrations={str(key): float(value) for key, value in data.get("calibrations", {}).items()},
+            agent_api_key=str(data.get("agent_api_key", "")),
+            agent_base_url=str(data.get("agent_base_url", DEFAULT_AGENT_BASE_URL)),
+            agent_model=str(data.get("agent_model", DEFAULT_AGENT_MODEL)),
+            agent_timeout_seconds=float(data.get("agent_timeout_seconds", DEFAULT_AGENT_TIMEOUT_SECONDS)),
         )
         derive_missing_calibrations(config)
         config.validate()
