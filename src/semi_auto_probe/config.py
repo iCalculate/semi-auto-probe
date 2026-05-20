@@ -23,6 +23,37 @@ KEYBOARD_MOTION_SCHEME_LABELS = {
     KEYBOARD_MOTION_SCHEME_ARROW_PAGE: "Arrow keys + PageUp/PageDown",
     KEYBOARD_MOTION_SCHEME_WASD_QE: "WASD + Q/E",
 }
+MOTOR_SPEED_PROFILE_FAST = "fast"
+MOTOR_SPEED_PROFILE_FINE = "fine"
+MOTOR_SPEED_PROFILE_SAFE = "safe"
+MOTOR_SPEED_PROFILES = (
+    MOTOR_SPEED_PROFILE_FAST,
+    MOTOR_SPEED_PROFILE_FINE,
+    MOTOR_SPEED_PROFILE_SAFE,
+)
+MOTOR_SPEED_PROFILE_LABELS = {
+    MOTOR_SPEED_PROFILE_FAST: "Fast Move",
+    MOTOR_SPEED_PROFILE_FINE: "Fine Position",
+    MOTOR_SPEED_PROFILE_SAFE: "Safe Debug",
+}
+
+
+def normalize_motor_speed_profile(value: Any) -> str:
+    normalized = str(value or MOTOR_SPEED_PROFILE_FAST).strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        MOTOR_SPEED_PROFILE_FAST: MOTOR_SPEED_PROFILE_FAST,
+        MOTOR_SPEED_PROFILE_FINE: MOTOR_SPEED_PROFILE_FINE,
+        MOTOR_SPEED_PROFILE_SAFE: MOTOR_SPEED_PROFILE_SAFE,
+        "fast_move": MOTOR_SPEED_PROFILE_FAST,
+        "fine_position": MOTOR_SPEED_PROFILE_FINE,
+        "safe_debug": MOTOR_SPEED_PROFILE_SAFE,
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in MOTOR_SPEED_PROFILES:
+        raise ValueError(f"Motor speed profile must be one of {MOTOR_SPEED_PROFILES}.")
+    return normalized
+
+
 AUTOFOCUS_PEAK_MODEL_GAUSSIAN = "gaussian"
 AUTOFOCUS_PEAK_MODEL_LORENTZIAN = "lorentzian"
 AUTOFOCUS_PEAK_MODEL_PARABOLIC = "parabolic"
@@ -41,6 +72,11 @@ AUTOFOCUS_PEAK_MODEL_LABELS = {
 }
 JOG_STEP_AXES = ("X", "Y", "Z")
 DEFAULT_JOG_STEP_LEVELS = {axis: (1, 10, 100, 1000) for axis in JOG_STEP_AXES}
+CONTROLLER_MOTION_PARAMETER_FIELDS = ("minimum_speed", "work_speed", "acceleration")
+DEFAULT_CONTROLLER_MOTION_PARAMETERS = {
+    axis: {field_name: 0 for field_name in CONTROLLER_MOTION_PARAMETER_FIELDS}
+    for axis in JOG_STEP_AXES
+}
 DEFAULT_AGENT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_AGENT_MODEL = "deepseek-chat"
 DEFAULT_AGENT_TIMEOUT_SECONDS = 30.0
@@ -98,6 +134,28 @@ def normalize_jog_step_levels_map(data: Any) -> dict[str, tuple[int, ...]]:
     return normalized
 
 
+def normalize_controller_motion_parameters_map(data: Any) -> dict[str, dict[str, int]]:
+    raw_map = data if isinstance(data, dict) else {}
+    aliases = {
+        "minimum_speed": ("minimum_speed", "min_speed", "min", "minimum"),
+        "work_speed": ("work_speed", "working_speed", "work", "speed"),
+        "acceleration": ("acceleration", "accel"),
+    }
+    normalized: dict[str, dict[str, int]] = {}
+    for axis in JOG_STEP_AXES:
+        raw_axis = raw_map.get(axis, raw_map.get(axis.lower(), {}))
+        raw_axis = raw_axis if isinstance(raw_axis, dict) else {}
+        values: dict[str, int] = {}
+        for field_name, field_aliases in aliases.items():
+            raw_value = next((raw_axis[alias] for alias in field_aliases if alias in raw_axis), 0)
+            value = int(raw_value)
+            if value < 0 or value > 0xFFFF:
+                raise ValueError(f"{axis} controller {field_name.replace('_', ' ')} must be in range 0..65535.")
+            values[field_name] = value
+        normalized[axis] = values
+    return normalized
+
+
 def calibration_key(objective: int, eyepiece: float) -> str:
     return f"objective_{objective:g}__eyepiece_{eyepiece:g}"
 
@@ -151,6 +209,13 @@ class ProbeConfig:
     lead_z_mm: float = 0.5
     base_angle_deg: float = 0.72
     cc_speed_percent: int = 100
+    fine_speed_percent: int = 40
+    safe_speed_percent: int = 15
+    active_motor_speed_profile: str = MOTOR_SPEED_PROFILE_FAST
+    controller_motion_parameters: dict[str, dict[str, int]] = field(default_factory=lambda: {
+        axis: dict(DEFAULT_CONTROLLER_MOTION_PARAMETERS[axis])
+        for axis in JOG_STEP_AXES
+    })
     cc_accel_time_s: float = 0.1
     autofocus_settle_ms: int = 100
     autofocus_sample_count: int = 5
@@ -180,7 +245,13 @@ class ProbeConfig:
         if self.base_angle_deg <= 0:
             raise ValueError("Base angle must be positive.")
         if self.cc_speed_percent < 0 or self.cc_speed_percent > 100:
-            raise ValueError("CC speed percent must be in range 0..100.")
+            raise ValueError("Fast motor speed percent must be in range 0..100.")
+        if self.fine_speed_percent < 0 or self.fine_speed_percent > 100:
+            raise ValueError("Fine motor speed percent must be in range 0..100.")
+        if self.safe_speed_percent < 0 or self.safe_speed_percent > 100:
+            raise ValueError("Safe motor speed percent must be in range 0..100.")
+        self.active_motor_speed_profile = normalize_motor_speed_profile(self.active_motor_speed_profile)
+        self.controller_motion_parameters = normalize_controller_motion_parameters_map(self.controller_motion_parameters)
         if self.cc_accel_time_s < 0 or self.cc_accel_time_s > 2.55:
             raise ValueError("CC acceleration time must be in range 0..2.55 seconds.")
         if self.autofocus_settle_ms < 0 or self.autofocus_settle_ms > 10000:
@@ -219,6 +290,14 @@ class ProbeConfig:
 
     def cc_acceleration_units(self) -> int:
         return int(round(self.cc_accel_time_s * 100.0))
+
+    def motor_speed_percent(self, profile: str | None = None) -> int:
+        selected_profile = normalize_motor_speed_profile(profile or self.active_motor_speed_profile)
+        if selected_profile == MOTOR_SPEED_PROFILE_FINE:
+            return int(self.fine_speed_percent)
+        if selected_profile == MOTOR_SPEED_PROFILE_SAFE:
+            return int(self.safe_speed_percent)
+        return int(self.cc_speed_percent)
 
     @property
     def steps_per_revolution(self) -> float:
@@ -263,6 +342,13 @@ class ProbeConfig:
             "lead_z_mm": self.lead_z_mm,
             "base_angle_deg": self.base_angle_deg,
             "cc_speed_percent": self.cc_speed_percent,
+            "fine_speed_percent": self.fine_speed_percent,
+            "safe_speed_percent": self.safe_speed_percent,
+            "active_motor_speed_profile": self.active_motor_speed_profile,
+            "controller_motion_parameters": {
+                axis: dict(self.controller_motion_parameters[axis])
+                for axis in JOG_STEP_AXES
+            },
             "cc_accel_time_s": self.cc_accel_time_s,
             "autofocus_settle_ms": self.autofocus_settle_ms,
             "autofocus_sample_count": self.autofocus_sample_count,
@@ -286,6 +372,16 @@ class ProbeConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ProbeConfig":
+        controller_motion_parameters = data.get("controller_motion_parameters")
+        if controller_motion_parameters is None:
+            controller_motion_parameters = {
+                axis: {
+                    "minimum_speed": data.get("controller_min_speed", 0),
+                    "work_speed": data.get("controller_work_speed", 0),
+                    "acceleration": data.get("controller_acceleration", 0),
+                }
+                for axis in JOG_STEP_AXES
+            }
         config = cls(
             objective=int(data.get("objective", cls.objective)),
             eyepiece=float(data.get("eyepiece", cls.eyepiece)),
@@ -294,6 +390,10 @@ class ProbeConfig:
             lead_z_mm=float(data.get("lead_z_mm", cls.lead_z_mm)),
             base_angle_deg=float(data.get("base_angle_deg", cls.base_angle_deg)),
             cc_speed_percent=int(data.get("cc_speed_percent", cls.cc_speed_percent)),
+            fine_speed_percent=int(data.get("fine_speed_percent", cls.fine_speed_percent)),
+            safe_speed_percent=int(data.get("safe_speed_percent", cls.safe_speed_percent)),
+            active_motor_speed_profile=normalize_motor_speed_profile(data.get("active_motor_speed_profile", MOTOR_SPEED_PROFILE_FAST)),
+            controller_motion_parameters=normalize_controller_motion_parameters_map(controller_motion_parameters),
             cc_accel_time_s=float(data.get("cc_accel_time_s", cls.cc_accel_time_s)),
             autofocus_settle_ms=int(data.get("autofocus_settle_ms", cls.autofocus_settle_ms)),
             autofocus_sample_count=int(data.get("autofocus_sample_count", cls.autofocus_sample_count)),

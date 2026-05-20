@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from .protocol import (
     COMM_TEST_COMMAND,
     FRAME_LENGTH,
+    FUNCTION_MOTION_PARAMETERS_RESPONSE,
+    FUNCTION_READ_MOTION_PARAMETERS,
     FUNCTION_READ_POSITION,
     FUNCTION_REACHED_POSITION,
     FUNCTION_MULTI_AXIS_COMPLETED,
@@ -15,20 +17,24 @@ from .protocol import (
     RESPONSE_HEAD,
     Axis,
     AxisPosition,
+    ControllerMotionParameters,
     IoStatus,
     build_absolute_move_command,
     build_clear_position_command,
     build_disable_realtime_position_command,
     build_enable_realtime_position_command,
     build_read_io_status_command,
+    build_read_motion_parameters_command,
     build_multi_axis_relative_move_command,
     build_relative_move_command,
     build_read_position_command,
     build_stop_command,
     hex_bytes,
+    payload_contains_clear_position_command,
     parse_frame,
     parse_axis_position_response,
     parse_io_status_response,
+    parse_motion_parameters_response,
     validate_comm_test_response,
 )
 
@@ -48,6 +54,7 @@ class ControllerSerialClient:
         self.timeout = timeout
         self._serial = None
         self._lock = threading.RLock()
+        self.admin_mode_enabled = False
 
     @property
     def is_open(self) -> bool:
@@ -79,7 +86,16 @@ class ControllerSerialClient:
                 self._serial.close()
                 self._serial = None
 
+    def set_admin_mode_enabled(self, enabled: bool) -> None:
+        self.admin_mode_enabled = bool(enabled)
+
+    def _require_admin_mode_for_clear_position(self) -> None:
+        if not self.admin_mode_enabled:
+            raise PermissionError("Clear-position commands require Config admin mode.")
+
     def send_and_read_frame(self, command: bytes) -> bytes:
+        if payload_contains_clear_position_command(command):
+            self._require_admin_mode_for_clear_position()
         with self._lock:
             if not self.is_open:
                 self.open()
@@ -91,6 +107,8 @@ class ControllerSerialClient:
             return self._serial.read(FRAME_LENGTH)
 
     def write_command(self, command: bytes, reset_input: bool = False) -> None:
+        if payload_contains_clear_position_command(command):
+            self._require_admin_mode_for_clear_position()
         with self._lock:
             if not self.is_open:
                 self.open()
@@ -109,6 +127,8 @@ class ControllerSerialClient:
             return self._serial.read(FRAME_LENGTH)
 
     def send_raw(self, payload: bytes, read_length: int = FRAME_LENGTH, reset_input: bool = True) -> bytes:
+        if payload_contains_clear_position_command(payload):
+            self._require_admin_mode_for_clear_position()
         with self._lock:
             if not self.is_open:
                 self.open()
@@ -268,6 +288,22 @@ class ControllerSerialClient:
             response = self._read_io_status_response()
         return command, response, parse_io_status_response(response)
 
+    def read_motion_parameters(self, axis: Axis) -> tuple[bytes, bytes, ControllerMotionParameters]:
+        command = build_read_motion_parameters_command(axis)
+        with self._lock:
+            if not self.is_open:
+                self.open()
+            assert self._serial is not None
+
+            self._serial.reset_input_buffer()
+            self._serial.write(command)
+            self._serial.flush()
+            response = self._read_motion_parameters_response(axis)
+        return command, response, parse_motion_parameters_response(response)
+
+    def read_xyz_motion_parameters(self) -> list[tuple[bytes, bytes, ControllerMotionParameters]]:
+        return [self.read_motion_parameters(axis) for axis in (Axis.X, Axis.Y, Axis.Z)]
+
     def _read_io_status_response(self) -> bytes:
         assert self._serial is not None
         deadline = time.monotonic() + self.timeout
@@ -302,6 +338,41 @@ class ControllerSerialClient:
 
         detail = f"last bytes {hex_bytes(last_seen)}" if last_seen else "no frame"
         raise TimeoutError(f"Timeout waiting for I/O status response ({detail}).")
+
+    def _read_motion_parameters_response(self, axis: Axis) -> bytes:
+        assert self._serial is not None
+        deadline = time.monotonic() + self.timeout
+        last_seen = b""
+        buffer = bytearray()
+
+        while time.monotonic() < deadline:
+            chunk = self._serial.read(1)
+            if not chunk:
+                continue
+            buffer.extend(chunk)
+            last_seen = bytes(buffer[-FRAME_LENGTH:])
+
+            head_index = buffer.find(bytes((RESPONSE_HEAD,)))
+            if head_index < 0:
+                del buffer[:-1]
+                continue
+            if head_index > 0:
+                del buffer[:head_index]
+
+            while len(buffer) >= FRAME_LENGTH:
+                frame = bytes(buffer[:FRAME_LENGTH])
+                try:
+                    parsed = parse_frame(frame, expected_head=RESPONSE_HEAD)
+                except ValueError:
+                    del buffer[0]
+                    break
+                del buffer[:FRAME_LENGTH]
+                last_seen = frame
+                if parsed.function_code == FUNCTION_MOTION_PARAMETERS_RESPONSE and parsed.axis == axis:
+                    return frame
+
+        detail = f"last bytes {hex_bytes(last_seen)}" if last_seen else "no frame"
+        raise TimeoutError(f"Timeout waiting for {axis.name} D5 motion-parameter response ({detail}).")
 
     def read_stable_xyz_positions(
         self,
@@ -427,6 +498,7 @@ class ControllerSerialClient:
         return command
 
     def clear_position(self, axis: Axis) -> bytes:
+        self._require_admin_mode_for_clear_position()
         command = build_clear_position_command(axis)
         self.write_command(command, reset_input=True)
         return command

@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from semi_auto_probe.app import ProbeApp
-from semi_auto_probe.config import KEYBOARD_MOTION_SCHEME_WASD_QE, ProbeConfig
+from semi_auto_probe.config import KEYBOARD_MOTION_SCHEME_WASD_QE, MOTOR_SPEED_PROFILE_FINE, MOTOR_SPEED_PROFILE_SAFE, ProbeConfig
 
 
 class DummyVar:
@@ -68,6 +68,19 @@ class KeyboardControlsTests(unittest.TestCase):
         self.assertFalse(ProbeApp._float_text_allowed("-1", minimum=0, maximum=1000))
         self.assertTrue(ProbeApp._jog_step_text_allowed("1, 10; 1000"))
         self.assertFalse(ProbeApp._jog_step_text_allowed("1, ten"))
+
+    def test_motion_speed_uses_active_profile(self) -> None:
+        app = self.make_app_shell()
+        app.probe_config = ProbeConfig(
+            cc_speed_percent=80,
+            fine_speed_percent=30,
+            safe_speed_percent=10,
+            active_motor_speed_profile=MOTOR_SPEED_PROFILE_FINE,
+        )
+
+        self.assertEqual(ProbeApp._motion_speed_percent(app), 30)
+        self.assertEqual(ProbeApp._motion_speed_percent(app, MOTOR_SPEED_PROFILE_SAFE), 10)
+        self.assertAlmostEqual(ProbeApp._axis_move_timeout(300, 30), 10.0)
 
 
 if __name__ == "__main__":

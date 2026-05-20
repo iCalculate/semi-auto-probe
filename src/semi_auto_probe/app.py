@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import queue
+import hmac
 import json
 import math
+import os
 import re
 import shutil
 import threading
@@ -48,6 +50,9 @@ from .config import (
     KEYBOARD_MOTION_SCHEME_ARROW_PAGE,
     KEYBOARD_MOTION_SCHEME_LABELS,
     KEYBOARD_MOTION_SCHEME_WASD_QE,
+    MOTOR_SPEED_PROFILE_FAST,
+    MOTOR_SPEED_PROFILE_LABELS,
+    MOTOR_SPEED_PROFILES,
     OBJECTIVE_OPTIONS,
     ProbeConfig,
     derive_missing_calibrations,
@@ -59,7 +64,7 @@ from .config import (
     save_probe_config,
 )
 from .focusmap_3d import create_focusmap_3d_view
-from .gds_stage_mapper import GDSStageMapperPanel, stage_move_plan_from_um
+from .gds_stage_mapper import GDSStageMapperPanel, stage_move_plan_from_um, stage_xyz_move_plan_from_um
 from .img_stitch import (
     StitchEdgeQuality,
     StitchSession,
@@ -78,6 +83,7 @@ from .img_stitch import (
 from .logging_utils import colorize_hex_frame, configure_logging, print_startup_banner
 from .monitor_feed import publish_camera_frame, request_web_fallback_camera_release, start_frame_publisher
 from .protocol import COMM_TEST_COMMAND, FUNCTION_READ_POSITION, RESPONSE_HEAD, Axis, AxisPosition, IoStatus, hex_bytes, parse_axis_position_response
+from .protocol import payload_contains_clear_position_command
 from .serial_client import ControllerSerialClient, CommunicationTestResult, list_serial_ports
 from .ui.calibration_dialog import PixelCalibrationDialog
 from .ui.agent_panel import AgentPanel
@@ -92,6 +98,8 @@ RESULT_POLL_MAX_SECONDS = 0.012
 REALTIME_POSITION_UI_INTERVAL_SECONDS = 0.05
 AUTOFOCUS_POST_SETTLE_DISCARD_FRAMES = 2
 FOCUSMAP_AUTOSAVE_FILENAME = "last_focusmap_mapping.json"
+ADMIN_TOKEN_ENV = "SEMI_AUTO_PROBE_ADMIN_TOKEN"
+WEB_ACCESS_TOKEN_ENV = "SEMI_AUTO_PROBE_WEB_TOKEN"
 
 
 class ToggleSwitch(tk.Canvas):
@@ -300,6 +308,9 @@ class ProbeApp(tk.Tk):
         self.realtime_enabled = False
         self.realtime_button_var = tk.StringVar(value="Continue")
         self.home_signal_button_var = tk.StringVar(value="Home Signals")
+        self.admin_mode_enabled = False
+        self.admin_token_var = tk.StringVar(value="")
+        self.admin_mode_status_var = tk.StringVar(value="Admin mode locked")
         self.motion_busy = False
         self.keyboard_motion_busy = False
         self.position_read_pending = False
@@ -370,6 +381,18 @@ class ProbeApp(tk.Tk):
         self.lead_z_var = tk.StringVar(value=f"{self.probe_config.lead_z_mm:g}")
         self.base_angle_var = tk.StringVar(value=f"{self.probe_config.base_angle_deg:g}")
         self.cc_speed_percent_var = tk.StringVar(value=str(self.probe_config.cc_speed_percent))
+        self.fine_speed_percent_var = tk.StringVar(value=str(self.probe_config.fine_speed_percent))
+        self.safe_speed_percent_var = tk.StringVar(value=str(self.probe_config.safe_speed_percent))
+        self.motor_speed_profile_var = tk.StringVar(value=self._motor_speed_profile_label(self.probe_config.active_motor_speed_profile))
+        self.controller_motion_parameter_vars = {
+            axis: {
+                field_name: tk.StringVar(value=str(self.probe_config.controller_motion_parameters[axis][field_name]))
+                for field_name in ("minimum_speed", "work_speed", "acceleration")
+            }
+            for axis in JOG_STEP_AXES
+        }
+        self.controller_motion_status_var = tk.StringVar(value="D5 controller parameters not read.")
+        self.controller_motion_startup_read_done = False
         self.cc_accel_time_var = tk.StringVar(value=f"{self.probe_config.cc_accel_time_s:g}")
         self.autofocus_settle_ms_var = tk.StringVar(value=str(self.probe_config.autofocus_settle_ms))
         self.autofocus_sample_count_var = tk.StringVar(value=str(self.probe_config.autofocus_sample_count))
@@ -395,6 +418,8 @@ class ProbeApp(tk.Tk):
         self.agent_base_url_var = tk.StringVar(value=self.probe_config.agent_base_url)
         self.agent_model_var = tk.StringVar(value=self.probe_config.agent_model)
         self.agent_timeout_var = tk.StringVar(value=f"{self.probe_config.agent_timeout_seconds:g}")
+        self.set_xyz_zero_button: ttk.Button | None = None
+        self.set_autofocus_z_zero_button: ttk.Button | None = None
 
         self._configure_theme()
         self._build_ui()
@@ -758,6 +783,7 @@ class ProbeApp(tk.Tk):
         self._build_agent_page(agent_page)
         self._build_config_page(config_page)
         self._update_config_display()
+        self._update_admin_mode_controls()
         self._warm_page_layouts()
         self.show_page("Main")
 
@@ -861,6 +887,9 @@ class ProbeApp(tk.Tk):
             self.colors,
             get_stage_position_um=self._gds_mapper_current_stage_um,
             move_to_stage_um=self.move_gds_mapper_target,
+            move_to_stage_xyz_um=self.move_gds_mapper_stage_target,
+            get_focus_z_um=self._gds_mapper_focus_z_um,
+            get_microscope_preview=self.agent_microscope_preview,
             set_status=self.status_var.set,
         )
 
@@ -932,6 +961,8 @@ class ProbeApp(tk.Tk):
                 "Eyepiece": f"{self.probe_config.eyepiece:g}x",
                 "XY um/pulse": f"{self.probe_config.um_per_pulse('X'):.6g}",
                 "Z um/pulse": f"{self.probe_config.um_per_pulse('Z'):.6g}",
+                "Motor speed profile": self._motor_speed_profile_label(self.probe_config.active_motor_speed_profile),
+                "Motor speed percent": f"{self.probe_config.motor_speed_percent()}",
             },
         )
 
@@ -1144,7 +1175,7 @@ class ProbeApp(tk.Tk):
         return stage_um, pulses, stage_um < 0
 
     def _cc_axis_param(self, reverse: bool, pulses: int) -> tuple[bool, int, int, int]:
-        speed = self.probe_config.cc_speed_percent if pulses else 0
+        speed = self._motion_speed_percent() if pulses else 0
         return reverse, pulses, speed, self.probe_config.cc_acceleration_units()
 
     def _image_centering_cc_plan(
@@ -1213,11 +1244,20 @@ class ProbeApp(tk.Tk):
         finally:
             self.result_queue.put(("motor_done",))
 
-    def _gds_mapper_current_stage_um(self) -> tuple[float, float]:
+    def _gds_mapper_current_stage_um(self) -> tuple[float, float, float]:
         return (
             self.current_position_values["X"] * self.probe_config.um_per_pulse("X"),
             self.current_position_values["Y"] * self.probe_config.um_per_pulse("Y"),
+            self.current_position_values["Z"] * self.probe_config.um_per_pulse("Z"),
         )
+
+    def _gds_mapper_focus_z_um(self, target_x_um: float, target_y_um: float) -> float | None:
+        x_pulses = int(round(target_x_um / self.probe_config.um_per_pulse("X")))
+        y_pulses = int(round(target_y_um / self.probe_config.um_per_pulse("Y")))
+        z_pulses = self._focusmap_z_target_at_xy(x_pulses, y_pulses)
+        if z_pulses is None:
+            return None
+        return z_pulses * self.probe_config.um_per_pulse("Z")
 
     def _gds_mapper_motion_blocker(self) -> str | None:
         if self.motion_busy or self.keyboard_motion_busy:
@@ -1238,6 +1278,9 @@ class ProbeApp(tk.Tk):
             self.gds_stage_mapper_panel.set_motion_status(message)
 
     def move_gds_mapper_target(self, target_x_um: float, target_y_um: float) -> None:
+        self.move_gds_mapper_stage_target(target_x_um, target_y_um, None)
+
+    def move_gds_mapper_stage_target(self, target_x_um: float, target_y_um: float, target_z_um: float | None = None) -> None:
         blocker = self._gds_mapper_motion_blocker()
         if blocker:
             self._set_gds_mapper_status(blocker)
@@ -1251,12 +1294,18 @@ class ProbeApp(tk.Tk):
             return
 
         try:
-            plan = stage_move_plan_from_um(
-                {"X": self.current_position_values["X"], "Y": self.current_position_values["Y"]},
-                target_x_um,
-                target_y_um,
-                self.probe_config.um_per_pulse("X"),
-                self.probe_config.um_per_pulse("Y"),
+            target_um = {"X": target_x_um, "Y": target_y_um}
+            scales = {
+                "X": self.probe_config.um_per_pulse("X"),
+                "Y": self.probe_config.um_per_pulse("Y"),
+            }
+            if target_z_um is not None:
+                target_um["Z"] = target_z_um
+                scales["Z"] = self.probe_config.um_per_pulse("Z")
+            plan = stage_xyz_move_plan_from_um(
+                {axis: self.current_position_values[axis] for axis in target_um},
+                target_um,
+                scales,
             )
         except ValueError as exc:
             self._set_gds_mapper_status(f"LayoutBond target invalid: {exc}")
@@ -1270,41 +1319,42 @@ class ProbeApp(tk.Tk):
         self.motion_busy = True
         self.clear_position_edits()
         self._show_target_positions(plan.target_pulses)
-        self._set_gds_mapper_status(
-            f"LayoutBond moving to X {target_x_um:.6g} um, Y {target_y_um:.6g} um."
-        )
-        threading.Thread(target=self._gds_mapper_move_worker, args=(target_x_um, target_y_um), daemon=True).start()
+        z_text = "" if target_z_um is None else f", Z {target_z_um:.6g} um"
+        self._set_gds_mapper_status(f"LayoutBond moving to X {target_x_um:.6g} um, Y {target_y_um:.6g} um{z_text}.")
+        threading.Thread(target=self._gds_mapper_move_worker, args=(target_x_um, target_y_um, target_z_um), daemon=True).start()
 
-    def _gds_mapper_move_worker(self, target_x_um: float, target_y_um: float) -> None:
+    def _gds_mapper_move_worker(self, target_x_um: float, target_y_um: float, target_z_um: float | None = None) -> None:
         assert self.serial_client is not None
         try:
             entries = self.serial_client.read_stable_xyz_positions()
-            running_axes = [entry[2].axis_name for entry in entries if entry[2].axis_name in {"X", "Y"} and entry[2].is_running]
+            target_axes = {"X", "Y"} if target_z_um is None else {"X", "Y", "Z"}
+            running_axes = [entry[2].axis_name for entry in entries if entry[2].axis_name in target_axes and entry[2].is_running]
             if running_axes:
                 raise RuntimeError(f"Stage is currently moving on {', '.join(running_axes)}.")
 
-            current_pulses = {
-                "X": self._axis_from_position_entries(entries, Axis.X),
-                "Y": self._axis_from_position_entries(entries, Axis.Y),
-            }
-            plan = stage_move_plan_from_um(
+            current_pulses = {axis: self._axis_from_position_entries(entries, self._controller_axis(axis)) for axis in target_axes}
+            target_um = {"X": target_x_um, "Y": target_y_um}
+            scales = {"X": self.probe_config.um_per_pulse("X"), "Y": self.probe_config.um_per_pulse("Y")}
+            if target_z_um is not None:
+                target_um["Z"] = target_z_um
+                scales["Z"] = self.probe_config.um_per_pulse("Z")
+            plan = stage_xyz_move_plan_from_um(
                 current_pulses,
-                target_x_um,
-                target_y_um,
-                self.probe_config.um_per_pulse("X"),
-                self.probe_config.um_per_pulse("Y"),
+                target_um,
+                scales,
             )
             if not plan.has_motion:
                 self.result_queue.put(("gds_mapper_status", "Stage is already at the selected GDS target."))
                 self.result_queue.put(("read_positions", entries, "gds_mapper"))
                 return
 
-            axis_params = {
-                Axis.X: self._cc_axis_param(plan.deltas["X"] < 0, abs(plan.deltas["X"])),
-                Axis.Y: self._cc_axis_param(plan.deltas["Y"] < 0, abs(plan.deltas["Y"])),
-            }
+            axis_params = {}
+            for axis_name, delta in plan.deltas.items():
+                controller_axis = self._controller_axis(axis_name)
+                if controller_axis is not None:
+                    axis_params[controller_axis] = self._cc_axis_param(delta < 0, abs(delta))
             command, completed = self.serial_client.move_multi_axis_relative_and_wait(axis_params, timeout=self._cc_move_timeout(axis_params))
-            self.result_queue.put(("motor_command", "XY", "cc LayoutBond", command, "gds_mapper"))
+            self.result_queue.put(("motor_command", "".join(sorted(plan.deltas)), "cc LayoutBond", command, "gds_mapper"))
             self.result_queue.put(("cc_done", completed, "gds_mapper"))
             self.result_queue.put(("moving",))
             updated_entries = self.serial_client.read_xyz_positions()
@@ -1373,11 +1423,26 @@ class ProbeApp(tk.Tk):
         zero_bar.grid(row=4, column=0, sticky="ew", padx=8, pady=(10, 8))
         zero_bar.columnconfigure((0, 1, 2), weight=1, uniform="zero_bar")
         ttk.Button(zero_bar, textvariable=self.home_signal_button_var, command=self.toggle_home_signal_polling).grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(zero_bar, text="Set New Zero", style="Accent.TButton", command=self.set_xyz_zero).grid(row=0, column=1, sticky="ew", padx=(4, 4))
+        self.set_xyz_zero_button = ttk.Button(zero_bar, text="Set New Zero", style="Accent.TButton", command=self.set_xyz_zero)
+        self.set_xyz_zero_button.grid(row=0, column=1, sticky="ew", padx=(4, 4))
         ttk.Button(zero_bar, text="Go Zero", command=self.go_xyz_zero).grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
+        speed_bar = ttk.Frame(axes, style="Panel.TFrame")
+        speed_bar.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 8))
+        speed_bar.columnconfigure(1, weight=1)
+        ttk.Label(speed_bar, text="Speed Profile", style="Panel.TLabel").grid(row=0, column=0, sticky="w")
+        speed_combo = ttk.Combobox(
+            speed_bar,
+            textvariable=self.motor_speed_profile_var,
+            values=[MOTOR_SPEED_PROFILE_LABELS[profile] for profile in MOTOR_SPEED_PROFILES],
+            state="readonly",
+            width=16,
+        )
+        speed_combo.grid(row=0, column=1, sticky="ew", padx=(10, 0))
+        speed_combo.bind("<<ComboboxSelected>>", self._on_motor_speed_profile_selected)
+
         focusmap_toggle = ttk.Frame(axes, style="Panel.TFrame")
-        focusmap_toggle.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 10))
+        focusmap_toggle.grid(row=6, column=0, sticky="ew", padx=8, pady=(0, 10))
         focusmap_toggle.columnconfigure(0, weight=1)
         ttk.Label(focusmap_toggle, text="FocusMap Z", style="Panel.TLabel").grid(row=0, column=0, sticky="w")
         ToggleSwitch(
@@ -1563,7 +1628,8 @@ class ProbeApp(tk.Tk):
         ttk.Button(manual, text="Z+", style="Accent.TButton", command=lambda: self.autofocus_manual_z(reverse=False)).grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
         ttk.Button(control_panel, text="Start Auto", style="Accent.TButton", command=self.start_autofocus).grid(row=11, column=0, sticky="ew", pady=(16, 0))
-        ttk.Button(control_panel, text="Set Z=0", command=self.set_autofocus_z_zero).grid(row=12, column=0, sticky="ew", pady=(8, 0))
+        self.set_autofocus_z_zero_button = ttk.Button(control_panel, text="Set Z=0", command=self.set_autofocus_z_zero)
+        self.set_autofocus_z_zero_button.grid(row=12, column=0, sticky="ew", pady=(8, 0))
         ttk.Button(control_panel, text="Stop", style="Danger.TButton", command=self.stop_autofocus).grid(row=13, column=0, sticky="ew", pady=(8, 0))
         ttk.Label(control_panel, textvariable=self.autofocus_status_var, style="Status.TLabel", wraplength=190, padding=10).grid(row=14, column=0, sticky="ew", pady=(16, 0))
 
@@ -1759,7 +1825,8 @@ class ProbeApp(tk.Tk):
         row += 1
         ttk.Button(control_panel, text="Start FocusMap", style="Accent.TButton", command=self.start_af_plane_mapping).grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         row += 1
-        ttk.Button(control_panel, text="Re-Auto Focus", style="Accent.TButton", command=self.reauto_focus_selected_af_plane_point).grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(control_panel, text="Re-Auto Focus", style="Accent.TButton", command=self.reauto_focus_selected_af_plane_point).grid(row=row, column=0, sticky="ew", pady=(8, 0), padx=(0, 5))
+        ttk.Button(control_panel, text="Inject Current Z", command=self.inject_current_z_to_selected_af_plane_point).grid(row=row, column=1, sticky="ew", pady=(8, 0), padx=(5, 0))
         row += 1
         ttk.Button(control_panel, textvariable=self.af_plane_pause_button_var, command=self.toggle_af_plane_pause).grid(row=row, column=0, sticky="ew", pady=(8, 0), padx=(0, 5))
         ttk.Button(control_panel, text="Stop / Cancel", style="Danger.TButton", command=self.stop_af_plane_mapping).grid(row=row, column=1, sticky="ew", pady=(8, 0), padx=(5, 0))
@@ -2025,14 +2092,22 @@ class ProbeApp(tk.Tk):
         self._update_imgstitch_mode_fields()
 
     def _build_config_page(self, parent: ttk.Frame) -> None:
-        parent.columnconfigure(0, weight=1)
-        parent.columnconfigure(1, weight=1)
+        parent.columnconfigure((0, 1, 2), weight=1, uniform="config_columns")
         parent.rowconfigure(0, weight=1)
 
         optical_panel = ttk.Frame(parent, style="Panel.TFrame", padding=16)
-        optical_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        optical_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         optical_panel.columnconfigure(0, weight=1)
         optical_panel.columnconfigure(1, weight=1)
+
+        motion_panel = ttk.Frame(parent, style="Panel.TFrame", padding=16)
+        motion_panel.grid(row=0, column=1, sticky="nsew", padx=(4, 4))
+        motion_panel.columnconfigure(0, weight=1)
+        motion_panel.columnconfigure(1, weight=1)
+
+        system_panel = ttk.Frame(parent, style="Panel.TFrame", padding=16)
+        system_panel.grid(row=0, column=2, sticky="nsew", padx=(8, 0))
+        system_panel.columnconfigure((1, 2), weight=1, uniform="af_thresholds")
 
         ttk.Label(optical_panel, text="OPTICAL CALIBRATION", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Label(optical_panel, text="Objective", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(16, 4))
@@ -2045,10 +2120,10 @@ class ProbeApp(tk.Tk):
         eyepiece_combo.bind("<<ComboboxSelected>>", lambda _event: self.apply_config(save=True))
 
         ttk.Label(optical_panel, text="CALIBRATION", style="Section.TLabel").grid(row=3, column=0, columnspan=2, sticky="w", pady=(24, 6))
-        ttk.Label(optical_panel, textvariable=self.calibration_status_var, style="Value.TLabel", wraplength=560, padding=10).grid(row=4, column=0, columnspan=2, sticky="ew")
+        ttk.Label(optical_panel, textvariable=self.calibration_status_var, style="Value.TLabel", wraplength=360, padding=10).grid(row=4, column=0, columnspan=2, sticky="ew")
         ttk.Button(optical_panel, text="Calibrate Pixels", style="Accent.TButton", command=self.open_pixel_calibration).grid(row=5, column=0, sticky="ew", pady=(14, 0), padx=(0, 8))
         ttk.Button(optical_panel, text="Save Config", command=self.apply_config).grid(row=5, column=1, sticky="ew", pady=(14, 0), padx=(8, 0))
-        ttk.Label(optical_panel, textvariable=self.config_status_var, style="Status.TLabel", wraplength=560, padding=10).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        ttk.Label(optical_panel, textvariable=self.config_status_var, style="Status.TLabel", wraplength=360, padding=10).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(18, 0))
 
         main_control_panel = ttk.Frame(optical_panel, style="Panel.TFrame")
         main_control_panel.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(24, 0))
@@ -2068,61 +2143,72 @@ class ProbeApp(tk.Tk):
             ttk.Label(main_control_panel, text=f"Alt+{axis} levels", style="Muted.TLabel").grid(row=row_index, column=0, sticky="w", pady=2)
             self._jog_step_levels_entry(main_control_panel, self.jog_step_level_vars[axis]).grid(row=row_index, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
 
-        agent_config_panel = ttk.Frame(optical_panel, style="Panel.TFrame")
-        agent_config_panel.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(24, 0))
-        agent_config_panel.columnconfigure(1, weight=1)
-        ttk.Label(agent_config_panel, text="AI AGENT API", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
-        ttk.Label(agent_config_panel, text="Provider", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=2)
-        ttk.Label(agent_config_panel, text="DeepSeek / OpenAI-compatible", style="Value.TLabel", padding=(8, 4)).grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=2)
-        ttk.Label(agent_config_panel, text="API key", style="Muted.TLabel").grid(row=2, column=0, sticky="w", pady=2)
-        tk.Entry(
-            agent_config_panel,
-            textvariable=self.agent_api_key_var,
-            show="*",
-            **self._numeric_widget_options(),
-        ).grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
-        ttk.Label(agent_config_panel, text="Base URL", style="Muted.TLabel").grid(row=3, column=0, sticky="w", pady=2)
-        tk.Entry(
-            agent_config_panel,
-            textvariable=self.agent_base_url_var,
-            **self._numeric_widget_options(),
-        ).grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
-        ttk.Label(agent_config_panel, text="Model", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=2)
-        tk.Entry(
-            agent_config_panel,
-            textvariable=self.agent_model_var,
-            **self._numeric_widget_options(),
-        ).grid(row=4, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
-        ttk.Label(agent_config_panel, text="Timeout (s)", style="Muted.TLabel").grid(row=5, column=0, sticky="w", pady=2)
-        self._numeric_entry(agent_config_panel, self.agent_timeout_var, kind="float", minimum=1, maximum=300).grid(row=5, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
-        ttk.Button(agent_config_panel, text="Save Agent API", style="Accent.TButton", command=self.apply_config).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(10, 0))
-
-        motor_panel = ttk.Frame(parent, style="Panel.TFrame", padding=16)
-        motor_panel.grid(row=0, column=1, sticky="nsew")
-        motor_panel.columnconfigure(0, weight=1)
-        motor_panel.columnconfigure(1, weight=1)
-        ttk.Label(motor_panel, text="MOTOR MAPPING", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(motion_panel, text="MOTOR MAPPING", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
 
         fields = (
             ("Microstep", self.microstep_var, "int", 1, 1_000_000),
             ("Base angle (deg)", self.base_angle_var, "float", 0.000001, 360),
             ("X/Y lead (mm)", self.lead_xy_var, "float", 0.000001, 1_000_000),
             ("Z lead (mm)", self.lead_z_var, "float", 0.000001, 1_000_000),
-            ("CC speed (%)", self.cc_speed_percent_var, "int", 0, 100),
             ("CC accel/decel (s)", self.cc_accel_time_var, "float", 0, 2.55),
         )
         for index, (label, variable, kind, minimum, maximum) in enumerate(fields, start=1):
             col = (index - 1) % 2
             row = 1 + ((index - 1) // 2) * 2
-            ttk.Label(motor_panel, text=label, style="Muted.TLabel").grid(row=row, column=col, sticky="w", pady=(16, 4), padx=(0 if col == 0 else 8, 8 if col == 0 else 0))
-            entry = self._numeric_entry(motor_panel, variable, kind=kind, minimum=minimum, maximum=maximum)
+            ttk.Label(motion_panel, text=label, style="Muted.TLabel").grid(row=row, column=col, sticky="w", pady=(16, 4), padx=(0 if col == 0 else 8, 8 if col == 0 else 0))
+            entry = self._numeric_entry(motion_panel, variable, kind=kind, minimum=minimum, maximum=maximum)
             entry.grid(row=row + 1, column=col, sticky="ew", padx=(0 if col == 0 else 8, 8 if col == 0 else 0), ipady=6)
 
-        ttk.Label(motor_panel, text="CONVERSION", style="Section.TLabel").grid(row=7, column=0, columnspan=2, sticky="w", pady=(24, 6))
-        ttk.Label(motor_panel, textvariable=self.motor_conversion_var, style="Value.TLabel", wraplength=560, padding=10).grid(row=8, column=0, columnspan=2, sticky="ew")
+        speed_panel = ttk.Frame(motion_panel, style="Panel.TFrame")
+        speed_panel.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(22, 0))
+        speed_panel.columnconfigure(1, weight=1)
+        ttk.Label(speed_panel, text="MOTOR SPEED", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        ttk.Label(speed_panel, text="Speed profile", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=2)
+        speed_profile_combo = ttk.Combobox(
+            speed_panel,
+            values=[MOTOR_SPEED_PROFILE_LABELS[profile] for profile in MOTOR_SPEED_PROFILES],
+            textvariable=self.motor_speed_profile_var,
+            state="readonly",
+        )
+        speed_profile_combo.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=2)
+        speed_profile_combo.bind("<<ComboboxSelected>>", lambda _event: self.apply_config(save=True))
+        for row_index, (label, variable) in enumerate(
+            (
+                ("Fast speed (%)", self.cc_speed_percent_var),
+                ("Fine speed (%)", self.fine_speed_percent_var),
+                ("Safe speed (%)", self.safe_speed_percent_var),
+            ),
+            start=2,
+        ):
+            ttk.Label(speed_panel, text=label, style="Muted.TLabel").grid(row=row_index, column=0, sticky="w", pady=2)
+            self._numeric_entry(speed_panel, variable, minimum=0, maximum=100, width=7).grid(row=row_index, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
 
-        autofocus_panel = ttk.Frame(motor_panel, style="Panel.TFrame")
-        autofocus_panel.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(24, 0))
+        d5_panel = ttk.Frame(motion_panel, style="Panel.TFrame")
+        d5_panel.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(22, 0))
+        d5_panel.columnconfigure((1, 2, 3), weight=1, uniform="d5_params")
+        ttk.Label(d5_panel, text="D5 CONTROLLER READBACK", style="Section.TLabel").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        ttk.Label(d5_panel, text="Axis", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=2)
+        for column, label in enumerate(("Min", "Work", "Accel"), start=1):
+            ttk.Label(d5_panel, text=label, style="Muted.TLabel").grid(row=1, column=column, sticky="w", padx=(8 if column > 1 else 0, 0), pady=2)
+        for row_index, axis in enumerate(JOG_STEP_AXES, start=2):
+            ttk.Label(d5_panel, text=axis, style="Panel.TLabel").grid(row=row_index, column=0, sticky="w", pady=2)
+            for column, field_name in enumerate(("minimum_speed", "work_speed", "acceleration"), start=1):
+                self._numeric_entry(
+                    d5_panel,
+                    self.controller_motion_parameter_vars[axis][field_name],
+                    minimum=0,
+                    maximum=65535,
+                    width=5,
+                ).grid(row=row_index, column=column, sticky="ew", padx=(8 if column > 1 else 0, 0), pady=2, ipady=5)
+        ttk.Button(d5_panel, text="Read D5 X/Y/Z", command=self.read_controller_motion_parameters).grid(row=5, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        ttk.Label(d5_panel, textvariable=self.controller_motion_status_var, style="Status.TLabel", wraplength=360, padding=8).grid(row=6, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+
+        ttk.Label(motion_panel, text="CONVERSION", style="Section.TLabel").grid(row=9, column=0, columnspan=2, sticky="w", pady=(24, 6))
+        ttk.Label(motion_panel, textvariable=self.motor_conversion_var, style="Value.TLabel", wraplength=360, padding=10).grid(row=10, column=0, columnspan=2, sticky="ew")
+        ttk.Button(motion_panel, text="Apply Mapping", style="Accent.TButton", command=self.apply_config).grid(row=11, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+
+        autofocus_panel = ttk.Frame(system_panel, style="Panel.TFrame")
+        autofocus_panel.grid(row=0, column=0, columnspan=3, sticky="ew")
         autofocus_panel.columnconfigure((1, 2), weight=1, uniform="af_thresholds")
         ttk.Label(autofocus_panel, text="AUTOFOCUS CONFIG", style="Section.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
         ttk.Label(autofocus_panel, text="Settle after Z move (ms)", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=2)
@@ -2151,7 +2237,48 @@ class ProbeApp(tk.Tk):
             ):
                 self._numeric_entry(autofocus_panel, variable, kind="float", minimum=0, maximum=1_000_000_000).grid(row=row_index, column=column, sticky="ew", padx=(8, 0), pady=2, ipady=5)
 
-        ttk.Button(motor_panel, text="Apply Mapping", style="Accent.TButton", command=self.apply_config).grid(row=10, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        agent_config_panel = ttk.Frame(system_panel, style="Panel.TFrame")
+        agent_config_panel.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(24, 0))
+        agent_config_panel.columnconfigure(1, weight=1)
+        ttk.Label(agent_config_panel, text="AI AGENT API", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        ttk.Label(agent_config_panel, text="Provider", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Label(agent_config_panel, text="DeepSeek / OpenAI-compatible", style="Value.TLabel", padding=(8, 4)).grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=2)
+        ttk.Label(agent_config_panel, text="API key", style="Muted.TLabel").grid(row=2, column=0, sticky="w", pady=2)
+        tk.Entry(
+            agent_config_panel,
+            textvariable=self.agent_api_key_var,
+            show="*",
+            **self._numeric_widget_options(),
+        ).grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+        ttk.Label(agent_config_panel, text="Base URL", style="Muted.TLabel").grid(row=3, column=0, sticky="w", pady=2)
+        tk.Entry(
+            agent_config_panel,
+            textvariable=self.agent_base_url_var,
+            **self._numeric_widget_options(),
+        ).grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+        ttk.Label(agent_config_panel, text="Model", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=2)
+        tk.Entry(
+            agent_config_panel,
+            textvariable=self.agent_model_var,
+            **self._numeric_widget_options(),
+        ).grid(row=4, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+        ttk.Label(agent_config_panel, text="Timeout (s)", style="Muted.TLabel").grid(row=5, column=0, sticky="w", pady=2)
+        self._numeric_entry(agent_config_panel, self.agent_timeout_var, kind="float", minimum=1, maximum=300).grid(row=5, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+        ttk.Button(agent_config_panel, text="Save Agent API", style="Accent.TButton", command=self.apply_config).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+
+        admin_panel = ttk.Frame(system_panel, style="Panel.TFrame")
+        admin_panel.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(24, 0))
+        admin_panel.columnconfigure(1, weight=1)
+        ttk.Label(admin_panel, text="ADMIN MODE", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        ttk.Label(admin_panel, text="Token", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=2)
+        tk.Entry(
+            admin_panel,
+            textvariable=self.admin_token_var,
+            show="*",
+            **self._numeric_widget_options(),
+        ).grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+        ttk.Button(admin_panel, text="Enable Admin", style="Accent.TButton", command=self.enable_admin_mode).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Label(admin_panel, textvariable=self.admin_mode_status_var, style="Status.TLabel", wraplength=360, padding=10).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
 
     def _update_comm_note(self) -> None:
         if self.comm_input_mode_var.get() == "Hex":
@@ -2188,6 +2315,8 @@ class ProbeApp(tk.Tk):
 
         if read_length < 0:
             self.status_var.set("Read bytes must be zero or positive.")
+            return "break"
+        if payload_contains_clear_position_command(payload) and not self._require_admin_mode("Manual clear-position command"):
             return "break"
 
         self.status_var.set("Sending manual command...")
@@ -2294,6 +2423,108 @@ class ProbeApp(tk.Tk):
             if label == scheme_label or label == scheme:
                 return scheme
         return KEYBOARD_MOTION_SCHEME_ARROW_PAGE
+
+    def _expected_admin_tokens(self) -> tuple[str, ...]:
+        tokens: list[str] = []
+        for variable_name in (ADMIN_TOKEN_ENV, WEB_ACCESS_TOKEN_ENV):
+            token = os.environ.get(variable_name, "").strip()
+            if token:
+                tokens.append(token)
+        return tuple(tokens)
+
+    def enable_admin_mode(self) -> None:
+        candidate = self.admin_token_var.get().strip()
+        expected_tokens = self._expected_admin_tokens()
+        if not expected_tokens:
+            self.admin_mode_enabled = False
+            self.admin_mode_status_var.set(f"Admin token missing. Set {ADMIN_TOKEN_ENV} or {WEB_ACCESS_TOKEN_ENV}.")
+            self.status_var.set("Admin mode unavailable: no token configured.")
+            self._update_admin_mode_controls()
+            return
+        if not candidate or not any(hmac.compare_digest(candidate, expected) for expected in expected_tokens):
+            self.admin_mode_enabled = False
+            self.admin_mode_status_var.set("Admin mode locked: invalid token.")
+            self.status_var.set("Admin mode token rejected.")
+            self._update_admin_mode_controls()
+            return
+
+        self.admin_mode_enabled = True
+        self.admin_token_var.set("")
+        self.admin_mode_status_var.set("Admin mode enabled for this session. Set-zero commands are unlocked.")
+        self.status_var.set("Admin mode enabled.")
+        self._update_admin_mode_controls()
+
+    def _update_admin_mode_controls(self) -> None:
+        state = "normal" if self.admin_mode_enabled else "disabled"
+        for button_name in ("set_xyz_zero_button", "set_autofocus_z_zero_button"):
+            button = getattr(self, button_name, None)
+            if button is not None:
+                button.configure(state=state)
+        if self.serial_client is not None:
+            self.serial_client.set_admin_mode_enabled(self.admin_mode_enabled)
+        if not self.admin_mode_enabled and self.admin_mode_status_var.get() == "Admin mode locked":
+            self.admin_mode_status_var.set("Admin mode locked. Set-zero commands are disabled.")
+
+    def _require_admin_mode(self, action: str) -> bool:
+        if self.admin_mode_enabled:
+            return True
+        message = f"{action} requires Config admin mode."
+        self.status_var.set(message)
+        logger.warning(message)
+        self._update_admin_mode_controls()
+        return False
+
+    @staticmethod
+    def _motor_speed_profile_label(profile: str) -> str:
+        return MOTOR_SPEED_PROFILE_LABELS.get(profile, MOTOR_SPEED_PROFILE_LABELS[MOTOR_SPEED_PROFILE_FAST])
+
+    @staticmethod
+    def _motor_speed_profile_from_label(label: str) -> str:
+        normalized = label.strip().lower()
+        for profile, profile_label in MOTOR_SPEED_PROFILE_LABELS.items():
+            if normalized == profile_label.lower() or normalized == profile:
+                return profile
+        return MOTOR_SPEED_PROFILE_FAST
+
+    def _motion_speed_percent(self, profile: str | None = None) -> int:
+        return self.probe_config.motor_speed_percent(profile)
+
+    def _on_motor_speed_profile_selected(self, _event: tk.Event | None = None) -> None:
+        profile = self._motor_speed_profile_from_label(self.motor_speed_profile_var.get())
+        self.probe_config.active_motor_speed_profile = profile
+        self.motor_speed_profile_var.set(self._motor_speed_profile_label(profile))
+        self._update_config_display()
+        try:
+            save_probe_config(self.probe_config, self.config_path)
+        except Exception as exc:
+            self.status_var.set(f"Motor speed profile save failed: {exc}")
+            self.config_status_var.set(f"Save failed: {exc}")
+            logger.error("Failed to save motor speed profile: %s", exc)
+            return
+        label = self._motor_speed_profile_label(profile)
+        self.status_var.set(f"Motor speed profile: {label} ({self.probe_config.motor_speed_percent()}%).")
+        self.config_status_var.set(f"Saved {self.config_path.name}")
+
+    def read_controller_motion_parameters(self) -> None:
+        self._start_controller_motion_parameters_read("manual")
+
+    def _start_controller_motion_parameters_read(self, source: str) -> None:
+        if not self.serial_client:
+            self.connect_serial()
+        if not self.serial_client:
+            self.controller_motion_status_var.set("D5 read skipped: serial is not connected.")
+            return
+
+        self.controller_motion_status_var.set("Reading D5 controller parameters...")
+        threading.Thread(target=self._read_controller_motion_parameters_worker, args=(source,), daemon=True).start()
+
+    def _read_controller_motion_parameters_worker(self, source: str) -> None:
+        assert self.serial_client is not None
+        try:
+            entries = self.serial_client.read_xyz_motion_parameters()
+            self.result_queue.put(("controller_motion_parameters", entries, source))
+        except Exception as exc:
+            self.result_queue.put(("controller_motion_parameters_error", exc, source))
 
     def _keyboard_event_key(self, event: tk.Event) -> str:
         keysym = str(getattr(event, "keysym", ""))
@@ -2578,6 +2809,16 @@ class ProbeApp(tk.Tk):
                 lead_z_mm=float(self.lead_z_var.get()),
                 base_angle_deg=float(self.base_angle_var.get()),
                 cc_speed_percent=int(self.cc_speed_percent_var.get()),
+                fine_speed_percent=int(self.fine_speed_percent_var.get()),
+                safe_speed_percent=int(self.safe_speed_percent_var.get()),
+                active_motor_speed_profile=self._motor_speed_profile_from_label(self.motor_speed_profile_var.get()),
+                controller_motion_parameters={
+                    axis: {
+                        field_name: int(self.controller_motion_parameter_vars[axis][field_name].get())
+                        for field_name in ("minimum_speed", "work_speed", "acceleration")
+                    }
+                    for axis in JOG_STEP_AXES
+                },
                 cc_accel_time_s=float(self.cc_accel_time_var.get()),
                 autofocus_settle_ms=int(self.autofocus_settle_ms_var.get()),
                 autofocus_sample_count=int(self.autofocus_sample_count_var.get()),
@@ -2634,6 +2875,12 @@ class ProbeApp(tk.Tk):
         self.lead_z_var.set(f"{self.probe_config.lead_z_mm:g}")
         self.base_angle_var.set(f"{self.probe_config.base_angle_deg:g}")
         self.cc_speed_percent_var.set(str(self.probe_config.cc_speed_percent))
+        self.fine_speed_percent_var.set(str(self.probe_config.fine_speed_percent))
+        self.safe_speed_percent_var.set(str(self.probe_config.safe_speed_percent))
+        self.motor_speed_profile_var.set(self._motor_speed_profile_label(self.probe_config.active_motor_speed_profile))
+        for axis in JOG_STEP_AXES:
+            for field_name in ("minimum_speed", "work_speed", "acceleration"):
+                self.controller_motion_parameter_vars[axis][field_name].set(str(self.probe_config.controller_motion_parameters[axis][field_name]))
         self.cc_accel_time_var.set(f"{self.probe_config.cc_accel_time_s:g}")
         self.autofocus_settle_ms_var.set(str(self.probe_config.autofocus_settle_ms))
         self.autofocus_sample_count_var.set(str(self.probe_config.autofocus_sample_count))
@@ -2679,7 +2926,19 @@ class ProbeApp(tk.Tk):
             f"X: {self.probe_config.um_per_pulse('X'):.6g} um/pulse, {self.probe_config.pulses_per_um('X'):.6g} pulse/um",
             f"Y: {self.probe_config.um_per_pulse('Y'):.6g} um/pulse, {self.probe_config.pulses_per_um('Y'):.6g} pulse/um",
             f"Z: {self.probe_config.um_per_pulse('Z'):.6g} um/pulse, {self.probe_config.pulses_per_um('Z'):.6g} pulse/um",
-            f"CC: speed {self.probe_config.cc_speed_percent}%, accel/decel {self.probe_config.cc_accel_time_s:.3g}s ({self.probe_config.cc_acceleration_units()} units)",
+            (
+                f"Motor speed: {self._motor_speed_profile_label(self.probe_config.active_motor_speed_profile)} "
+                f"{self.probe_config.motor_speed_percent()}% "
+                f"(Fast {self.probe_config.cc_speed_percent}%, Fine {self.probe_config.fine_speed_percent}%, Safe {self.probe_config.safe_speed_percent}%)"
+            ),
+            (
+                "D5 controller: "
+                + "; ".join(
+                    f"{axis} min {params['minimum_speed']}, work {params['work_speed']}, accel {params['acceleration']}"
+                    for axis, params in self.probe_config.controller_motion_parameters.items()
+                )
+            ),
+            f"CC accel/decel: {self.probe_config.cc_accel_time_s:.3g}s ({self.probe_config.cc_acceleration_units()} units)",
             f"AF settle: {self.probe_config.autofocus_settle_ms} ms",
             f"AF integration: {self.probe_config.autofocus_sample_count} frame(s)",
             f"AF peak model: {self._autofocus_peak_model_label(self.probe_config.autofocus_peak_model)}",
@@ -3077,6 +3336,8 @@ class ProbeApp(tk.Tk):
         threading.Thread(target=self._move_axis_worker, args=("Z", Axis.Z, reverse, pulses, "autofocus manual", "Relative", {"Z": target}), daemon=True).start()
 
     def set_autofocus_z_zero(self) -> None:
+        if not self._require_admin_mode("Set Z=0"):
+            return
         if self.motion_busy:
             self.autofocus_status_var.set("Motion busy")
             self.status_var.set("Motion is busy; Set Z=0 skipped.")
@@ -3096,6 +3357,8 @@ class ProbeApp(tk.Tk):
     def _set_autofocus_z_zero_worker(self) -> None:
         assert self.serial_client is not None
         try:
+            if not self.admin_mode_enabled:
+                raise PermissionError("Set Z=0 requires Config admin mode.")
             command = self.serial_client.clear_position(Axis.Z)
             self.result_queue.put(("zero_z_command", command))
             time.sleep(0.1)
@@ -3108,6 +3371,8 @@ class ProbeApp(tk.Tk):
             self.result_queue.put(("motor_done",))
 
     def set_xyz_zero(self) -> None:
+        if not self._require_admin_mode("Set New Zero"):
+            return
         if self.motion_busy:
             self.status_var.set("Motion is busy; Set New Zero skipped.")
             logger.warning("Set New Zero skipped because motion is busy.")
@@ -3125,6 +3390,8 @@ class ProbeApp(tk.Tk):
     def _set_xyz_zero_worker(self) -> None:
         assert self.serial_client is not None
         try:
+            if not self.admin_mode_enabled:
+                raise PermissionError("Set New Zero requires Config admin mode.")
             command = self.serial_client.clear_position(Axis.ALL)
             self.result_queue.put(("zero_xyz_command", command))
             time.sleep(0.1)
@@ -3796,12 +4063,13 @@ class ProbeApp(tk.Tk):
         reached_hex = ""
         reached_wait_seconds: float | None = None
         if delta:
-            command = self.serial_client.move_relative(axis=Axis.Z, reverse=delta < 0, pulses=abs(delta), speed_percent=100)
+            speed_percent = self._motion_speed_percent()
+            command = self.serial_client.move_relative(axis=Axis.Z, reverse=delta < 0, pulses=abs(delta), speed_percent=speed_percent)
             command_hex = hex_bytes(command)
             self.result_queue.put(("motor_command", "Z", "autofocus", command, source))
             self.result_queue.put(("moving",))
             reached_start = time.monotonic()
-            reached = self.serial_client.wait_axis_reached(Axis.Z, timeout=max(5.0, abs(delta) / 100.0))
+            reached = self.serial_client.wait_axis_reached(Axis.Z, timeout=self._axis_move_timeout(abs(delta), speed_percent))
             reached_wait_seconds = time.monotonic() - reached_start
             reached_hex = hex_bytes(reached)
             logger.info("AutoFocus Z reached feedback: %s", colorize_hex_frame(reached_hex, "RX"))
@@ -4169,6 +4437,28 @@ class ProbeApp(tk.Tk):
         self._draw_focusmap_all()
         self.af_plane_status_var.set(f"Re-Auto Focus point {point.index}.")
         threading.Thread(target=self._reauto_focus_af_plane_point_worker, args=(point, dict(record), af_params, dry_run), daemon=True).start()
+
+    def inject_current_z_to_selected_af_plane_point(self) -> None:
+        if self.af_plane_running or self.motion_busy or self.autofocus_running or self.imgstitch_running:
+            self.af_plane_status_var.set("Another motion workflow is running.")
+            return
+        if self.af_plane_selected_index is None:
+            self.af_plane_status_var.set("Select a mesh point before injecting current Z.")
+            return
+        record = self._af_plane_record_by_index(self.af_plane_selected_index)
+        if record is None:
+            self.af_plane_status_var.set("Selected FocusMap point is no longer available.")
+            return
+        current_z = int(self.current_position_values["Z"])
+        record["measured_z"] = current_z
+        record["status"] = "success"
+        record["message"] = "Injected current Z"
+        record["retry_count"] = record.get("retry_count", 0)
+        record.setdefault("fit_enabled", True)
+        self._refit_af_plane_from_current_results(
+            final=True,
+            status_prefix=f"Point {self.af_plane_selected_index} updated from current Z={current_z}",
+        )
 
     def _reauto_focus_af_plane_point_worker(
         self,
@@ -5081,14 +5371,15 @@ class ProbeApp(tk.Tk):
                 return
 
             delta = target_z - current_z
+            speed_percent = self._motion_speed_percent()
             if target_z >= 0:
-                command = self.serial_client.move_absolute(axis=Axis.Z, target_position=target_z, speed_percent=100)
+                command = self.serial_client.move_absolute(axis=Axis.Z, target_position=target_z, speed_percent=speed_percent)
                 action = "focusmap absolute"
             else:
-                command = self.serial_client.move_relative(axis=Axis.Z, reverse=delta < 0, pulses=abs(delta), speed_percent=100)
+                command = self.serial_client.move_relative(axis=Axis.Z, reverse=delta < 0, pulses=abs(delta), speed_percent=speed_percent)
                 action = "focusmap relative"
             self.result_queue.put(("motor_command", "Z", action, command, "focusmap"))
-            reached = self.serial_client.wait_axis_reached(Axis.Z, timeout=max(5.0, abs(target_z - current_z) / 100.0))
+            reached = self.serial_client.wait_axis_reached(Axis.Z, timeout=self._axis_move_timeout(abs(delta), speed_percent))
             self.result_queue.put(("axis_done", "Z", reached, "focusmap"))
             entries = self.serial_client.read_stable_xyz_positions()
             self.result_queue.put(("read_positions", entries, "focusmap", {"Z": target_z}))
@@ -5777,12 +6068,13 @@ class ProbeApp(tk.Tk):
         current_x = self._axis_from_position_entries(entries, Axis.X)
         current_y = self._axis_from_position_entries(entries, Axis.Y)
         current_z = self._axis_from_position_entries(entries, Axis.Z)
+        speed_percent = self._motion_speed_percent()
         for axis, target, current in ((Axis.X, x_value, current_x), (Axis.Y, y_value, current_y), (Axis.Z, z_value, current_z)):
             delta = target - current
             if not delta:
                 continue
-            self.serial_client.move_relative(axis=axis, reverse=delta < 0, pulses=abs(delta), speed_percent=100)
-            self.serial_client.wait_axis_reached(axis, timeout=max(5.0, abs(delta) / 100.0))
+            self.serial_client.move_relative(axis=axis, reverse=delta < 0, pulses=abs(delta), speed_percent=speed_percent)
+            self.serial_client.wait_axis_reached(axis, timeout=self._axis_move_timeout(abs(delta), speed_percent))
         entries = self.serial_client.read_stable_xyz_positions()
         self.result_queue.put(("read_positions", entries, source))
         return entries
@@ -6338,14 +6630,15 @@ class ProbeApp(tk.Tk):
     def _move_axis_worker(self, axis: str, controller_axis: Axis, reverse: bool, pulses: int, source: str, mode: str, expected_targets: dict[str, int]) -> None:
         assert self.serial_client is not None
         try:
+            speed_percent = self._motion_speed_percent()
             if mode == "Absolute":
-                command = self.serial_client.move_absolute(axis=controller_axis, target_position=pulses, speed_percent=100)
+                command = self.serial_client.move_absolute(axis=controller_axis, target_position=pulses, speed_percent=speed_percent)
                 action = "absolute"
             else:
-                command = self.serial_client.move_relative(axis=controller_axis, reverse=reverse, pulses=pulses, speed_percent=100)
+                command = self.serial_client.move_relative(axis=controller_axis, reverse=reverse, pulses=pulses, speed_percent=speed_percent)
                 action = "reverse" if reverse else "forward"
             self.result_queue.put(("motor_command", axis, action, command, source))
-            reached = self.serial_client.wait_axis_reached(controller_axis, timeout=max(5.0, pulses / 100.0))
+            reached = self.serial_client.wait_axis_reached(controller_axis, timeout=self._axis_move_timeout(pulses, speed_percent))
             self.result_queue.put(("axis_done", axis, reached, source))
             self.result_queue.put(("moving",))
             entries = self.serial_client.read_xyz_positions()
@@ -6371,6 +6664,7 @@ class ProbeApp(tk.Tk):
     def _move_edited_positions_worker(self, axes: tuple[str, ...], modes: dict[str, str], values: dict[str, int], expected_targets: dict[str, int]) -> None:
         assert self.serial_client is not None
         try:
+            speed_percent = self._motion_speed_percent()
             if len(axes) == 1:
                 axis_name = axes[0]
                 controller_axis = self._controller_axis(axis_name)
@@ -6378,16 +6672,16 @@ class ProbeApp(tk.Tk):
                     return
                 value = values[axis_name]
                 if modes[axis_name] == "Absolute":
-                    command = self.serial_client.move_absolute(axis=controller_axis, target_position=value, speed_percent=100)
+                    command = self.serial_client.move_absolute(axis=controller_axis, target_position=value, speed_percent=speed_percent)
                     action = "absolute"
                 else:
                     if value == 0:
                         raise ValueError("Relative move value must be non-zero.")
-                    command = self.serial_client.move_relative(axis=controller_axis, reverse=value < 0, pulses=abs(value), speed_percent=100)
+                    command = self.serial_client.move_relative(axis=controller_axis, reverse=value < 0, pulses=abs(value), speed_percent=speed_percent)
                     action = "relative"
                 self.result_queue.put(("motor_command", axis_name, action, command, "button"))
                 wait_pulses = abs(value) if modes[axis_name] == "Relative" else abs(value - self.current_position_values[axis_name])
-                reached = self.serial_client.wait_axis_reached(controller_axis, timeout=max(5.0, wait_pulses / 100.0))
+                reached = self.serial_client.wait_axis_reached(controller_axis, timeout=self._axis_move_timeout(wait_pulses, speed_percent))
                 self.result_queue.put(("axis_done", axis_name, reached, "button"))
             else:
                 axis_params: dict[Axis, tuple[bool, int, int, int]] = {}
@@ -6434,9 +6728,16 @@ class ProbeApp(tk.Tk):
             self.result_queue.put(("motor_done",))
 
     @staticmethod
+    def _axis_move_timeout(pulses: int, speed_percent: int) -> float:
+        return max(5.0, abs(pulses) / max(1, speed_percent))
+
+    @staticmethod
     def _cc_move_timeout(axis_params: dict[Axis, tuple[bool, int, int, int]]) -> float:
-        max_pulses = max((pulses for _reverse, pulses, _speed, _acceleration in axis_params.values()), default=0)
-        return max(5.0, max_pulses / 100.0)
+        max_seconds = max(
+            (pulses / max(1, speed) for _reverse, pulses, speed, _acceleration in axis_params.values()),
+            default=0.0,
+        )
+        return max(5.0, max_seconds)
 
     def _emergency_stop_worker(self) -> None:
         assert self.serial_client is not None
@@ -6488,6 +6789,7 @@ class ProbeApp(tk.Tk):
 
         try:
             self.serial_client = ControllerSerialClient(port)
+            self.serial_client.set_admin_mode_enabled(self.admin_mode_enabled)
             self.serial_client.open()
         except Exception as exc:
             self.status_var.set(f"Serial connection failed: {exc}")
@@ -6558,6 +6860,9 @@ class ProbeApp(tk.Tk):
                     logger.info("Communication test passed. %s %s", colorize_hex_frame(result.request_hex, "TX"), colorize_hex_frame(result.response_hex, "RX"))
                     self.clear_position_edits()
                     self.status_var.set("Communication test passed. Reading current X/Y/Z positions...")
+                    if not self.controller_motion_startup_read_done:
+                        self.controller_motion_startup_read_done = True
+                        self._start_controller_motion_parameters_read("startup")
                     threading.Thread(target=self._read_current_position_worker, args=("comm_test", False), daemon=True).start()
                 else:
                     logger.warning("Communication test did not pass. %s %s Detail=%s", colorize_hex_frame(result.request_hex, "TX"), colorize_hex_frame(result.response_hex or "-", "RX"), result.message)
@@ -6696,6 +7001,52 @@ class ProbeApp(tk.Tk):
             self.home_signal_button_var.set("Home Signals")
             self.status_var.set(f"Home signal polling stopped: {exc}")
             logger.error("Home signal polling stopped: %s", exc)
+            return
+
+        if event_type == "controller_motion_parameters":
+            _, entries, source = event
+            summary_parts: list[str] = []
+            last_command_hex = "-"
+            last_response_hex = "-"
+            for command, response, parameters in entries:
+                command_hex = hex_bytes(command)
+                response_hex = hex_bytes(response)
+                last_command_hex = command_hex
+                last_response_hex = response_hex
+                self._append_hex_history("TX", command_hex)
+                self._append_hex_history("RX", response_hex)
+                axis_name = parameters.axis.name
+                self.probe_config.controller_motion_parameters[axis_name] = {
+                    "minimum_speed": int(parameters.minimum_speed),
+                    "work_speed": int(parameters.work_speed),
+                    "acceleration": int(parameters.acceleration),
+                }
+                summary_parts.append(
+                    f"{axis_name} min {parameters.minimum_speed}, work {parameters.work_speed}, accel {parameters.acceleration}"
+                )
+            self.tx_var.set(last_command_hex)
+            self.rx_var.set(last_response_hex)
+            self._sync_config_vars_from_config()
+            self._update_config_display()
+            message = "D5 readback: " + "; ".join(summary_parts) + "."
+            self.controller_motion_status_var.set(message)
+            self.status_var.set("Controller D5 parameters updated." if source == "startup" else message)
+            try:
+                save_probe_config(self.probe_config, self.config_path)
+                self.config_status_var.set(f"Saved {self.config_path.name}")
+            except Exception as exc:
+                self.config_status_var.set(f"Save failed: {exc}")
+                logger.error("Failed to save D5 controller parameters: %s", exc)
+            logger.info("Controller D5 parameters updated. %s", message)
+            return
+
+        if event_type == "controller_motion_parameters_error":
+            _, exc, source = event
+            message = f"D5 read failed: {exc}"
+            self.controller_motion_status_var.set(message)
+            if source != "startup":
+                self.status_var.set(message)
+            logger.error("Controller D5 parameter read failed: %s", exc)
             return
 
         if event_type == "moving":

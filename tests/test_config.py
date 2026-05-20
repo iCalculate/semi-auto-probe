@@ -9,6 +9,8 @@ from semi_auto_probe.config import (
     DEFAULT_CONFIG_FILENAME,
     KEYBOARD_MOTION_SCHEME_ARROW_PAGE,
     KEYBOARD_MOTION_SCHEME_WASD_QE,
+    MOTOR_SPEED_PROFILE_FAST,
+    MOTOR_SPEED_PROFILE_SAFE,
     ProbeConfig,
     calibration_distance_px,
     calibration_key,
@@ -32,6 +34,18 @@ class ProbeConfigTest(unittest.TestCase):
         self.assertEqual(pulses_from_um(1000.0, config, "Y"), 1000)
         self.assertEqual(pulses_from_um(1000.0, config, "Z"), 2000)
         self.assertEqual(config.cc_speed_percent, 100)
+        self.assertEqual(config.fine_speed_percent, 40)
+        self.assertEqual(config.safe_speed_percent, 15)
+        self.assertEqual(config.active_motor_speed_profile, MOTOR_SPEED_PROFILE_FAST)
+        self.assertEqual(config.motor_speed_percent(), 100)
+        self.assertEqual(
+            config.controller_motion_parameters,
+            {
+                "X": {"minimum_speed": 0, "work_speed": 0, "acceleration": 0},
+                "Y": {"minimum_speed": 0, "work_speed": 0, "acceleration": 0},
+                "Z": {"minimum_speed": 0, "work_speed": 0, "acceleration": 0},
+            },
+        )
         self.assertAlmostEqual(config.cc_accel_time_s, 0.1)
         self.assertEqual(config.cc_acceleration_units(), 10)
 
@@ -62,7 +76,23 @@ class ProbeConfigTest(unittest.TestCase):
     def test_json_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / DEFAULT_CONFIG_FILENAME
-            config = ProbeConfig(objective=5, eyepiece=2.5, microstep=4, lead_xy_mm=2.0, lead_z_mm=1.0, cc_speed_percent=80, cc_accel_time_s=0.2)
+            config = ProbeConfig(
+                objective=5,
+                eyepiece=2.5,
+                microstep=4,
+                lead_xy_mm=2.0,
+                lead_z_mm=1.0,
+                cc_speed_percent=80,
+                fine_speed_percent=35,
+                safe_speed_percent=12,
+                active_motor_speed_profile=MOTOR_SPEED_PROFILE_SAFE,
+                controller_motion_parameters={
+                    "X": {"minimum_speed": 5, "work_speed": 100, "acceleration": 10},
+                    "Y": {"minimum_speed": 6, "work_speed": 90, "acceleration": 11},
+                    "Z": {"minimum_speed": 7, "work_speed": 80, "acceleration": 12},
+                },
+                cc_accel_time_s=0.2,
+            )
             config.set_calibration(5, 2.5, 1.25)
 
             save_probe_config(config, path)
@@ -74,6 +104,13 @@ class ProbeConfigTest(unittest.TestCase):
             self.assertEqual(loaded.lead_xy_mm, 2.0)
             self.assertEqual(loaded.lead_z_mm, 1.0)
             self.assertEqual(loaded.cc_speed_percent, 80)
+            self.assertEqual(loaded.fine_speed_percent, 35)
+            self.assertEqual(loaded.safe_speed_percent, 12)
+            self.assertEqual(loaded.active_motor_speed_profile, MOTOR_SPEED_PROFILE_SAFE)
+            self.assertEqual(loaded.motor_speed_percent(), 12)
+            self.assertEqual(loaded.controller_motion_parameters["X"], {"minimum_speed": 5, "work_speed": 100, "acceleration": 10})
+            self.assertEqual(loaded.controller_motion_parameters["Y"], {"minimum_speed": 6, "work_speed": 90, "acceleration": 11})
+            self.assertEqual(loaded.controller_motion_parameters["Z"], {"minimum_speed": 7, "work_speed": 80, "acceleration": 12})
             self.assertAlmostEqual(loaded.cc_accel_time_s, 0.2)
             self.assertAlmostEqual(loaded.current_um_per_px(), 1.25)
 

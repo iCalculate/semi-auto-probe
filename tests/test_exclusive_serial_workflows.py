@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import threading
 import unittest
+from unittest.mock import patch
 from types import MethodType
 
 from semi_auto_probe.app import ProbeApp
@@ -100,6 +102,27 @@ class ExclusiveSerialWorkflowTests(unittest.TestCase):
         self.assertTrue(restored)
         self.assertTrue(app.home_signal_enabled)
         self.assertFalse(app.imgstitch_restore_home_signal)
+
+    def test_admin_mode_requires_config_token(self) -> None:
+        app = ProbeApp.__new__(ProbeApp)
+        app.admin_mode_enabled = False
+        app.admin_token_var = DummyVar("wrong")
+        app.admin_mode_status_var = DummyVar("Admin mode locked")
+        app.status_var = DummyVar()
+        app.serial_client = None
+        app.set_xyz_zero_button = None
+        app.set_autofocus_z_zero_button = None
+
+        with patch.dict(os.environ, {"SEMI_AUTO_PROBE_ADMIN_TOKEN": "secret-token"}, clear=False):
+            ProbeApp.enable_admin_mode(app)
+            self.assertFalse(app.admin_mode_enabled)
+            self.assertIn("invalid token", app.admin_mode_status_var.get())
+
+            app.admin_token_var.set("secret-token")
+            ProbeApp.enable_admin_mode(app)
+
+        self.assertTrue(app.admin_mode_enabled)
+        self.assertEqual(app.admin_token_var.get(), "")
 
 
 if __name__ == "__main__":

@@ -19,6 +19,8 @@ FUNCTION_MULTI_AXIS_RELATIVE_MOVE = 0xCC
 FUNCTION_ENABLE_REALTIME_POSITION = 0xD1
 FUNCTION_DISABLE_REALTIME_POSITION = 0xD4
 FUNCTION_CLEAR_POSITION = 0xD3
+FUNCTION_READ_MOTION_PARAMETERS = 0xD5
+FUNCTION_MOTION_PARAMETERS_RESPONSE = 0xB4
 FUNCTION_REACHED_POSITION = 0xB5
 FUNCTION_MULTI_AXIS_COMPLETED = 0xBE
 FUNCTION_READ_IO_STATUS = 0xD7
@@ -103,6 +105,15 @@ class IoStatus:
         return bool(self.home_mask & int(axis))
 
 
+@dataclass(frozen=True)
+class ControllerMotionParameters:
+    axis: Axis
+    minimum_speed: int
+    work_speed: int
+    acceleration: int
+    raw: bytes
+
+
 def parse_frame(raw: bytes, expected_head: int | None = None) -> ControllerFrame:
     if len(raw) != FRAME_LENGTH:
         raise ValueError(f"Expected {FRAME_LENGTH} bytes, got {len(raw)}.")
@@ -147,8 +158,19 @@ def build_clear_position_command(axis: Axis) -> bytes:
     return build_frame(FUNCTION_CLEAR_POSITION, axis)
 
 
+def payload_contains_clear_position_command(payload: bytes) -> bool:
+    for index in range(max(0, len(payload) - 1)):
+        if payload[index] == FRAME_HEAD and payload[index + 1] == FUNCTION_CLEAR_POSITION:
+            return True
+    return False
+
+
 def build_read_io_status_command() -> bytes:
     return build_frame(FUNCTION_READ_IO_STATUS)
+
+
+def build_read_motion_parameters_command(axis: Axis) -> bytes:
+    return build_frame(FUNCTION_READ_MOTION_PARAMETERS, axis)
 
 
 def build_relative_move_command(axis: Axis, reverse: bool, pulses: int, speed_percent: int = 100) -> bytes:
@@ -232,5 +254,22 @@ def parse_io_status_response(raw: bytes) -> IoStatus:
         limit_mask=int.from_bytes(raw[3:5], byteorder="big", signed=False),
         input_mask=raw[5],
         output_mask=raw[6],
+        raw=raw,
+    )
+
+
+def parse_motion_parameters_response(raw: bytes) -> ControllerMotionParameters:
+    frame = parse_frame(raw, expected_head=RESPONSE_HEAD)
+    if frame.function_code != FUNCTION_MOTION_PARAMETERS_RESPONSE:
+        raise ValueError(f"Expected motion-parameter response B4, got {frame.function_code:02X}.")
+    try:
+        axis = Axis(frame.axis)
+    except ValueError as exc:
+        raise ValueError(f"Unexpected axis in D5 motion-parameter response: {frame.axis:02X}.") from exc
+    return ControllerMotionParameters(
+        axis=axis,
+        minimum_speed=int.from_bytes(frame.data[0:2], byteorder="big", signed=False),
+        work_speed=int.from_bytes(frame.data[2:4], byteorder="big", signed=False),
+        acceleration=int.from_bytes(frame.data[4:6], byteorder="big", signed=False),
         raw=raw,
     )

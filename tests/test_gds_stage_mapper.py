@@ -11,10 +11,12 @@ from semi_auto_probe.gds_stage_mapper import (
     GDSCanvasViewer,
     GDSLayoutModel,
     GDSShape,
+    GDSStageMapperPanel,
     layer_grid_position,
     render_gds_preview_ppm,
     snap_gds_point,
     stage_move_plan_from_um,
+    stage_xyz_move_plan_from_um,
 )
 from semi_auto_probe.protocol import Axis, AxisPosition
 
@@ -157,6 +159,16 @@ class StageMovePlanTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "positive"):
             stage_move_plan_from_um({"X": 0, "Y": 0}, 0.0, 0.0, 0.0, 1.0)
 
+    def test_stage_xyz_um_target_converts_to_pulse_deltas(self) -> None:
+        plan = stage_xyz_move_plan_from_um(
+            {"X": 10, "Y": -4, "Z": 7},
+            {"X": 6.0, "Y": -1.5, "Z": 4.0},
+            {"X": 0.5, "Y": 0.25, "Z": 2.0},
+        )
+
+        self.assertEqual(plan.target_pulses, {"X": 12, "Y": -6, "Z": 2})
+        self.assertEqual(plan.deltas, {"X": 2, "Y": -2, "Z": -5})
+
 
 class GDSCanvasViewerModelTests(unittest.TestCase):
     def test_new_model_defaults_all_layers_hidden(self) -> None:
@@ -244,7 +256,7 @@ class DummyMapperSerial:
     def move_multi_axis_relative_and_wait(self, axis_params, timeout=10.0):
         self.axis_params = axis_params
         for axis, (reverse, pulses, _speed, _acceleration) in axis_params.items():
-            if axis in (Axis.X, Axis.Y):
+            if axis in (Axis.X, Axis.Y, Axis.Z):
                 self.positions[axis.name] += -pulses if reverse else pulses
         return b"command", b"done"
 
@@ -252,7 +264,102 @@ class DummyMapperSerial:
         return self._entries()
 
 
+class DummyVar:
+    def __init__(self, value: str = "") -> None:
+        self.value = value
+
+    def get(self) -> str:
+        return self.value
+
+    def set(self, value: str) -> None:
+        self.value = value
+
+
 class GDSMapperMotionBridgeTests(unittest.TestCase):
+    def panel_for_coordinate_tests(self) -> GDSStageMapperPanel:
+        panel = GDSStageMapperPanel.__new__(GDSStageMapperPanel)
+        panel.coord_vars = {axis: DummyVar("0") for axis in ("X", "Y", "Z", "U", "V")}
+        panel.coord_edit_modes = {axis: None for axis in ("X", "Y", "Z", "U", "V")}
+        panel.coord_inputs = {}
+        panel.modified_coord_axes = set()
+        panel.current_coord_edit_mode = None
+        panel.use_focus_z_var = DummyVar(False)
+        panel.motion_status_var = DummyVar()
+        panel.mapper = None
+        panel.get_stage_position_um = lambda: (10.0, 20.0, 3.0)
+        return panel
+
+    def test_coordinate_stage_target_uses_panel_move_callback(self) -> None:
+        moves = []
+        panel = self.panel_for_coordinate_tests()
+        panel.coord_vars["X"].set("12.5")
+        panel.coord_vars["Y"].set("-3.25")
+        panel.modified_coord_axes = {"X", "Y"}
+        panel.coord_edit_modes["X"] = "Absolute"
+        panel.coord_edit_modes["Y"] = "Absolute"
+        panel.move_to_stage_xyz_um = lambda x_um, y_um, z_um: moves.append((x_um, y_um, z_um))
+
+        GDSStageMapperPanel.move_coordinate_target(panel)
+
+        self.assertEqual(moves, [(12.5, -3.25, None)])
+        self.assertIn("Coordinate move requested", panel.motion_status_var.get())
+
+    def test_relative_stage_target_offsets_current_stage_um(self) -> None:
+        panel = self.panel_for_coordinate_tests()
+        panel.coord_vars["X"].set("1.5")
+        panel.coord_vars["Y"].set("-2.0")
+        panel.coord_edit_modes["X"] = "Relative"
+        panel.coord_edit_modes["Y"] = "Relative"
+        panel.modified_coord_axes = {"X", "Y"}
+
+        self.assertEqual(GDSStageMapperPanel._coordinate_target_from_edits(panel), (11.5, 18.0, None))
+
+    def test_uv_target_uses_affine_mapping_when_bound(self) -> None:
+        panel = self.panel_for_coordinate_tests()
+        panel.mapper = AffineCoordinateMapper.fit(
+            [
+                CalibrationPoint("P1", 0.0, 0.0, 10.0, 20.0),
+                CalibrationPoint("P2", 10.0, 0.0, 20.0, 20.0),
+                CalibrationPoint("P3", 0.0, 10.0, 10.0, 30.0),
+                CalibrationPoint("P4", 10.0, 10.0, 20.0, 30.0),
+            ]
+        )
+        panel.coord_vars["U"].set("3")
+        panel.coord_vars["V"].set("4")
+        panel.coord_edit_modes["U"] = "Absolute"
+        panel.coord_edit_modes["V"] = "Absolute"
+        panel.modified_coord_axes = {"U", "V"}
+
+        target = GDSStageMapperPanel._coordinate_target_from_edits(panel)
+        self.assertAlmostEqual(target[0], 13.0)
+        self.assertAlmostEqual(target[1], 24.0)
+        self.assertIsNone(target[2])
+
+    def test_focus_z_overrides_z_target_from_focus_callback(self) -> None:
+        panel = self.panel_for_coordinate_tests()
+        panel.use_focus_z_var = DummyVar(True)
+        panel.get_focus_z_um = lambda x_um, y_um: x_um + y_um
+        panel.coord_vars["X"].set("12")
+        panel.coord_vars["Y"].set("4")
+        panel.coord_vars["Z"].set("99")
+        panel.coord_edit_modes["X"] = "Absolute"
+        panel.coord_edit_modes["Y"] = "Absolute"
+        panel.coord_edit_modes["Z"] = "Absolute"
+        panel.modified_coord_axes = {"X", "Y", "Z"}
+
+        self.assertEqual(GDSStageMapperPanel._coordinate_target_from_edits(panel), (12.0, 4.0, 16.0))
+
+    def test_selected_target_can_populate_coordinate_fields(self) -> None:
+        panel = self.panel_for_coordinate_tests()
+        panel.selected_target_stage_um = (4.0, 5.5)
+        panel.coord_inputs = {}
+
+        GDSStageMapperPanel.copy_selected_target_to_coordinates(panel)
+
+        self.assertEqual(panel.coord_vars["X"].get(), "4")
+        self.assertEqual(panel.coord_vars["Y"].get(), "5.5")
+        self.assertIn("copied", panel.motion_status_var.get())
+
     def test_worker_uses_existing_serial_move_api_with_um_target(self) -> None:
         try:
             from semi_auto_probe.app import ProbeApp
@@ -280,6 +387,29 @@ class GDSMapperMotionBridgeTests(unittest.TestCase):
         self.assertEqual(events[0][:4], ("motor_command", "XY", "cc LayoutBond", b"command"))
         self.assertEqual(events[1], ("cc_done", b"done", "gds_mapper"))
         self.assertEqual(events[-1], ("motor_done",))
+
+    def test_worker_can_include_focus_z_stage_target(self) -> None:
+        try:
+            from semi_auto_probe.app import ProbeApp
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"ProbeApp import unavailable: {exc}")
+
+        app = ProbeApp.__new__(ProbeApp)
+        app.probe_config = ProbeConfig()
+        app.current_position_values = {"X": 10, "Y": -4, "Z": 0}
+        app.result_queue = queue.Queue()
+        app.serial_client = DummyMapperSerial()
+
+        ProbeApp._gds_mapper_move_worker(app, target_x_um=12.0, target_y_um=-6.0, target_z_um=4.0)
+
+        self.assertEqual(
+            app.serial_client.axis_params,
+            {
+                Axis.X: (False, 2, 100, 10),
+                Axis.Z: (False, 8, 100, 10),
+                Axis.Y: (True, 2, 100, 10),
+            },
+        )
 
 
 if __name__ == "__main__":

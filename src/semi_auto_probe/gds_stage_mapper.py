@@ -87,6 +87,25 @@ def stage_move_plan_from_um(
     return StageMovePlan(target_pulses=target_pulses, deltas=deltas)
 
 
+def stage_xyz_move_plan_from_um(
+    current_pulses: dict[str, int],
+    target_um: dict[str, float],
+    um_per_pulse: dict[str, float],
+) -> StageMovePlan:
+    target_pulses: dict[str, int] = {}
+    for axis, value_um in target_um.items():
+        if axis not in {"X", "Y", "Z"}:
+            raise ValueError(f"Unsupported stage axis: {axis}")
+        scale = float(um_per_pulse.get(axis, 0.0))
+        if scale <= 0:
+            raise ValueError(f"{axis} um-per-pulse value must be positive.")
+        if not math.isfinite(float(value_um)):
+            raise ValueError(f"{axis} target stage coordinate must be finite.")
+        target_pulses[axis] = int(round(float(value_um) / scale))
+    deltas = {axis: target_pulses[axis] - int(current_pulses.get(axis, 0)) for axis in target_pulses}
+    return StageMovePlan(target_pulses=target_pulses, deltas=deltas)
+
+
 def snap_gds_point(point: tuple[float, float], grid_um: float) -> tuple[float, float]:
     if grid_um <= 0:
         return point
@@ -730,13 +749,19 @@ class GDSStageMapperPanel:
         parent: tk.Widget,
         colors: dict[str, str],
         *,
-        get_stage_position_um: Callable[[], tuple[float, float]],
+        get_stage_position_um: Callable[[], tuple[float, float] | tuple[float, float, float]],
         move_to_stage_um: Callable[[float, float], None],
+        move_to_stage_xyz_um: Callable[[float, float, float | None], None] | None = None,
+        get_focus_z_um: Callable[[float, float], float | None] | None = None,
+        get_microscope_preview: Callable[[], bytes | None] | None = None,
         set_status: Callable[[str], None] | None = None,
     ) -> None:
         self.colors = colors
         self.get_stage_position_um = get_stage_position_um
         self.move_to_stage_um = move_to_stage_um
+        self.move_to_stage_xyz_um = move_to_stage_xyz_um
+        self.get_focus_z_um = get_focus_z_um
+        self.get_microscope_preview = get_microscope_preview
         self.set_app_status = set_status
         self.model: GDSLayoutModel | None = None
         self.gds_path: Path | None = None
@@ -746,6 +771,8 @@ class GDSStageMapperPanel:
         self.selected_target_stage_um: tuple[float, float] | None = None
         self.loader_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.loader_poll_job: str | None = None
+        self.microscope_poll_job: str | None = None
+        self.microscope_photo: tk.PhotoImage | None = None
 
         self.snap_grid_options = {
             "100 nm": 0.1,
@@ -770,6 +797,15 @@ class GDSStageMapperPanel:
         self.current_stage_var = tk.StringVar(value="Current stage: -")
         self.current_gds_var = tk.StringVar(value="Current GDS: -")
         self.motion_status_var = tk.StringVar(value="Idle")
+        self.coord_vars: dict[str, tk.StringVar] = {axis: tk.StringVar(value="-") for axis in ("X", "Y", "Z", "U", "V")}
+        self.coord_inputs: dict[str, tk.Entry] = {}
+        self.coord_edit_modes: dict[str, str | None] = {axis: None for axis in ("X", "Y", "Z", "U", "V")}
+        self.modified_coord_axes: set[str] = set()
+        self.current_coord_edit_mode: str | None = None
+        self.coord_click_job: str | None = None
+        self.use_focus_z_var = tk.BooleanVar(value=False)
+        self.stage_nav_status_var = tk.StringVar(value="Stage XY: -")
+        self.microscope_status_var = tk.StringVar(value="Microscope: waiting for camera frame.")
         self.layer_vars: dict[tuple[int, int], tk.BooleanVar] = {}
         self.gds_point_buttons: dict[str, tk.Button] = {}
         self.point_vars: dict[str, dict[str, tk.StringVar]] = {
@@ -791,16 +827,30 @@ class GDSStageMapperPanel:
         if importlib.util.find_spec("gdstk") is None:
             self.load_status_var.set(GDS_MISSING_MESSAGE)
         self._schedule_overlay_poll()
+        self._schedule_microscope_preview_poll()
 
     def _build_ui(self) -> None:
         pane = ttk.PanedWindow(self.frame, orient=tk.HORIZONTAL)
         pane.grid(row=0, column=0, sticky="nsew")
 
         viewer_panel = ttk.Frame(pane, style="Panel.TFrame", padding=10)
-        viewer_panel.columnconfigure(0, weight=1)
+        viewer_panel.columnconfigure(0, weight=0, minsize=300)
+        viewer_panel.columnconfigure(1, weight=1)
         viewer_panel.rowconfigure(0, weight=1)
+
+        left_panel = ttk.Frame(viewer_panel, style="Panel.TFrame")
+        left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        left_panel.columnconfigure(0, weight=1)
+        left_panel.rowconfigure(1, weight=1)
+        self._build_microscope_preview(left_panel)
+        self._build_stage_navigation_panel(left_panel)
+
+        gds_canvas_panel = ttk.Frame(viewer_panel, style="Panel.TFrame")
+        gds_canvas_panel.grid(row=0, column=1, sticky="nsew")
+        gds_canvas_panel.columnconfigure(0, weight=1)
+        gds_canvas_panel.rowconfigure(0, weight=1)
         self.viewer = GDSCanvasViewer(
-            viewer_panel,
+            gds_canvas_panel,
             self.colors,
             on_cursor_gds=self._set_cursor_gds,
             on_select_gds=self._handle_gds_click,
@@ -834,6 +884,76 @@ class GDSStageMapperPanel:
         section.grid(row=row, column=0, sticky="ew", pady=(0, 10))
         section.columnconfigure(0, weight=1)
         return section
+
+    def _build_microscope_preview(self, parent: ttk.Frame) -> None:
+        preview = ttk.LabelFrame(parent, text="Microscope Live", padding=8)
+        preview.grid(row=0, column=0, sticky="ew")
+        preview.columnconfigure(0, weight=1)
+        self.microscope_label = ttk.Label(
+            preview,
+            text="No microscope frame",
+            anchor="center",
+            style="Value.TLabel",
+            padding=8,
+        )
+        self.microscope_label.grid(row=0, column=0, sticky="ew")
+        ttk.Label(preview, textvariable=self.microscope_status_var, style="Muted.TLabel").grid(row=1, column=0, sticky="ew", pady=(6, 0))
+
+    def _build_stage_navigation_panel(self, parent: ttk.Frame) -> None:
+        panel = ttk.LabelFrame(parent, text="Stage XY", padding=8)
+        panel.grid(row=1, column=0, sticky="new", pady=(10, 0))
+        panel.columnconfigure(0, weight=1)
+
+        ttk.Label(panel, textvariable=self.stage_nav_status_var, style="Value.TLabel", padding=7).grid(row=0, column=0, sticky="ew")
+
+        header = ttk.Frame(panel, style="Panel.TFrame")
+        header.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        header.columnconfigure(0, weight=1)
+        ttk.Button(header, text="Move", style="Accent.TButton", command=self.move_coordinate_target).grid(row=0, column=1, sticky="e", padx=(8, 0))
+        ttk.Button(header, text="Clear", command=self.clear_coordinate_edits).grid(row=0, column=2, sticky="e", padx=(6, 0))
+
+        grid = ttk.Frame(panel, style="Panel.TFrame")
+        grid.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        for column in range(3):
+            grid.columnconfigure(column, weight=1, uniform="layoutbond_xyz")
+        for column, axis in enumerate(("X", "Y", "Z")):
+            self._build_coordinate_cell(grid, axis, row=0, column=column)
+
+        uv_grid = ttk.Frame(panel, style="Panel.TFrame")
+        uv_grid.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        uv_grid.columnconfigure((0, 1), weight=1, uniform="layoutbond_uv")
+        self._build_coordinate_cell(uv_grid, "U", row=0, column=0)
+        self._build_coordinate_cell(uv_grid, "V", row=0, column=1)
+
+        ttk.Checkbutton(panel, text="Use FocusZ", variable=self.use_focus_z_var, command=self._on_focus_z_toggle).grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Button(panel, text="Use Selected GDS Target", command=self.copy_selected_target_to_coordinates).grid(row=5, column=0, sticky="ew", pady=(8, 0))
+
+    def _build_coordinate_cell(self, parent: ttk.Frame, axis: str, row: int, column: int) -> None:
+        cell = ttk.Frame(parent, style="Panel.TFrame")
+        cell.grid(row=row, column=column, sticky="ew", padx=(0 if column == 0 else 4, 0 if axis in {"Z", "V"} else 4))
+        cell.columnconfigure(0, weight=1)
+        unit = "um" if axis in {"X", "Y", "Z"} else "layout"
+        ttk.Label(cell, text=f"{axis} {unit}", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+        entry = tk.Entry(
+            cell,
+            textvariable=self.coord_vars[axis],
+            justify="center",
+            bg=self.colors["surface_2"],
+            fg=self.colors["accent"],
+            insertbackground=self.colors["text"],
+            relief="flat",
+            readonlybackground=self.colors["surface_2"],
+            font=("Cascadia Mono", 11, "bold"),
+            width=8,
+        )
+        entry.configure(state="readonly")
+        entry.grid(row=1, column=0, sticky="ew", pady=(4, 0), ipady=6)
+        entry.bind("<Button-1>", lambda _event, a=axis: self.schedule_coordinate_edit(a, "Relative"))
+        entry.bind("<Double-Button-1>", lambda _event, a=axis: self.begin_coordinate_edit(a, "Absolute"))
+        entry.bind("<KeyRelease>", lambda _event: self._update_coordinate_counterparts_from_edits())
+        entry.bind("<Return>", lambda _event: self.move_coordinate_target())
+        entry.bind("<Escape>", lambda _event: self.clear_coordinate_edits())
+        self.coord_inputs[axis] = entry
 
     def _build_gds_file_section(self, parent: ttk.Frame, row: int) -> int:
         section = self._section(parent, "GDS File", row)
@@ -1087,7 +1207,7 @@ class GDSStageMapperPanel:
 
     def _set_point_stage_from_current(self, point_name: str) -> None:
         try:
-            x_um, y_um = self.get_stage_position_um()
+            x_um, y_um, _z_um = self._stage_position_xyz_um()
         except Exception as exc:
             self.motion_status_var.set(f"Current stage position unavailable: {exc}")
             return
@@ -1174,7 +1294,7 @@ class GDSStageMapperPanel:
         self.selected_target_stage_um = (x_um, y_um)
         self.target_stage_var.set(f"Target stage x, y: {x_um:.6g} um, {y_um:.6g} um")
         try:
-            current_x, current_y = self.get_stage_position_um()
+            current_x, current_y, _current_z = self._stage_position_xyz_um()
             distance = math.hypot(x_um - current_x, y_um - current_y)
             self.move_distance_var.set(f"Move distance: {distance:.6g} um")
         except Exception:
@@ -1188,6 +1308,220 @@ class GDSStageMapperPanel:
         self.motion_status_var.set(f"Move requested: X {x_um:.6g} um, Y {y_um:.6g} um.")
         self.move_to_stage_um(x_um, y_um)
 
+    def copy_selected_target_to_coordinates(self) -> None:
+        if self.selected_target_stage_um is None:
+            self.motion_status_var.set("No selected stage target is available.")
+            return
+        x_um, y_um = self.selected_target_stage_um
+        _current_x, _current_y, current_z = self._stage_position_xyz_um()
+        self._set_coordinate_values_from_target(x_um, y_um, current_z)
+        self.motion_status_var.set("Selected stage target copied to manual fields.")
+
+    def schedule_coordinate_edit(self, axis: str, mode: str) -> str:
+        if self.coord_click_job is not None:
+            try:
+                self.frame.after_cancel(self.coord_click_job)
+            except tk.TclError:
+                pass
+        self.coord_click_job = self.frame.after(180, lambda a=axis, m=mode: self.begin_coordinate_edit(a, m))
+        return "break"
+
+    def begin_coordinate_edit(self, axis: str, mode: str) -> str:
+        if axis in {"U", "V"} and self.mapper is None:
+            self.motion_status_var.set("Bind GDS mapping before editing U/V.")
+            return "break"
+        if axis == "Z" and self.use_focus_z_var.get():
+            self.motion_status_var.set("Use FocusZ is enabled; Z follows the mapped plane.")
+            self._update_focus_z_preview()
+            return "break"
+        if self.coord_click_job is not None:
+            try:
+                self.frame.after_cancel(self.coord_click_job)
+            except tk.TclError:
+                pass
+            self.coord_click_job = None
+
+        starting_new_mode = self.current_coord_edit_mode != mode
+        self.current_coord_edit_mode = mode
+        if starting_new_mode:
+            self.modified_coord_axes.clear()
+            for target_axis in ("X", "Y", "Z", "U", "V"):
+                self.coord_edit_modes[target_axis] = None
+                self._set_coord_input_readonly(target_axis)
+            self._refresh_coordinate_display(force=True)
+
+        first_axis_edit = axis not in self.modified_coord_axes
+        self.modified_coord_axes.add(axis)
+        self.coord_edit_modes[axis] = mode
+        entry = self.coord_inputs[axis]
+        entry.configure(state="normal", fg=self.colors["warning"] if mode == "Relative" else self.colors["blue"])
+        entry.focus_set()
+        if mode == "Relative" and first_axis_edit:
+            self.coord_vars[axis].set("")
+        self.motion_status_var.set(
+            "Relative coordinate input. Empty fields default to 0."
+            if mode == "Relative"
+            else "Absolute coordinate input. Empty fields default to current position."
+        )
+        entry.after_idle(lambda a=axis: self.coord_inputs[a].icursor("end"))
+        return "break"
+
+    def clear_coordinate_edits(self) -> None:
+        self.modified_coord_axes.clear()
+        self.current_coord_edit_mode = None
+        for axis in ("X", "Y", "Z", "U", "V"):
+            self.coord_edit_modes[axis] = None
+            self._set_coord_input_readonly(axis)
+        self._refresh_coordinate_display(force=True)
+
+    def move_coordinate_target(self) -> None:
+        try:
+            target_x_um, target_y_um, target_z_um = self._coordinate_target_from_edits()
+        except ValueError as exc:
+            self.motion_status_var.set(str(exc))
+            return
+        self.motion_status_var.set(f"Coordinate move requested: X {target_x_um:.6g} um, Y {target_y_um:.6g} um, Z {target_z_um if target_z_um is not None else '-'} um.")
+        if self.move_to_stage_xyz_um is not None:
+            self.move_to_stage_xyz_um(target_x_um, target_y_um, target_z_um)
+        else:
+            self.move_to_stage_um(target_x_um, target_y_um)
+        self.clear_coordinate_edits()
+
+    def _coordinate_target_from_edits(self) -> tuple[float, float, float | None]:
+        if not self.modified_coord_axes:
+            raise ValueError("No coordinate input has been modified.")
+        current_x, current_y, current_z = self._stage_position_xyz_um()
+        target_x, target_y, target_z = current_x, current_y, current_z
+        if self.modified_coord_axes & {"U", "V"}:
+            if self.mapper is None:
+                raise ValueError("Bind GDS mapping before moving by U/V.")
+            current_u, current_v = self.mapper.stage_to_gds(current_x, current_y)
+            target_u = self._coordinate_axis_target("U", current_u)
+            target_v = self._coordinate_axis_target("V", current_v)
+            target_x, target_y = self.mapper.gds_to_stage(target_u, target_v)
+        if self.modified_coord_axes & {"X", "Y"}:
+            target_x = self._coordinate_axis_target("X", current_x)
+            target_y = self._coordinate_axis_target("Y", current_y)
+        if self.use_focus_z_var.get():
+            if self.get_focus_z_um is None:
+                raise ValueError("FocusZ source is unavailable.")
+            focus_z = self.get_focus_z_um(target_x, target_y)
+            if focus_z is None:
+                raise ValueError("Use FocusZ is enabled, but no FocusMap plane is stored.")
+            target_z = focus_z
+        elif "Z" in self.modified_coord_axes:
+            target_z = self._coordinate_axis_target("Z", current_z)
+        else:
+            target_z = None
+        return target_x, target_y, target_z
+
+    def _coordinate_axis_target(self, axis: str, current_value: float) -> float:
+        text = self.coord_vars[axis].get().strip()
+        mode = self.coord_edit_modes[axis] or self.current_coord_edit_mode or "Relative"
+        if not text:
+            value = 0.0 if mode == "Relative" else current_value
+        else:
+            try:
+                value = float(text)
+            except ValueError as exc:
+                raise ValueError(f"{axis} coordinate must be numeric.") from exc
+        if not math.isfinite(value):
+            raise ValueError(f"{axis} coordinate must be finite.")
+        return current_value + value if mode == "Relative" else value
+
+    def _update_coordinate_counterparts_from_edits(self) -> None:
+        try:
+            target_x, target_y, target_z = self._coordinate_target_from_edits()
+        except ValueError:
+            return
+        self._set_coordinate_values_from_target(target_x, target_y, target_z)
+
+    def _set_coordinate_values_from_target(self, x_um: float, y_um: float, z_um: float | None) -> None:
+        for axis, value in (("X", x_um), ("Y", y_um)):
+            if axis not in self.modified_coord_axes:
+                self.coord_vars[axis].set(f"{value:.6g}")
+        if z_um is not None and "Z" not in self.modified_coord_axes:
+            self.coord_vars["Z"].set(f"{z_um:.6g}")
+        if self.mapper is not None:
+            try:
+                u, v = self.mapper.stage_to_gds(x_um, y_um)
+                if "U" not in self.modified_coord_axes:
+                    self.coord_vars["U"].set(f"{u:.6g}")
+                if "V" not in self.modified_coord_axes:
+                    self.coord_vars["V"].set(f"{v:.6g}")
+            except Exception:
+                return
+
+    def _stage_position_xyz_um(self) -> tuple[float, float, float]:
+        values = self.get_stage_position_um()
+        if len(values) == 2:
+            x_um, y_um = values
+            return float(x_um), float(y_um), 0.0
+        x_um, y_um, z_um = values
+        return float(x_um), float(y_um), float(z_um)
+
+    def _set_coord_input_readonly(self, axis: str) -> None:
+        entry = self.coord_inputs.get(axis)
+        if entry is None:
+            return
+        is_uv_disabled = axis in {"U", "V"} and self.mapper is None
+        is_z_locked = axis == "Z" and self.use_focus_z_var.get()
+        entry.configure(
+            fg=self.colors["muted"] if is_uv_disabled or is_z_locked else self.colors["accent"],
+            state="readonly",
+            readonlybackground=self.colors["surface_2"],
+        )
+
+    def _refresh_coordinate_display(self, *, force: bool = False) -> None:
+        if self.modified_coord_axes and not force:
+            return
+        try:
+            x_um, y_um, z_um = self._stage_position_xyz_um()
+        except Exception as exc:
+            self.stage_nav_status_var.set(f"Current XYZ: unavailable ({exc})")
+            return
+        self.coord_vars["X"].set(f"{x_um:.6g}")
+        self.coord_vars["Y"].set(f"{y_um:.6g}")
+        self.coord_vars["Z"].set(f"{z_um:.6g}")
+        if self.use_focus_z_var.get() and self.get_focus_z_um is not None:
+            try:
+                focus_z = self.get_focus_z_um(x_um, y_um)
+            except Exception:
+                focus_z = None
+            if focus_z is not None:
+                self.coord_vars["Z"].set(f"{focus_z:.6g}")
+        if self.mapper is None:
+            self.coord_vars["U"].set("-")
+            self.coord_vars["V"].set("-")
+        else:
+            try:
+                u, v = self.mapper.stage_to_gds(x_um, y_um)
+                self.coord_vars["U"].set(f"{u:.6g}")
+                self.coord_vars["V"].set(f"{v:.6g}")
+            except Exception:
+                self.coord_vars["U"].set("-")
+                self.coord_vars["V"].set("-")
+        for axis in ("X", "Y", "Z", "U", "V"):
+            self._set_coord_input_readonly(axis)
+
+    def _on_focus_z_toggle(self) -> None:
+        if self.use_focus_z_var.get():
+            self.modified_coord_axes.discard("Z")
+            self.coord_edit_modes["Z"] = None
+            self._update_focus_z_preview()
+        self._set_coord_input_readonly("Z")
+
+    def _update_focus_z_preview(self) -> None:
+        if not self.use_focus_z_var.get() or self.get_focus_z_um is None:
+            return
+        try:
+            x_um, y_um, _z_um = self._coordinate_target_from_edits() if self.modified_coord_axes else self._stage_position_xyz_um()
+            focus_z = self.get_focus_z_um(x_um, y_um)
+        except Exception:
+            return
+        if focus_z is not None:
+            self.coord_vars["Z"].set(f"{focus_z:.6g}")
+
     def set_motion_status(self, message: str) -> None:
         self.motion_status_var.set(message)
 
@@ -1198,13 +1532,45 @@ class GDSStageMapperPanel:
         except tk.TclError:
             return
 
+    def _schedule_microscope_preview_poll(self) -> None:
+        try:
+            self._update_microscope_preview()
+            self.microscope_poll_job = self.frame.after(120, self._schedule_microscope_preview_poll)
+        except tk.TclError:
+            return
+
+    def _update_microscope_preview(self) -> None:
+        if self.get_microscope_preview is None:
+            self.microscope_status_var.set("Microscope: preview source unavailable.")
+            return
+        try:
+            payload = self.get_microscope_preview()
+        except Exception as exc:
+            self.microscope_status_var.set(f"Microscope: unavailable ({exc})")
+            return
+        if not payload:
+            self.microscope_status_var.set("Microscope: waiting for camera frame.")
+            return
+        try:
+            self.microscope_photo = tk.PhotoImage(data=payload, format="PPM")
+            self.microscope_label.configure(image=self.microscope_photo, text="")
+            self.microscope_status_var.set("Microscope: live frame.")
+        except tk.TclError as exc:
+            self.microscope_status_var.set(f"Microscope: preview error ({exc})")
+
     def _update_stage_overlay(self) -> None:
         self._update_target_preview()
+        self._refresh_coordinate_display()
+        try:
+            nav_x_um, nav_y_um, nav_z_um = self._stage_position_xyz_um()
+            self.stage_nav_status_var.set(f"Current XYZ: {nav_x_um:.6g}, {nav_y_um:.6g}, {nav_z_um:.6g} um")
+        except Exception as exc:
+            self.stage_nav_status_var.set(f"Current XYZ: unavailable ({exc})")
         if self.mapper is None or not self.overlay_enabled_var.get():
             self.viewer.set_stage_overlay(None, None)
             return
         try:
-            x_um, y_um = self.get_stage_position_um()
+            x_um, y_um, _z_um = self._stage_position_xyz_um()
             width_um = float(self.fov_width_var.get())
             height_um = float(self.fov_height_var.get())
             if width_um <= 0 or height_um <= 0:
