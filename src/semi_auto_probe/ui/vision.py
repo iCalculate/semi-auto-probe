@@ -20,9 +20,14 @@ class VisionPanel:
         self.move_point_to_center = move_point_to_center
         self.get_centering_preview = get_centering_preview
         self.photo: tk.PhotoImage | None = None
+        self.source_image_bgr = None
         self.canvas_image_id: int | None = None
         self.canvas_message_id: int | None = None
         self.image_bounds: tuple[float, float, float, float] | None = None
+        self.image_width = 0
+        self.image_height = 0
+        self.display_scale_x = 1.0
+        self.display_scale_y = 1.0
         self.tool_var = tk.StringVar(value="idle")
         self.status_var = tk.StringVar(value="Select a vision tool.")
         self.cross_enabled = False
@@ -110,7 +115,18 @@ class VisionPanel:
         self.draw_overlay()
 
     def set_image(self, photo: tk.PhotoImage) -> None:
+        self.source_image_bgr = None
         self.photo = photo
+        self.image_width = photo.width()
+        self.image_height = photo.height()
+        self.display_scale_x = 1.0
+        self.display_scale_y = 1.0
+        self.draw_image()
+        self.draw_overlay()
+
+    def set_image_bgr(self, image_bgr) -> None:
+        self.source_image_bgr = image_bgr
+        self.image_height, self.image_width = image_bgr.shape[:2]
         self.draw_image()
         self.draw_overlay()
 
@@ -120,6 +136,9 @@ class VisionPanel:
             self.canvas.delete("vision_overlay")
             self.canvas_image_id = None
             self.image_bounds = None
+            self.source_image_bgr = None
+            self.image_width = 0
+            self.image_height = 0
             if self.canvas_message_id is not None:
                 self.canvas.delete(self.canvas_message_id)
             self.canvas_message_id = self.canvas.create_text(
@@ -140,6 +159,9 @@ class VisionPanel:
         self.draw_overlay()
 
     def draw_image(self) -> None:
+        if self.source_image_bgr is not None:
+            self._draw_fit_bgr_image()
+            return
         if self.photo is None:
             return
         try:
@@ -147,9 +169,49 @@ class VisionPanel:
             canvas_height = max(1, self.canvas.winfo_height())
             image_width = self.photo.width()
             image_height = self.photo.height()
+            self.image_width = image_width
+            self.image_height = image_height
+            self.display_scale_x = 1.0
+            self.display_scale_y = 1.0
             x = max(0, (canvas_width - image_width) / 2.0)
             y = max(0, (canvas_height - image_height) / 2.0)
             self.image_bounds = (x, y, x + image_width, y + image_height)
+            if self.canvas_message_id is not None:
+                self.canvas.delete(self.canvas_message_id)
+                self.canvas_message_id = None
+            if self.canvas_image_id is None:
+                self.canvas_image_id = self.canvas.create_image(x, y, anchor="nw", image=self.photo, tags=("camera_image",))
+            else:
+                self.canvas.coords(self.canvas_image_id, x, y)
+                self.canvas.itemconfigure(self.canvas_image_id, image=self.photo)
+            self.canvas.tag_lower(self.canvas_image_id)
+        except tk.TclError:
+            return
+
+    def _draw_fit_bgr_image(self) -> None:
+        if self.source_image_bgr is None or self.image_width <= 0 or self.image_height <= 0:
+            return
+        try:
+            import cv2
+
+            canvas_width = max(1, self.canvas.winfo_width())
+            canvas_height = max(1, self.canvas.winfo_height())
+            scale = min(canvas_width / self.image_width, canvas_height / self.image_height)
+            if not math.isfinite(scale) or scale <= 0:
+                scale = 1.0
+            display_width = max(1, min(canvas_width, int(self.image_width * scale)))
+            display_height = max(1, min(canvas_height, int(self.image_height * scale)))
+            self.display_scale_x = display_width / self.image_width
+            self.display_scale_y = display_height / self.image_height
+            interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+            display_bgr = cv2.resize(self.source_image_bgr, (display_width, display_height), interpolation=interpolation)
+            display_rgb = cv2.cvtColor(display_bgr, cv2.COLOR_BGR2RGB)
+            header = f"P6 {display_width} {display_height} 255\n".encode("ascii")
+            self.photo = tk.PhotoImage(data=header + display_rgb.tobytes(), format="PPM")
+
+            x = max(0, (canvas_width - display_width) / 2.0)
+            y = max(0, (canvas_height - display_height) / 2.0)
+            self.image_bounds = (x, y, x + display_width, y + display_height)
             if self.canvas_message_id is not None:
                 self.canvas.delete(self.canvas_message_id)
                 self.canvas_message_id = None
@@ -267,9 +329,9 @@ class VisionPanel:
     def _on_canvas_click(self, event: tk.Event) -> str | None:
         if self.shift_down:
             point = self._canvas_to_image_point(event.x, event.y)
-            if point is not None and self.photo is not None:
+            if point is not None and self.image_width > 0 and self.image_height > 0:
                 self.pre_shift_status = None
-                self.move_point_to_center(point[0], point[1], self.photo.width(), self.photo.height())
+                self.move_point_to_center(point[0], point[1], self.image_width, self.image_height)
             return "break"
 
         tool = self.tool_var.get()
@@ -346,11 +408,13 @@ class VisionPanel:
             if update_status:
                 self.status_var.set("Click inside the camera image.")
             return None
-        return canvas_x - left, canvas_y - top
+        image_x = (canvas_x - left) / self.display_scale_x
+        image_y = (canvas_y - top) / self.display_scale_y
+        return max(0.0, min(float(self.image_width), image_x)), max(0.0, min(float(self.image_height), image_y))
 
     def _image_to_canvas_point(self, point: tuple[float, float]) -> tuple[float, float]:
         left, top, _right, _bottom = self.image_bounds or (0.0, 0.0, 0.0, 0.0)
-        return left + point[0], top + point[1]
+        return left + point[0] * self.display_scale_x, top + point[1] * self.display_scale_y
 
     def _format_pixel_measure(self, pixels: float, unit_suffix: str = "") -> str:
         um_per_px = self.get_um_per_px()
@@ -363,7 +427,7 @@ class VisionPanel:
     def _draw_move_hover(self) -> None:
         try:
             self.canvas.delete("move_hover")
-            if not self.shift_down or self.hover_canvas_point is None or self.image_bounds is None or self.photo is None:
+            if not self.shift_down or self.hover_canvas_point is None or self.image_bounds is None or self.image_width <= 0 or self.image_height <= 0:
                 return
             point = self._canvas_to_image_point(*self.hover_canvas_point, update_status=False)
             if point is None:
@@ -378,7 +442,7 @@ class VisionPanel:
             self.canvas.create_line(mouse_x, mouse_y - 6, mouse_x, mouse_y + 6, fill="#fef3c7", width=1, tags="move_hover")
             self.canvas.create_oval(center_x - 3, center_y - 3, center_x + 3, center_y + 3, outline="#fbbf24", width=1, tags="move_hover")
 
-            text = self.get_centering_preview(point[0], point[1], self.photo.width(), self.photo.height())
+            text = self.get_centering_preview(point[0], point[1], self.image_width, self.image_height)
             text_x = mouse_x + 14
             text_y = mouse_y + 14
             text_item = self.canvas.create_text(

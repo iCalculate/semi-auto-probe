@@ -36,6 +36,16 @@ MOTOR_SPEED_PROFILE_LABELS = {
     MOTOR_SPEED_PROFILE_FINE: "Fine Position",
     MOTOR_SPEED_PROFILE_SAFE: "Safe Debug",
 }
+CAMERA_CONTROL_MODE_AUTO = "auto"
+CAMERA_CONTROL_MODE_MANUAL = "manual"
+CAMERA_CONTROL_MODES = (
+    CAMERA_CONTROL_MODE_AUTO,
+    CAMERA_CONTROL_MODE_MANUAL,
+)
+CAMERA_CONTROL_MODE_LABELS = {
+    CAMERA_CONTROL_MODE_AUTO: "Auto",
+    CAMERA_CONTROL_MODE_MANUAL: "Manual",
+}
 
 
 def normalize_motor_speed_profile(value: Any) -> str:
@@ -51,6 +61,21 @@ def normalize_motor_speed_profile(value: Any) -> str:
     normalized = aliases.get(normalized, normalized)
     if normalized not in MOTOR_SPEED_PROFILES:
         raise ValueError(f"Motor speed profile must be one of {MOTOR_SPEED_PROFILES}.")
+    return normalized
+
+
+def normalize_camera_control_mode(value: Any) -> str:
+    normalized = str(value or CAMERA_CONTROL_MODE_AUTO).strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        CAMERA_CONTROL_MODE_AUTO: CAMERA_CONTROL_MODE_AUTO,
+        CAMERA_CONTROL_MODE_MANUAL: CAMERA_CONTROL_MODE_MANUAL,
+        "automatic": CAMERA_CONTROL_MODE_AUTO,
+        "auto_mode": CAMERA_CONTROL_MODE_AUTO,
+        "manual_mode": CAMERA_CONTROL_MODE_MANUAL,
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in CAMERA_CONTROL_MODES:
+        raise ValueError(f"Camera control mode must be one of {CAMERA_CONTROL_MODES}.")
     return normalized
 
 
@@ -216,6 +241,10 @@ class ProbeConfig:
         axis: dict(DEFAULT_CONTROLLER_MOTION_PARAMETERS[axis])
         for axis in JOG_STEP_AXES
     })
+    camera_exposure_mode: str = CAMERA_CONTROL_MODE_AUTO
+    camera_exposure: float = 0.0
+    camera_gain_mode: str = CAMERA_CONTROL_MODE_AUTO
+    camera_gain: float = 0.0
     cc_accel_time_s: float = 0.1
     autofocus_settle_ms: int = 100
     autofocus_sample_count: int = 5
@@ -223,6 +252,8 @@ class ProbeConfig:
     imgstitch_settle_ms: int = 100
     imgstitch_seam_response_yellow: float = 0.10
     imgstitch_seam_response_green: float = 0.25
+    layoutbond_fov_width_um: float = 200.0
+    layoutbond_fov_height_um: float = 150.0
     keyboard_motion_scheme: str = KEYBOARD_MOTION_SCHEME_ARROW_PAGE
     jog_step_levels: dict[str, tuple[int, ...]] = field(default_factory=lambda: dict(DEFAULT_JOG_STEP_LEVELS))
     focus_threshold_yellow: dict[str, float] = field(default_factory=lambda: {"Laplacian": 1000.0, "Tenengrad": 20000.0, "Brenner": 1000.0})
@@ -252,6 +283,14 @@ class ProbeConfig:
             raise ValueError("Safe motor speed percent must be in range 0..100.")
         self.active_motor_speed_profile = normalize_motor_speed_profile(self.active_motor_speed_profile)
         self.controller_motion_parameters = normalize_controller_motion_parameters_map(self.controller_motion_parameters)
+        self.camera_exposure_mode = normalize_camera_control_mode(self.camera_exposure_mode)
+        self.camera_gain_mode = normalize_camera_control_mode(self.camera_gain_mode)
+        self.camera_exposure = float(self.camera_exposure)
+        self.camera_gain = float(self.camera_gain)
+        if not math.isfinite(self.camera_exposure) or abs(self.camera_exposure) > 1_000_000:
+            raise ValueError("Camera exposure must be a finite number in range -1000000..1000000.")
+        if not math.isfinite(self.camera_gain) or self.camera_gain < 0 or self.camera_gain > 1_000_000:
+            raise ValueError("Camera gain must be a finite number in range 0..1000000.")
         if self.cc_accel_time_s < 0 or self.cc_accel_time_s > 2.55:
             raise ValueError("CC acceleration time must be in range 0..2.55 seconds.")
         if self.autofocus_settle_ms < 0 or self.autofocus_settle_ms > 10000:
@@ -265,6 +304,13 @@ class ProbeConfig:
             raise ValueError("ImgStitch seam response thresholds must be non-negative.")
         if self.imgstitch_seam_response_green < self.imgstitch_seam_response_yellow:
             raise ValueError("ImgStitch green seam response threshold must be greater than or equal to yellow threshold.")
+        if (
+            not math.isfinite(self.layoutbond_fov_width_um)
+            or not math.isfinite(self.layoutbond_fov_height_um)
+            or self.layoutbond_fov_width_um <= 0
+            or self.layoutbond_fov_height_um <= 0
+        ):
+            raise ValueError("LayoutBond FOV dimensions must be positive.")
         if self.keyboard_motion_scheme not in KEYBOARD_MOTION_SCHEMES:
             raise ValueError(f"Keyboard motion scheme must be one of {KEYBOARD_MOTION_SCHEMES}.")
         self.jog_step_levels = normalize_jog_step_levels_map(self.jog_step_levels)
@@ -349,6 +395,10 @@ class ProbeConfig:
                 axis: dict(self.controller_motion_parameters[axis])
                 for axis in JOG_STEP_AXES
             },
+            "camera_exposure_mode": self.camera_exposure_mode,
+            "camera_exposure": self.camera_exposure,
+            "camera_gain_mode": self.camera_gain_mode,
+            "camera_gain": self.camera_gain,
             "cc_accel_time_s": self.cc_accel_time_s,
             "autofocus_settle_ms": self.autofocus_settle_ms,
             "autofocus_sample_count": self.autofocus_sample_count,
@@ -356,6 +406,8 @@ class ProbeConfig:
             "imgstitch_settle_ms": self.imgstitch_settle_ms,
             "imgstitch_seam_response_yellow": self.imgstitch_seam_response_yellow,
             "imgstitch_seam_response_green": self.imgstitch_seam_response_green,
+            "layoutbond_fov_width_um": self.layoutbond_fov_width_um,
+            "layoutbond_fov_height_um": self.layoutbond_fov_height_um,
             "keyboard_motion_scheme": self.keyboard_motion_scheme,
             "jog_step_levels": {
                 axis: list(self.jog_step_levels[axis])
@@ -394,6 +446,10 @@ class ProbeConfig:
             safe_speed_percent=int(data.get("safe_speed_percent", cls.safe_speed_percent)),
             active_motor_speed_profile=normalize_motor_speed_profile(data.get("active_motor_speed_profile", MOTOR_SPEED_PROFILE_FAST)),
             controller_motion_parameters=normalize_controller_motion_parameters_map(controller_motion_parameters),
+            camera_exposure_mode=normalize_camera_control_mode(data.get("camera_exposure_mode", CAMERA_CONTROL_MODE_AUTO)),
+            camera_exposure=float(data.get("camera_exposure", cls.camera_exposure)),
+            camera_gain_mode=normalize_camera_control_mode(data.get("camera_gain_mode", CAMERA_CONTROL_MODE_AUTO)),
+            camera_gain=float(data.get("camera_gain", cls.camera_gain)),
             cc_accel_time_s=float(data.get("cc_accel_time_s", cls.cc_accel_time_s)),
             autofocus_settle_ms=int(data.get("autofocus_settle_ms", cls.autofocus_settle_ms)),
             autofocus_sample_count=int(data.get("autofocus_sample_count", cls.autofocus_sample_count)),
@@ -401,6 +457,8 @@ class ProbeConfig:
             imgstitch_settle_ms=int(data.get("imgstitch_settle_ms", cls.imgstitch_settle_ms)),
             imgstitch_seam_response_yellow=float(data.get("imgstitch_seam_response_yellow", cls.imgstitch_seam_response_yellow)),
             imgstitch_seam_response_green=float(data.get("imgstitch_seam_response_green", cls.imgstitch_seam_response_green)),
+            layoutbond_fov_width_um=float(data.get("layoutbond_fov_width_um", cls.layoutbond_fov_width_um)),
+            layoutbond_fov_height_um=float(data.get("layoutbond_fov_height_um", cls.layoutbond_fov_height_um)),
             keyboard_motion_scheme=str(data.get("keyboard_motion_scheme", KEYBOARD_MOTION_SCHEME_ARROW_PAGE)),
             jog_step_levels=normalize_jog_step_levels_map(data.get("jog_step_levels")),
             focus_threshold_yellow={

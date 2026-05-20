@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 import queue
+import os
+import tempfile
 
 from semi_auto_probe.config import ProbeConfig
 from semi_auto_probe.gds_stage_mapper import (
@@ -12,6 +14,7 @@ from semi_auto_probe.gds_stage_mapper import (
     GDSLayoutModel,
     GDSShape,
     GDSStageMapperPanel,
+    LAYOUTBOND_AUTOSAVE_FILENAME,
     layer_grid_position,
     render_gds_preview_ppm,
     snap_gds_point,
@@ -285,6 +288,8 @@ class GDSMapperMotionBridgeTests(unittest.TestCase):
         panel.current_coord_edit_mode = None
         panel.use_focus_z_var = DummyVar(False)
         panel.motion_status_var = DummyVar()
+        panel.layout_jog_step_uv_var = DummyVar("1")
+        panel.layout_jog_buttons = []
         panel.mapper = None
         panel.get_stage_position_um = lambda: (10.0, 20.0, 3.0)
         return panel
@@ -349,6 +354,20 @@ class GDSMapperMotionBridgeTests(unittest.TestCase):
 
         self.assertEqual(GDSStageMapperPanel._coordinate_target_from_edits(panel), (12.0, 4.0, 16.0))
 
+    def test_selected_target_move_uses_focus_z_when_enabled(self) -> None:
+        moves = []
+        panel = self.panel_for_coordinate_tests()
+        panel.selected_target_stage_um = (4.0, 5.0)
+        panel.use_focus_z_var = DummyVar(True)
+        panel.get_focus_z_um = lambda x_um, y_um: x_um + y_um
+        panel.move_to_stage_um = lambda x_um, y_um: moves.append((x_um, y_um, None))
+        panel.move_to_stage_xyz_um = lambda x_um, y_um, z_um: moves.append((x_um, y_um, z_um))
+
+        GDSStageMapperPanel.move_selected_target(panel)
+
+        self.assertEqual(moves, [(4.0, 5.0, 9.0)])
+        self.assertIn("Z 9", panel.motion_status_var.get())
+
     def test_selected_target_can_populate_coordinate_fields(self) -> None:
         panel = self.panel_for_coordinate_tests()
         panel.selected_target_stage_um = (4.0, 5.5)
@@ -359,6 +378,57 @@ class GDSMapperMotionBridgeTests(unittest.TestCase):
         self.assertEqual(panel.coord_vars["X"].get(), "4")
         self.assertEqual(panel.coord_vars["Y"].get(), "5.5")
         self.assertIn("copied", panel.motion_status_var.get())
+
+    def test_layout_uv_jog_requires_mapping_and_moves_mapped_stage(self) -> None:
+        moves = []
+        panel = self.panel_for_coordinate_tests()
+        panel.mapper = AffineCoordinateMapper.fit(
+            [
+                CalibrationPoint("P1", 0.0, 0.0, 10.0, 20.0),
+                CalibrationPoint("P2", 10.0, 0.0, 20.0, 20.0),
+                CalibrationPoint("P3", 0.0, 10.0, 10.0, 30.0),
+                CalibrationPoint("P4", 10.0, 10.0, 20.0, 30.0),
+            ]
+        )
+        panel.move_to_stage_xyz_um = lambda x_um, y_um, z_um: moves.append((x_um, y_um, z_um))
+
+        GDSStageMapperPanel._move_layout_uv_jog(panel, 1.0, 0.0)
+
+        self.assertEqual(moves, [(11.0, 20.0, None)])
+        self.assertIn("Layout UV jog requested", panel.motion_status_var.get())
+
+    def test_autosave_writes_default_ignored_layoutbond_file(self) -> None:
+        panel = self.panel_for_coordinate_tests()
+        panel.gds_path = None
+        panel.model = None
+        panel.top_cell_var = DummyVar("-")
+        panel.point_vars = {
+            name: {
+                "u": DummyVar(str(u)),
+                "v": DummyVar(str(v)),
+                "x_um": DummyVar(str(x_um)),
+                "y_um": DummyVar(str(y_um)),
+            }
+            for name, u, v, x_um, y_um in (
+                ("P1", 0, 0, 10, 20),
+                ("P2", 10, 0, 20, 20),
+                ("P3", 0, 10, 10, 30),
+                ("P4", 10, 10, 20, 30),
+            )
+        }
+        panel.fov_width_var = DummyVar("200")
+        panel.fov_height_var = DummyVar("150")
+        panel.residual_threshold_var = DummyVar("5")
+        panel.mapper = AffineCoordinateMapper.fit(GDSStageMapperPanel._points_from_entries(panel))
+        cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                os.chdir(tmpdir)
+                output = GDSStageMapperPanel._autosave_calibration_result(panel)
+                self.assertEqual(output.name, LAYOUTBOND_AUTOSAVE_FILENAME)
+                self.assertTrue(output.exists())
+            finally:
+                os.chdir(cwd)
 
     def test_worker_uses_existing_serial_move_api_with_um_target(self) -> None:
         try:

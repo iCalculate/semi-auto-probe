@@ -33,7 +33,7 @@ from .agent import (
     AgentPlan,
     build_agent_planner_from_config,
 )
-from .camera import UsbCamera
+from .camera import CameraSettings, UsbCamera
 from .config import (
     AUTOFOCUS_PEAK_MODEL_GAUSSIAN,
     AUTOFOCUS_PEAK_MODEL_LABELS,
@@ -41,6 +41,8 @@ from .config import (
     AUTOFOCUS_PEAK_MODELS,
     AUTOFOCUS_PEAK_MODEL_PARABOLIC,
     AUTOFOCUS_PEAK_MODEL_PSEUDO_VOIGT,
+    CAMERA_CONTROL_MODE_LABELS,
+    CAMERA_CONTROL_MODES,
     DEFAULT_AGENT_BASE_URL,
     DEFAULT_AGENT_MODEL,
     DEFAULT_AGENT_TIMEOUT_SECONDS,
@@ -59,6 +61,7 @@ from .config import (
     format_jog_step_levels,
     load_probe_config,
     normalize_autofocus_peak_model,
+    normalize_camera_control_mode,
     parse_jog_step_levels_text,
     pulses_from_um,
     save_probe_config,
@@ -344,7 +347,7 @@ class ProbeApp(tk.Tk):
         self.imgstitch_show_seams_var = tk.BooleanVar(value=True)
         self.imgstitch_green_edge_correction_var = tk.BooleanVar(value=True)
         self.imgstitch_white_balance_var = tk.BooleanVar(value=True)
-        self.imgstitch_focusmap_plane_var = tk.BooleanVar(value=False)
+        self.imgstitch_focusmap_plane_var = self.main_focusmap_plane_var
         self.imgstitch_quality_var = tk.StringVar(value="No seam data")
         self.imgstitch_point_status_var = tk.StringVar(value="No rectangle points")
         self.imgstitch_plane_af_var = tk.BooleanVar(value=False)
@@ -393,11 +396,17 @@ class ProbeApp(tk.Tk):
         }
         self.controller_motion_status_var = tk.StringVar(value="D5 controller parameters not read.")
         self.controller_motion_startup_read_done = False
+        self.camera_exposure_mode_var = tk.StringVar(value=self._camera_control_mode_label(self.probe_config.camera_exposure_mode))
+        self.camera_exposure_var = tk.StringVar(value=f"{self.probe_config.camera_exposure:g}")
+        self.camera_gain_mode_var = tk.StringVar(value=self._camera_control_mode_label(self.probe_config.camera_gain_mode))
+        self.camera_gain_var = tk.StringVar(value=f"{self.probe_config.camera_gain:g}")
         self.cc_accel_time_var = tk.StringVar(value=f"{self.probe_config.cc_accel_time_s:g}")
         self.autofocus_settle_ms_var = tk.StringVar(value=str(self.probe_config.autofocus_settle_ms))
         self.autofocus_sample_count_var = tk.StringVar(value=str(self.probe_config.autofocus_sample_count))
         self.autofocus_peak_model_var = tk.StringVar(value=self._autofocus_peak_model_label(self.probe_config.autofocus_peak_model))
         self.imgstitch_settle_ms_var = tk.StringVar(value=str(self.probe_config.imgstitch_settle_ms))
+        self.layoutbond_fov_width_var = tk.StringVar(value=f"{self.probe_config.layoutbond_fov_width_um:g}")
+        self.layoutbond_fov_height_var = tk.StringVar(value=f"{self.probe_config.layoutbond_fov_height_um:g}")
         self.keyboard_motion_scheme_var = tk.StringVar(value=self._keyboard_motion_scheme_label(self.probe_config.keyboard_motion_scheme))
         self.jog_step_level_vars = {
             axis: tk.StringVar(value=format_jog_step_levels(self.jog_step_levels[axis]))
@@ -459,7 +468,10 @@ class ProbeApp(tk.Tk):
             "surface": "#111821",
             "surface_2": "#151f2b",
             "surface_3": "#1b2735",
+            "input": "#0f1722",
+            "input_focus": "#102235",
             "border": "#263545",
+            "border_focus": "#38bdf8",
             "text": "#e5edf5",
             "muted": "#8fa0b3",
             "accent": "#34d399",
@@ -485,27 +497,45 @@ class ProbeApp(tk.Tk):
         style.configure("Position.TLabel", background=self.colors["surface_2"], foreground=self.colors["accent"], font=("Cascadia Mono", 18, "bold"))
         style.configure("Status.TLabel", background=self.colors["surface_2"], foreground=self.colors["accent"], font=("Segoe UI Semibold", 10))
         style.configure("Video.TLabel", background="#05070a", foreground=self.colors["muted"], font=("Segoe UI Semibold", 14))
-        style.configure("TButton", background=self.colors["surface_3"], foreground=self.colors["text"], bordercolor=self.colors["border"], focusthickness=0, padding=(10, 6))
-        style.map("TButton", background=[("active", "#223144"), ("pressed", "#1d2a3a")])
+        style.configure("TButton", background=self.colors["surface_3"], foreground=self.colors["text"], bordercolor=self.colors["border"], focusthickness=0, focuscolor=self.colors["border_focus"], relief="flat", borderwidth=1, padding=(11, 7))
+        style.map("TButton", background=[("active", "#223144"), ("pressed", "#1d2a3a"), ("disabled", "#111827")], foreground=[("disabled", "#64748b")], bordercolor=[("focus", self.colors["border_focus"])])
         style.configure("Accent.TButton", background="#0f3b2d", foreground="#d1fae5", bordercolor="#1f7a5a", padding=(12, 6))
         style.map("Accent.TButton", background=[("active", "#14543f"), ("pressed", "#0f3b2d")])
         style.configure("Danger.TButton", background="#4c0519", foreground="#ffe4e6", bordercolor="#be123c", padding=(12, 6))
         style.map("Danger.TButton", background=[("active", "#881337"), ("pressed", "#4c0519")])
         style.configure("Ghost.TButton", background=self.colors["surface"], foreground=self.colors["muted"], bordercolor=self.colors["border"], padding=(8, 6))
         style.map("Ghost.TButton", background=[("active", self.colors["surface_2"])], foreground=[("active", self.colors["text"])])
-        style.configure("TEntry", fieldbackground=self.colors["surface_2"], background=self.colors["surface_2"], foreground=self.colors["text"], bordercolor=self.colors["border"], insertcolor=self.colors["text"], padding=5)
+        style.configure("TEntry", fieldbackground=self.colors["input"], background=self.colors["input"], foreground=self.colors["text"], bordercolor=self.colors["border"], lightcolor=self.colors["border"], darkcolor=self.colors["border"], insertcolor=self.colors["accent"], relief="flat", borderwidth=1, padding=(10, 7))
         style.map(
             "TEntry",
-            fieldbackground=[("focus", self.colors["surface_2"]), ("!disabled", self.colors["surface_2"])],
-            foreground=[("focus", self.colors["text"]), ("!disabled", self.colors["text"])],
+            fieldbackground=[("focus", self.colors["input_focus"]), ("readonly", self.colors["input"]), ("disabled", "#101820"), ("!disabled", self.colors["input"])],
+            foreground=[("focus", self.colors["text"]), ("readonly", self.colors["text"]), ("disabled", "#64748b"), ("!disabled", self.colors["text"])],
+            bordercolor=[("focus", self.colors["border_focus"]), ("invalid", "#fb7185"), ("!disabled", self.colors["border"])],
+            lightcolor=[("focus", self.colors["border_focus"]), ("invalid", "#fb7185")],
+            darkcolor=[("focus", self.colors["border_focus"]), ("invalid", "#fb7185")],
         )
-        style.configure("TCombobox", fieldbackground=self.colors["surface_2"], background=self.colors["surface_2"], foreground=self.colors["text"], bordercolor=self.colors["border"], arrowcolor=self.colors["muted"], padding=5)
-        style.map("TCombobox", fieldbackground=[("readonly", self.colors["surface_2"])], foreground=[("readonly", self.colors["text"])])
-        style.configure("TSpinbox", fieldbackground=self.colors["surface_2"], background=self.colors["surface_2"], foreground=self.colors["text"], bordercolor=self.colors["border"], arrowcolor=self.colors["muted"], padding=5)
-        style.configure("Error.TSpinbox", fieldbackground="#3f1018", background="#3f1018", foreground="#fecdd3", bordercolor="#be123c", arrowcolor="#fecdd3", padding=5)
-        style.configure("Treeview", background=self.colors["surface_2"], fieldbackground=self.colors["surface_2"], foreground=self.colors["text"], bordercolor=self.colors["border"], rowheight=25)
-        style.configure("Treeview.Heading", background=self.colors["surface_3"], foreground=self.colors["text"], font=("Segoe UI Semibold", 9))
-        style.map("Treeview", background=[("selected", "#164e3d")], foreground=[("selected", "#d1fae5")])
+        style.configure("TCombobox", fieldbackground=self.colors["input"], background=self.colors["surface_3"], foreground=self.colors["text"], bordercolor=self.colors["border"], lightcolor=self.colors["border"], darkcolor=self.colors["border"], arrowcolor=self.colors["muted"], relief="flat", borderwidth=1, padding=(10, 7))
+        style.map(
+            "TCombobox",
+            fieldbackground=[("focus", self.colors["input_focus"]), ("readonly", self.colors["input"]), ("disabled", "#101820")],
+            foreground=[("readonly", self.colors["text"]), ("disabled", "#64748b")],
+            background=[("active", "#223144"), ("pressed", "#172536")],
+            bordercolor=[("focus", self.colors["border_focus"]), ("!disabled", self.colors["border"])],
+            arrowcolor=[("active", self.colors["accent"]), ("focus", self.colors["accent"]), ("!disabled", self.colors["muted"])],
+        )
+        style.configure("TSpinbox", fieldbackground=self.colors["input"], background=self.colors["surface_3"], foreground=self.colors["text"], bordercolor=self.colors["border"], lightcolor=self.colors["border"], darkcolor=self.colors["border"], arrowcolor=self.colors["muted"], relief="flat", borderwidth=1, padding=(10, 7), arrowsize=14)
+        style.map(
+            "TSpinbox",
+            fieldbackground=[("focus", self.colors["input_focus"]), ("disabled", "#101820"), ("!disabled", self.colors["input"])],
+            foreground=[("disabled", "#64748b"), ("!disabled", self.colors["text"])],
+            background=[("active", "#223144"), ("pressed", "#172536")],
+            bordercolor=[("focus", self.colors["border_focus"]), ("invalid", "#fb7185"), ("!disabled", self.colors["border"])],
+            arrowcolor=[("active", self.colors["accent"]), ("focus", self.colors["accent"]), ("!disabled", self.colors["muted"])],
+        )
+        style.configure("Error.TSpinbox", fieldbackground="#3f1018", background="#4c0519", foreground="#fecdd3", bordercolor="#be123c", lightcolor="#be123c", darkcolor="#be123c", arrowcolor="#fecdd3", relief="flat", borderwidth=1, padding=(10, 7), arrowsize=14)
+        style.configure("Treeview", background=self.colors["input"], fieldbackground=self.colors["input"], foreground=self.colors["text"], bordercolor=self.colors["border"], lightcolor=self.colors["border"], darkcolor=self.colors["border"], rowheight=28, relief="flat", borderwidth=1)
+        style.configure("Treeview.Heading", background=self.colors["surface_3"], foreground=self.colors["text"], relief="flat", borderwidth=0, padding=(8, 7), font=("Segoe UI Semibold", 9))
+        style.map("Treeview", background=[("selected", "#0f766e")], foreground=[("selected", "#f8fafc")])
         style.configure(
             "FocusMap.Treeview",
             background="#0f1722",
@@ -532,8 +562,16 @@ class ProbeApp(tk.Tk):
         )
         style.map("FocusMap.Treeview.Heading", background=[("active", "#293a50")])
         style.configure("Horizontal.TProgressbar", background=self.colors["accent"], troughcolor=self.colors["surface_2"], bordercolor=self.colors["border"])
-        style.configure("TRadiobutton", background=self.colors["surface"], foreground=self.colors["text"], indicatorcolor=self.colors["surface_2"], padding=(4, 2))
-        style.map("TRadiobutton", background=[("active", self.colors["surface"])], foreground=[("active", self.colors["text"])], indicatorcolor=[("selected", self.colors["accent"])])
+        style.configure("TCheckbutton", background=self.colors["surface"], foreground=self.colors["text"], indicatorcolor=self.colors["input"], indicatormargin=6, padding=(6, 4), focuscolor=self.colors["border_focus"])
+        style.map(
+            "TCheckbutton",
+            background=[("active", self.colors["surface"])],
+            foreground=[("active", self.colors["text"]), ("disabled", "#64748b")],
+            indicatorcolor=[("selected", self.colors["accent"]), ("active", "#223144"), ("!selected", self.colors["input"])],
+            bordercolor=[("focus", self.colors["border_focus"])],
+        )
+        style.configure("TRadiobutton", background=self.colors["surface"], foreground=self.colors["text"], indicatorcolor=self.colors["input"], padding=(6, 4), focuscolor=self.colors["border_focus"])
+        style.map("TRadiobutton", background=[("active", self.colors["surface"])], foreground=[("active", self.colors["text"])], indicatorcolor=[("selected", self.colors["accent"]), ("!selected", self.colors["input"])])
         style.configure("TNotebook", background=self.colors["bg"], borderwidth=0, tabmargins=(0, 4, 0, 0))
         style.configure(
             "TNotebook.Tab",
@@ -551,13 +589,13 @@ class ProbeApp(tk.Tk):
         )
         style.configure("TLabelframe", background=self.colors["surface"], bordercolor=self.colors["border"])
         style.configure("TLabelframe.Label", background=self.colors["surface"], foreground=self.colors["muted"], font=("Segoe UI Semibold", 9))
-        self.option_add("*Entry.selectBackground", "#2563eb")
+        self.option_add("*Entry.selectBackground", "#0e7490")
         self.option_add("*Entry.selectForeground", "#f8fafc")
-        self.option_add("*Spinbox.selectBackground", "#2563eb")
+        self.option_add("*Spinbox.selectBackground", "#0e7490")
         self.option_add("*Spinbox.selectForeground", "#f8fafc")
-        self.option_add("*TCombobox*Listbox.background", self.colors["surface_2"])
+        self.option_add("*TCombobox*Listbox.background", self.colors["input"])
         self.option_add("*TCombobox*Listbox.foreground", self.colors["text"])
-        self.option_add("*TCombobox*Listbox.selectBackground", "#2563eb")
+        self.option_add("*TCombobox*Listbox.selectBackground", "#0e7490")
         self.option_add("*TCombobox*Listbox.selectForeground", "#f8fafc")
 
     @staticmethod
@@ -613,14 +651,14 @@ class ProbeApp(tk.Tk):
         return {
             "relief": "flat",
             "bd": 0,
-            "bg": self.colors["surface_2"],
+            "bg": self.colors["input"],
             "fg": fg or self.colors["text"],
-            "insertbackground": self.colors["text"],
-            "selectbackground": "#2563eb",
+            "insertbackground": self.colors["accent"],
+            "selectbackground": "#0e7490",
             "selectforeground": "#f8fafc",
-            "highlightthickness": 1,
+            "highlightthickness": 2,
             "highlightbackground": self.colors["border"],
-            "highlightcolor": "#38bdf8",
+            "highlightcolor": self.colors["border_focus"],
             "font": font,
         }
 
@@ -662,7 +700,7 @@ class ProbeApp(tk.Tk):
         increment: float | int = 1,
         width: int = 9,
         command: Callable[[], None] | None = None,
-    ) -> tk.Spinbox:
+    ) -> ttk.Spinbox:
         if kind == "float":
             validate_command = self.register(lambda proposed: self._float_text_allowed(proposed, float(from_value), float(to_value)))
         else:
@@ -675,12 +713,11 @@ class ProbeApp(tk.Tk):
             "width": width,
             "validate": "key",
             "validatecommand": (validate_command, "%P"),
-            "buttonbackground": self.colors["surface_3"],
-            **self._numeric_widget_options(),
+            "style": "TSpinbox",
         }
         if command is not None:
             options["command"] = command
-        spinbox = tk.Spinbox(parent, **options)
+        spinbox = ttk.Spinbox(parent, **options)
         return spinbox
 
     def _jog_step_levels_entry(self, parent: tk.Widget, variable: tk.StringVar) -> tk.Entry:
@@ -725,27 +762,39 @@ class ProbeApp(tk.Tk):
         content.rowconfigure(1, weight=1)
 
         self.tab_buttons: dict[str, tk.Label] = {}
+        module_tab_labels = {
+            "Main": "🏠 MainView",
+            "AutoFocus": "🎯 AutoFocus",
+            "FocusMap": "🗺 FocusMap",
+            "ImgStitch": "🧩 ImgStitch",
+            "LayoutBond": "📐 LayoutMap",
+            "AI Agent": "🤖 AI Agent",
+            "Communication": "🔌 SerialIO",
+            "Config": "⚙ Settings",
+        }
         tab_bar = ttk.Frame(content, style="App.TFrame")
         tab_bar.grid(row=0, column=0, sticky="w")
-        for col, name in enumerate(("Main", "Communication", "AutoFocus", "FocusMap", "ImgStitch", "LayoutBond", "AI Agent", "Config")):
-            tab_bar.columnconfigure(col, weight=1, uniform="top_tabs", minsize=125)
+        for col, name in enumerate(("Main", "AutoFocus", "FocusMap", "ImgStitch", "LayoutBond", "AI Agent", "Communication", "Config")):
+            tab_bar.columnconfigure(col, minsize=124, uniform="top_tabs")
             label = tk.Label(
                 tab_bar,
-                text=name,
+                text=module_tab_labels[name],
                 anchor="center",
-                bg="#172536" if name == "Main" else "#0f1722",
-                fg="#d1fae5" if name == "Main" else self.colors["muted"],
-                font=("Segoe UI Semibold", 10),
-                padx=14,
-                pady=10,
+                bg="#17324a" if name == "Main" else "#132236",
+                fg="#f8fafc" if name == "Main" else "#c7d2e1",
+                font=("Segoe UI Emoji", 12),
+                padx=8,
+                pady=9,
                 bd=0,
                 highlightthickness=1,
-                highlightbackground=self.colors["border"],
-                highlightcolor=self.colors["border"],
+                highlightbackground="#22d3ee" if name == "Main" else "#31506b",
+                highlightcolor="#22d3ee",
                 cursor="hand2",
             )
-            label.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 1, 0))
+            label.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 6, 0), pady=(0, 2))
             label.bind("<Button-1>", lambda _event, page=name: self.show_page(page))
+            label.bind("<Enter>", lambda _event, page=name: self._set_tab_hover(page, True))
+            label.bind("<Leave>", lambda _event, page=name: self._set_tab_hover(page, False))
             self.tab_buttons[name] = label
 
         page_container = ttk.Frame(content, style="App.TFrame")
@@ -807,11 +856,21 @@ class ProbeApp(tk.Tk):
         for page_name, button in self.tab_buttons.items():
             selected = page_name == name
             button.configure(
-                bg="#172536" if selected else "#0f1722",
-                fg="#d1fae5" if selected else self.colors["muted"],
-                highlightbackground="#2dd4bf" if selected else self.colors["border"],
+                bg="#17324a" if selected else "#132236",
+                fg="#f8fafc" if selected else "#c7d2e1",
+                highlightbackground="#22d3ee" if selected else "#31506b",
             )
         self.after_idle(lambda page_name=name: self._refresh_after_page_switch(page_name))
+
+    def _set_tab_hover(self, name: str, is_hovered: bool) -> None:
+        button = self.tab_buttons.get(name)
+        if button is None or name == self.active_page_name:
+            return
+        button.configure(
+            bg="#1b3651" if is_hovered else "#132236",
+            fg="#f8fafc" if is_hovered else "#c7d2e1",
+            highlightbackground="#4f7a9d" if is_hovered else "#31506b",
+        )
 
     def _warm_page_layouts(self) -> None:
         for page in self.pages.values():
@@ -890,6 +949,10 @@ class ProbeApp(tk.Tk):
             move_to_stage_xyz_um=self.move_gds_mapper_stage_target,
             get_focus_z_um=self._gds_mapper_focus_z_um,
             get_microscope_preview=self.agent_microscope_preview,
+            fov_width_var=self.layoutbond_fov_width_var,
+            fov_height_var=self.layoutbond_fov_height_var,
+            use_focus_z_var=self.main_focusmap_plane_var,
+            on_focus_z_toggle=self._on_main_focusmap_plane_toggle,
             set_status=self.status_var.set,
         )
 
@@ -1278,7 +1341,13 @@ class ProbeApp(tk.Tk):
             self.gds_stage_mapper_panel.set_motion_status(message)
 
     def move_gds_mapper_target(self, target_x_um: float, target_y_um: float) -> None:
-        self.move_gds_mapper_stage_target(target_x_um, target_y_um, None)
+        target_z_um = None
+        if self.main_focusmap_plane_var.get():
+            target_z_um = self._gds_mapper_focus_z_um(target_x_um, target_y_um)
+            if target_z_um is None:
+                self._set_gds_mapper_status("FocusMap Z is enabled, but no FocusMap plane is stored.")
+                return
+        self.move_gds_mapper_stage_target(target_x_um, target_y_um, target_z_um)
 
     def move_gds_mapper_stage_target(self, target_x_um: float, target_y_um: float, target_z_um: float | None = None) -> None:
         blocker = self._gds_mapper_motion_blocker()
@@ -1497,11 +1566,16 @@ class ProbeApp(tk.Tk):
 
         self.comm_input = tk.Text(
             command_panel,
-            bg=self.colors["surface_2"],
+            bg=self.colors["input"],
             fg=self.colors["text"],
-            insertbackground=self.colors["text"],
-            selectbackground=self.colors["surface_3"],
+            insertbackground=self.colors["accent"],
+            selectbackground="#0e7490",
+            selectforeground="#f8fafc",
             relief="flat",
+            bd=0,
+            highlightthickness=2,
+            highlightbackground=self.colors["border"],
+            highlightcolor=self.colors["border_focus"],
             wrap="word",
             font=("Cascadia Mono", 10),
             padx=10,
@@ -1528,11 +1602,16 @@ class ProbeApp(tk.Tk):
 
         self.hex_history = tk.Text(
             history_panel,
-            bg=self.colors["surface_2"],
+            bg=self.colors["input"],
             fg=self.colors["text"],
-            insertbackground=self.colors["text"],
-            selectbackground=self.colors["surface_3"],
+            insertbackground=self.colors["accent"],
+            selectbackground="#0e7490",
+            selectforeground="#f8fafc",
             relief="flat",
+            bd=0,
+            highlightthickness=2,
+            highlightbackground=self.colors["border"],
+            highlightcolor=self.colors["border_focus"],
             wrap="word",
             font=("Cascadia Mono", 10),
             padx=12,
@@ -2064,13 +2143,16 @@ class ProbeApp(tk.Tk):
 
         plane_check = ttk.Checkbutton(control_panel, text="Four-corner plane AF", variable=self.imgstitch_plane_af_var)
         plane_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        focusmap_plane_check = ttk.Checkbutton(
-            control_panel,
-            text="Use FocusMap plane Z",
-            variable=self.imgstitch_focusmap_plane_var,
+        focusmap_plane_check = ttk.Frame(control_panel, style="Panel.TFrame")
+        focusmap_plane_check.grid(row=row + 1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        focusmap_plane_check.columnconfigure(0, weight=1)
+        ttk.Label(focusmap_plane_check, text="FocusMap plane Z", style="Panel.TLabel").grid(row=0, column=0, sticky="w")
+        ToggleSwitch(
+            focusmap_plane_check,
+            self.imgstitch_focusmap_plane_var,
+            self.colors,
             command=self._on_imgstitch_focusmap_plane_toggle,
-        )
-        focusmap_plane_check.grid(row=row + 1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=0, column=1, sticky="e")
         start_button = ttk.Button(control_panel, text="Start", style="Accent.TButton", command=self.start_imgstitch)
         start_button.grid(row=row + 2, column=0, sticky="ew", pady=(8, 0), padx=(0, 5))
         recompose_button = ttk.Button(control_panel, text="Apply and Recalculate", command=self.recompose_imgstitch_session)
@@ -2142,6 +2224,52 @@ class ProbeApp(tk.Tk):
         for row_index, axis in enumerate(JOG_STEP_AXES, start=2):
             ttk.Label(main_control_panel, text=f"Alt+{axis} levels", style="Muted.TLabel").grid(row=row_index, column=0, sticky="w", pady=2)
             self._jog_step_levels_entry(main_control_panel, self.jog_step_level_vars[axis]).grid(row=row_index, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+
+        ttk.Label(main_control_panel, text="LayoutBond FOV W (um)", style="Muted.TLabel").grid(row=5, column=0, sticky="w", pady=(10, 2))
+        self._numeric_entry(main_control_panel, self.layoutbond_fov_width_var, kind="float", minimum=0.000001, maximum=1_000_000).grid(row=5, column=1, sticky="ew", padx=(8, 0), pady=(10, 2), ipady=5)
+        ttk.Label(main_control_panel, text="LayoutBond FOV H (um)", style="Muted.TLabel").grid(row=6, column=0, sticky="w", pady=2)
+        self._numeric_entry(main_control_panel, self.layoutbond_fov_height_var, kind="float", minimum=0.000001, maximum=1_000_000).grid(row=6, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+
+        camera_control_panel = ttk.Frame(optical_panel, style="Panel.TFrame")
+        camera_control_panel.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(24, 0))
+        camera_control_panel.columnconfigure(1, weight=1)
+        camera_mode_values = [CAMERA_CONTROL_MODE_LABELS[mode] for mode in CAMERA_CONTROL_MODES]
+        ttk.Label(camera_control_panel, text="CAMERA CONTROL", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        ttk.Label(camera_control_panel, text="Exposure mode", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=2)
+        exposure_mode_combo = ttk.Combobox(
+            camera_control_panel,
+            values=camera_mode_values,
+            textvariable=self.camera_exposure_mode_var,
+            state="readonly",
+        )
+        exposure_mode_combo.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=2)
+        ttk.Label(camera_control_panel, text="Exposure value", style="Muted.TLabel").grid(row=2, column=0, sticky="w", pady=2)
+        self._numeric_entry(
+            camera_control_panel,
+            self.camera_exposure_var,
+            kind="float",
+            minimum=-1_000_000,
+            maximum=1_000_000,
+            width=8,
+        ).grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+        ttk.Label(camera_control_panel, text="Gain mode", style="Muted.TLabel").grid(row=3, column=0, sticky="w", pady=2)
+        gain_mode_combo = ttk.Combobox(
+            camera_control_panel,
+            values=camera_mode_values,
+            textvariable=self.camera_gain_mode_var,
+            state="readonly",
+        )
+        gain_mode_combo.grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=2)
+        ttk.Label(camera_control_panel, text="Gain value", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=2)
+        self._numeric_entry(
+            camera_control_panel,
+            self.camera_gain_var,
+            kind="float",
+            minimum=0,
+            maximum=1_000_000,
+            width=8,
+        ).grid(row=4, column=1, sticky="ew", padx=(8, 0), pady=2, ipady=5)
+        ttk.Button(camera_control_panel, text="Apply Camera", style="Accent.TButton", command=self.apply_camera_config).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(10, 0))
 
         ttk.Label(motion_panel, text="MOTOR MAPPING", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
 
@@ -2423,6 +2551,19 @@ class ProbeApp(tk.Tk):
             if label == scheme_label or label == scheme:
                 return scheme
         return KEYBOARD_MOTION_SCHEME_ARROW_PAGE
+
+    @staticmethod
+    def _camera_control_mode_label(mode: str) -> str:
+        normalized = normalize_camera_control_mode(mode)
+        return CAMERA_CONTROL_MODE_LABELS[normalized]
+
+    @staticmethod
+    def _camera_control_mode_from_label(label: str) -> str:
+        normalized_label = label.strip().lower()
+        for mode, mode_label in CAMERA_CONTROL_MODE_LABELS.items():
+            if normalized_label == mode_label.lower() or normalized_label == mode:
+                return mode
+        return normalize_camera_control_mode(label)
 
     def _expected_admin_tokens(self) -> tuple[str, ...]:
         tokens: list[str] = []
@@ -2761,7 +2902,7 @@ class ProbeApp(tk.Tk):
         value = ttk.Label(parent, textvariable=self.status_var, style="Status.TLabel", wraplength=300, padding=10)
         value.grid(row=row + 1, column=0, sticky="ew")
 
-    def _ppm_with_scalebar(self, image_bgr) -> bytes:
+    def _bgr_with_scalebar(self, image_bgr):
         import cv2
 
         image = image_bgr.copy()
@@ -2794,6 +2935,12 @@ class ProbeApp(tk.Tk):
             cv2.putText(image, label, (x0 + 1, y0 - 13), cv2.FONT_HERSHEY_SIMPLEX, 0.58, shadow_color, 3, cv2.LINE_AA)
             cv2.putText(image, label, (x0, y0 - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.58, bar_color, 2, cv2.LINE_AA)
 
+        return image
+
+    def _ppm_with_scalebar(self, image_bgr) -> bytes:
+        import cv2
+
+        image = self._bgr_with_scalebar(image_bgr)
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         out_height, out_width = rgb.shape[:2]
         header = f"P6 {out_width} {out_height} 255\n".encode("ascii")
@@ -2819,11 +2966,17 @@ class ProbeApp(tk.Tk):
                     }
                     for axis in JOG_STEP_AXES
                 },
+                camera_exposure_mode=self._camera_control_mode_from_label(self.camera_exposure_mode_var.get()),
+                camera_exposure=float(self.camera_exposure_var.get() or 0.0),
+                camera_gain_mode=self._camera_control_mode_from_label(self.camera_gain_mode_var.get()),
+                camera_gain=float(self.camera_gain_var.get() or 0.0),
                 cc_accel_time_s=float(self.cc_accel_time_var.get()),
                 autofocus_settle_ms=int(self.autofocus_settle_ms_var.get()),
                 autofocus_sample_count=int(self.autofocus_sample_count_var.get()),
                 autofocus_peak_model=self._autofocus_peak_model_from_label(self.autofocus_peak_model_var.get()),
                 imgstitch_settle_ms=int(self.imgstitch_settle_ms_var.get()),
+                layoutbond_fov_width_um=float(self.layoutbond_fov_width_var.get()),
+                layoutbond_fov_height_um=float(self.layoutbond_fov_height_var.get()),
                 keyboard_motion_scheme=self._keyboard_motion_scheme_from_label(self.keyboard_motion_scheme_var.get()),
                 jog_step_levels={
                     axis: parse_jog_step_levels_text(self.jog_step_level_vars[axis].get())
@@ -2867,6 +3020,21 @@ class ProbeApp(tk.Tk):
             self.status_var.set("Config saved.")
         return True
 
+    def apply_camera_config(self) -> None:
+        if not self.apply_config(save=True):
+            return
+        self.restart_camera()
+        self.config_status_var.set(f"Saved {self.config_path.name}; camera restarted.")
+        self.status_var.set("Camera config saved and applied.")
+
+    def _camera_settings_from_config(self) -> CameraSettings:
+        return CameraSettings(
+            exposure_mode=self.probe_config.camera_exposure_mode,
+            exposure=self.probe_config.camera_exposure,
+            gain_mode=self.probe_config.camera_gain_mode,
+            gain=self.probe_config.camera_gain,
+        )
+
     def _sync_config_vars_from_config(self) -> None:
         self.objective_var.set(str(self.probe_config.objective))
         self.eyepiece_var.set(f"{self.probe_config.eyepiece:g}")
@@ -2881,11 +3049,17 @@ class ProbeApp(tk.Tk):
         for axis in JOG_STEP_AXES:
             for field_name in ("minimum_speed", "work_speed", "acceleration"):
                 self.controller_motion_parameter_vars[axis][field_name].set(str(self.probe_config.controller_motion_parameters[axis][field_name]))
+        self.camera_exposure_mode_var.set(self._camera_control_mode_label(self.probe_config.camera_exposure_mode))
+        self.camera_exposure_var.set(f"{self.probe_config.camera_exposure:g}")
+        self.camera_gain_mode_var.set(self._camera_control_mode_label(self.probe_config.camera_gain_mode))
+        self.camera_gain_var.set(f"{self.probe_config.camera_gain:g}")
         self.cc_accel_time_var.set(f"{self.probe_config.cc_accel_time_s:g}")
         self.autofocus_settle_ms_var.set(str(self.probe_config.autofocus_settle_ms))
         self.autofocus_sample_count_var.set(str(self.probe_config.autofocus_sample_count))
         self.autofocus_peak_model_var.set(self._autofocus_peak_model_label(self.probe_config.autofocus_peak_model))
         self.imgstitch_settle_ms_var.set(str(self.probe_config.imgstitch_settle_ms))
+        self.layoutbond_fov_width_var.set(f"{self.probe_config.layoutbond_fov_width_um:g}")
+        self.layoutbond_fov_height_var.set(f"{self.probe_config.layoutbond_fov_height_um:g}")
         self.keyboard_motion_scheme_var.set(self._keyboard_motion_scheme_label(self.probe_config.keyboard_motion_scheme))
         self.jog_step_levels = {
             axis: tuple(self.probe_config.jog_step_levels[axis])
@@ -2938,11 +3112,19 @@ class ProbeApp(tk.Tk):
                     for axis, params in self.probe_config.controller_motion_parameters.items()
                 )
             ),
+            (
+                "Camera: "
+                f"exposure {self._camera_control_mode_label(self.probe_config.camera_exposure_mode)} "
+                f"{self.probe_config.camera_exposure:g}, "
+                f"gain {self._camera_control_mode_label(self.probe_config.camera_gain_mode)} "
+                f"{self.probe_config.camera_gain:g}"
+            ),
             f"CC accel/decel: {self.probe_config.cc_accel_time_s:.3g}s ({self.probe_config.cc_acceleration_units()} units)",
             f"AF settle: {self.probe_config.autofocus_settle_ms} ms",
             f"AF integration: {self.probe_config.autofocus_sample_count} frame(s)",
             f"AF peak model: {self._autofocus_peak_model_label(self.probe_config.autofocus_peak_model)}",
             f"Stitch settle: {self.probe_config.imgstitch_settle_ms} ms",
+            f"LayoutBond FOV: {self.probe_config.layoutbond_fov_width_um:g} x {self.probe_config.layoutbond_fov_height_um:g} um",
             f"Keyboard: {self._keyboard_motion_scheme_label(self.probe_config.keyboard_motion_scheme)}",
             "Jog levels: "
             + "; ".join(
@@ -5278,8 +5460,10 @@ class ProbeApp(tk.Tk):
 
     def _on_imgstitch_focusmap_plane_toggle(self) -> None:
         if not self.imgstitch_focusmap_plane_var.get():
+            self.clear_position_edits()
             return
         if get_sample_plane_model() is not None:
+            self._on_main_focusmap_plane_toggle()
             return
         message = self._focusmap_plane_missing_message()
         self.imgstitch_focusmap_plane_var.set(False)
@@ -7409,7 +7593,7 @@ class ProbeApp(tk.Tk):
         self._set_camera_index_error(False)
         with self.camera_lock:
             self.latest_camera_frame = None
-        self.camera = UsbCamera(index=index, width=800, height=450)
+        self.camera = UsbCamera(index=index, width=800, height=450, settings=self._camera_settings_from_config())
         self.camera_running = True
         self.camera_rendering = True
         logger.info("Starting USB camera preview on index %s.", index)
@@ -7468,24 +7652,7 @@ class ProbeApp(tk.Tk):
 
     def _set_camera_index_error(self, is_error: bool) -> None:
         if hasattr(self, "camera_index_spinbox"):
-            if is_error:
-                self.camera_index_spinbox.configure(
-                    bg="#3f1018",
-                    fg="#fecdd3",
-                    highlightbackground="#be123c",
-                    highlightcolor="#fb7185",
-                    insertbackground="#fecdd3",
-                    buttonbackground="#4c0519",
-                )
-            else:
-                self.camera_index_spinbox.configure(
-                    bg=self.colors["surface_2"],
-                    fg=self.colors["text"],
-                    highlightbackground=self.colors["border"],
-                    highlightcolor="#38bdf8",
-                    insertbackground=self.colors["text"],
-                    buttonbackground=self.colors["surface_3"],
-                )
+            self.camera_index_spinbox.configure(style="Error.TSpinbox" if is_error else "TSpinbox")
 
     def _update_camera_frame(self) -> None:
         if not self.camera_rendering:
@@ -7497,8 +7664,8 @@ class ProbeApp(tk.Tk):
         if frame:
             publish_camera_frame(frame.image_bgr)
             if self.current_page == "Main" and self.vision_panel:
-                self.camera_image = tk.PhotoImage(data=self._ppm_with_scalebar(frame.image_bgr), format="PPM")
-                self.vision_panel.set_image(self.camera_image)
+                self.vision_panel.set_image_bgr(self._bgr_with_scalebar(frame.image_bgr))
+                self.camera_image = self.vision_panel.photo
             with self.focus_lock:
                 self.latest_focus_frame_ppm = frame.ppm_bytes
             with self.camera_lock:

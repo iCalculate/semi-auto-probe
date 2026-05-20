@@ -4,6 +4,8 @@ from pathlib import Path
 
 from semi_auto_probe.config import (
     AUTOFOCUS_PEAK_MODEL_LORENTZIAN,
+    CAMERA_CONTROL_MODE_AUTO,
+    CAMERA_CONTROL_MODE_MANUAL,
     DEFAULT_AGENT_BASE_URL,
     DEFAULT_AGENT_MODEL,
     DEFAULT_CONFIG_FILENAME,
@@ -38,6 +40,10 @@ class ProbeConfigTest(unittest.TestCase):
         self.assertEqual(config.safe_speed_percent, 15)
         self.assertEqual(config.active_motor_speed_profile, MOTOR_SPEED_PROFILE_FAST)
         self.assertEqual(config.motor_speed_percent(), 100)
+        self.assertEqual(config.camera_exposure_mode, CAMERA_CONTROL_MODE_AUTO)
+        self.assertEqual(config.camera_exposure, 0.0)
+        self.assertEqual(config.camera_gain_mode, CAMERA_CONTROL_MODE_AUTO)
+        self.assertEqual(config.camera_gain, 0.0)
         self.assertEqual(
             config.controller_motion_parameters,
             {
@@ -91,7 +97,13 @@ class ProbeConfigTest(unittest.TestCase):
                     "Y": {"minimum_speed": 6, "work_speed": 90, "acceleration": 11},
                     "Z": {"minimum_speed": 7, "work_speed": 80, "acceleration": 12},
                 },
+                camera_exposure_mode=CAMERA_CONTROL_MODE_MANUAL,
+                camera_exposure=-6.0,
+                camera_gain_mode=CAMERA_CONTROL_MODE_MANUAL,
+                camera_gain=12.5,
                 cc_accel_time_s=0.2,
+                layoutbond_fov_width_um=320.0,
+                layoutbond_fov_height_um=240.0,
             )
             config.set_calibration(5, 2.5, 1.25)
 
@@ -111,7 +123,13 @@ class ProbeConfigTest(unittest.TestCase):
             self.assertEqual(loaded.controller_motion_parameters["X"], {"minimum_speed": 5, "work_speed": 100, "acceleration": 10})
             self.assertEqual(loaded.controller_motion_parameters["Y"], {"minimum_speed": 6, "work_speed": 90, "acceleration": 11})
             self.assertEqual(loaded.controller_motion_parameters["Z"], {"minimum_speed": 7, "work_speed": 80, "acceleration": 12})
+            self.assertEqual(loaded.camera_exposure_mode, CAMERA_CONTROL_MODE_MANUAL)
+            self.assertAlmostEqual(loaded.camera_exposure, -6.0)
+            self.assertEqual(loaded.camera_gain_mode, CAMERA_CONTROL_MODE_MANUAL)
+            self.assertAlmostEqual(loaded.camera_gain, 12.5)
             self.assertAlmostEqual(loaded.cc_accel_time_s, 0.2)
+            self.assertAlmostEqual(loaded.layoutbond_fov_width_um, 320.0)
+            self.assertAlmostEqual(loaded.layoutbond_fov_height_um, 240.0)
             self.assertAlmostEqual(loaded.current_um_per_px(), 1.25)
 
     def test_imgstitch_seam_thresholds_round_trip(self) -> None:

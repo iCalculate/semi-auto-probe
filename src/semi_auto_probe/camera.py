@@ -3,6 +3,8 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
+from .config import CAMERA_CONTROL_MODE_AUTO, CAMERA_CONTROL_MODE_MANUAL, normalize_camera_control_mode
+
 
 @dataclass(frozen=True)
 class CameraFrame:
@@ -14,11 +16,20 @@ class CameraFrame:
     captured_at: float
 
 
+@dataclass(frozen=True)
+class CameraSettings:
+    exposure_mode: str = CAMERA_CONTROL_MODE_AUTO
+    exposure: float = 0.0
+    gain_mode: str = CAMERA_CONTROL_MODE_AUTO
+    gain: float = 0.0
+
+
 class UsbCamera:
-    def __init__(self, index: int = 0, width: int = 960, height: int = 540) -> None:
+    def __init__(self, index: int = 0, width: int = 960, height: int = 540, settings: CameraSettings | None = None) -> None:
         self.index = index
         self.width = width
         self.height = height
+        self.settings = settings or CameraSettings()
         self._cv2 = None
         self._capture = None
         self._last_frame_time: float | None = None
@@ -53,6 +64,7 @@ class UsbCamera:
         self._capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self._capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         self._capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self._apply_settings()
         self._update_property_text()
 
     def read(self, calculate_focus_scores: bool = True) -> CameraFrame | None:
@@ -159,7 +171,43 @@ class UsbCamera:
         exposure = self._capture.get(cv2.CAP_PROP_EXPOSURE)
         gain = self._capture.get(cv2.CAP_PROP_GAIN)
         auto_exposure = self._capture.get(cv2.CAP_PROP_AUTO_EXPOSURE)
-        self._property_text = f"EXP {self._format_property(exposure)}  GAIN {self._format_property(gain)}  AUTO {self._format_property(auto_exposure)}"
+        exposure_mode = "A" if normalize_camera_control_mode(self.settings.exposure_mode) == CAMERA_CONTROL_MODE_AUTO else "M"
+        gain_mode = "A" if normalize_camera_control_mode(self.settings.gain_mode) == CAMERA_CONTROL_MODE_AUTO else "M"
+        self._property_text = (
+            f"EXP {self._format_property(exposure)} {exposure_mode}  "
+            f"GAIN {self._format_property(gain)} {gain_mode}  "
+            f"AUTO {self._format_property(auto_exposure)}"
+        )
+
+    def _apply_settings(self) -> None:
+        if not self._capture or self._cv2 is None:
+            return
+
+        cv2 = self._cv2
+        exposure_mode = normalize_camera_control_mode(self.settings.exposure_mode)
+        gain_mode = normalize_camera_control_mode(self.settings.gain_mode)
+        if exposure_mode == CAMERA_CONTROL_MODE_AUTO:
+            self._set_first_supported(cv2.CAP_PROP_AUTO_EXPOSURE, (0.75, 1.0))
+        else:
+            self._set_first_supported(cv2.CAP_PROP_AUTO_EXPOSURE, (0.25, 0.0))
+            self._set_property(cv2.CAP_PROP_EXPOSURE, float(self.settings.exposure))
+
+        if gain_mode == CAMERA_CONTROL_MODE_MANUAL:
+            self._set_property(cv2.CAP_PROP_GAIN, float(self.settings.gain))
+
+    def _set_first_supported(self, property_id: int, values: tuple[float, ...]) -> bool:
+        for value in values:
+            if self._set_property(property_id, value):
+                return True
+        return False
+
+    def _set_property(self, property_id: int, value: float) -> bool:
+        if not self._capture:
+            return False
+        try:
+            return bool(self._capture.set(property_id, value))
+        except Exception:
+            return False
 
     @staticmethod
     def _format_property(value: float) -> str:

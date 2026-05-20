@@ -31,6 +31,7 @@ Thumbs.db
 # Local probe configuration and runtime outputs
 probe_config.local.json
 last_focusmap_mapping.json
+last_layoutbond_mapping.json
 last_imgstitch*.png
 assets/EBL-Mark-Array.gds
 imgstitch_session/
