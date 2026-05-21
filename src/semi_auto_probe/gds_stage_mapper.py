@@ -22,6 +22,55 @@ LAYER_TOGGLE_COLUMNS = 5
 GDS_VIEW_MARGIN_PX = 40
 LAYOUTBOND_AUTOSAVE_FILENAME = "last_layoutbond_mapping.json"
 SHIFT_EVENT_MASK = 0x0001
+KLAYOUT_BACKGROUND_COLOR = "#161616"
+KLAYOUT_GRID_MINOR_COLOR = "#242424"
+KLAYOUT_GRID_MAJOR_COLOR = "#343434"
+KLAYOUT_AXIS_COLOR = "#5a5a5a"
+KLAYOUT_CURSOR_COLOR = "#a8a8a8"
+KLAYOUT_SCALE_BAR_COLOR = "#f4f4f5"
+KLAYOUT_SCALE_BAR_SHADOW = "#050505"
+KLAYOUT_GRID_MIN_PIXEL_SPACING = 8.0
+KLAYOUT_LAYER_FILL_ALPHA = 0.46
+KLAYOUT_NANODEVICE_LAYER_COLORS = {
+    (3, 0): "#5080ff",
+    (4, 0): "#ff8840",
+    (6, 0): "#ffc840",
+    (10, 0): "#40e080",
+    (11, 0): "#00c8ff",
+    (12, 0): "#ff5050",
+    (14, 0): "#ff8840",
+    (16, 0): "#ffc840",
+    (17, 0): "#d040e0",
+    (18, 0): "#90e040",
+    (31, 0): "#00c8ff",
+    (41, 0): "#00c8ff",
+}
+KLAYOUT_LAYER_PALETTE = (
+    "#ff9d9d",
+    "#ff80a8",
+    "#c080ff",
+    "#9580ff",
+    "#8086ff",
+    "#80a8ff",
+    "#ff0000",
+    "#ff0080",
+    "#ff00ff",
+    "#8000ff",
+    "#0000ff",
+    "#0080ff",
+    "#80fffb",
+    "#80ff8d",
+    "#afff80",
+    "#f3ff80",
+    "#ffc280",
+    "#ffa080",
+    "#00ffff",
+    "#01ff6b",
+    "#91ff00",
+    "#ddff00",
+    "#ffae00",
+    "#ff8000",
+)
 
 
 class ToggleSwitch(tk.Canvas):
@@ -187,6 +236,65 @@ def layer_grid_position(index: int, columns: int = LAYER_TOGGLE_COLUMNS) -> tupl
     return index // columns, index % columns
 
 
+def choose_canvas_grid_steps(scale_px_per_um: float, *, min_pixel_spacing: float = KLAYOUT_GRID_MIN_PIXEL_SPACING) -> tuple[float, float]:
+    """Pick readable minor/major GDS grid spacing for the current zoom."""
+    scale = abs(float(scale_px_per_um))
+    if scale <= 0 or not math.isfinite(scale):
+        return 1.0, 10.0
+    candidate_steps = (
+        0.001,
+        0.002,
+        0.005,
+        0.01,
+        0.02,
+        0.05,
+        0.1,
+        0.2,
+        0.5,
+        1.0,
+        2.0,
+        5.0,
+        10.0,
+        20.0,
+        50.0,
+        100.0,
+        200.0,
+        500.0,
+        1000.0,
+    )
+    for step_um in candidate_steps:
+        if step_um * scale >= min_pixel_spacing:
+            return step_um, step_um * 10.0
+    return candidate_steps[-1], candidate_steps[-1] * 10.0
+
+
+def choose_scale_bar_length(scale_px_per_um: float, target_px: float = 118.0) -> tuple[float, float]:
+    """Return a readable scale-bar length in micrometers and its pixel width."""
+    scale = abs(float(scale_px_per_um))
+    if scale <= 0 or not math.isfinite(scale):
+        return 100.0, 100.0
+    target_um = max(float(target_px) / scale, 1e-9)
+    exponent = math.floor(math.log10(target_um))
+    base = 10.0 ** exponent
+    for multiplier in (1.0, 2.0, 5.0, 10.0):
+        length_um = multiplier * base
+        if length_um * scale >= target_px * 0.62:
+            return length_um, length_um * scale
+    length_um = 10.0 * base
+    return length_um, length_um * scale
+
+
+def klayout_layer_color(layer: tuple[int, int], layer_order: Iterable[tuple[int, int]]) -> str:
+    if layer in KLAYOUT_NANODEVICE_LAYER_COLORS:
+        return KLAYOUT_NANODEVICE_LAYER_COLORS[layer]
+    ordered_layers = list(layer_order)
+    try:
+        index = ordered_layers.index(layer)
+    except ValueError:
+        index = 0
+    return KLAYOUT_LAYER_PALETTE[index % len(KLAYOUT_LAYER_PALETTE)]
+
+
 def shape_visible_in_view(shape: "GDSShape", transform: "CanvasTransform", width: int, height: int, *, margin: int = GDS_VIEW_MARGIN_PX) -> bool:
     min_u, min_v, max_u, max_v = shape.bbox
     x1, y1 = transform.gds_to_canvas(min_u, max_v)
@@ -203,6 +311,9 @@ def render_gds_preview_ppm(
     height: int,
     layer_visibility: dict[tuple[int, int], bool],
     layer_colors: dict[tuple[int, int], str],
+    *,
+    background_color: str = KLAYOUT_BACKGROUND_COLOR,
+    draw_grid: bool = False,
 ) -> tuple[bytes, int] | None:
     """Rasterize visible GDS geometry into a PPM image for fast Tk display."""
     try:
@@ -213,11 +324,15 @@ def render_gds_preview_ppm(
     width = max(int(width), 1)
     height = max(int(height), 1)
     image = np.zeros((height, width, 3), dtype=np.uint8)
-    image[:, :] = _hex_to_rgb("#05070a")
-    rendered = 0
+    image[:, :] = _hex_to_rgb(background_color)
+    if draw_grid:
+        _draw_grid_on_image(image, transform)
     scale = float(transform.scale)
     offset_x = float(transform.offset_x)
     offset_y = float(transform.offset_y)
+    shapes_by_layer: dict[tuple[int, int], list[np.ndarray]] = {}
+    layer_order_index = {layer: index for index, layer in enumerate(model.layers)}
+    rendered = 0
 
     for shape in model.shapes:
         if not layer_visibility.get(shape.layer_key, False):
@@ -230,16 +345,70 @@ def render_gds_preview_ppm(
         coords = np.empty((points.shape[0], 2), dtype=np.int32)
         coords[:, 0] = np.rint(offset_x + points[:, 0] * scale).astype(np.int32)
         coords[:, 1] = np.rint(offset_y - points[:, 1] * scale).astype(np.int32)
-        color = _hex_to_rgb(layer_colors.get(shape.layer_key, "#60a5fa"))
+        shapes_by_layer.setdefault(shape.layer_key, []).append(coords)
+        rendered += 1
+
+    for layer in sorted(shapes_by_layer, key=lambda item: layer_order_index.get(item, 0)):
+        polygons = shapes_by_layer[layer]
+        color = _hex_to_rgb(layer_colors.get(layer, "#60a5fa"))
         try:
-            cv2.fillPoly(image, [coords], color=color, lineType=cv2.LINE_8)
-            cv2.polylines(image, [coords], isClosed=True, color=color, thickness=1, lineType=cv2.LINE_8)
+            overlay = image.copy()
+            for polygon in polygons:
+                cv2.fillPoly(overlay, [polygon], color=color, lineType=cv2.LINE_8)
+            cv2.addWeighted(overlay, KLAYOUT_LAYER_FILL_ALPHA, image, 1.0 - KLAYOUT_LAYER_FILL_ALPHA, 0.0, dst=image)
+            cv2.polylines(image, polygons, isClosed=True, color=color, thickness=1, lineType=cv2.LINE_8)
         except Exception:
             continue
-        rendered += 1
 
     header = f"P6 {width} {height} 255\n".encode("ascii")
     return header + image.tobytes(), rendered
+
+
+def _draw_grid_on_image(image: np.ndarray, transform: "CanvasTransform") -> None:
+    try:
+        import cv2  # type: ignore[import-not-found]
+    except Exception:
+        return
+
+    height, width = image.shape[:2]
+    if width <= 1 or height <= 1 or transform.scale <= 0:
+        return
+    minor_step, major_step = choose_canvas_grid_steps(transform.scale)
+    min_u, max_v = transform.canvas_to_gds(0, 0)
+    max_u, min_v = transform.canvas_to_gds(width, height)
+
+    def draw_lines(step_um: float, color_hex: str) -> None:
+        if step_um <= 0 or step_um * transform.scale < 4.0:
+            return
+        color = _hex_to_rgb(color_hex)
+        start_u = math.floor(min_u / step_um) * step_um
+        end_u = math.ceil(max_u / step_um) * step_um
+        count_u = int(round((end_u - start_u) / step_um)) + 1
+        for index in range(max(count_u, 0)):
+            x, _ = transform.gds_to_canvas(start_u + index * step_um, 0.0)
+            ix = int(round(x))
+            if 0 <= ix < width:
+                cv2.line(image, (ix, 0), (ix, height - 1), color, 1, cv2.LINE_8)
+
+        start_v = math.floor(min_v / step_um) * step_um
+        end_v = math.ceil(max_v / step_um) * step_um
+        count_v = int(round((end_v - start_v) / step_um)) + 1
+        for index in range(max(count_v, 0)):
+            _, y = transform.gds_to_canvas(0.0, start_v + index * step_um)
+            iy = int(round(y))
+            if 0 <= iy < height:
+                cv2.line(image, (0, iy), (width - 1, iy), color, 1, cv2.LINE_8)
+
+    draw_lines(minor_step, KLAYOUT_GRID_MINOR_COLOR)
+    draw_lines(major_step, KLAYOUT_GRID_MAJOR_COLOR)
+    axis_x, axis_y = transform.gds_to_canvas(0.0, 0.0)
+    axis_color = _hex_to_rgb(KLAYOUT_AXIS_COLOR)
+    if 0 <= axis_x < width:
+        ix = int(round(axis_x))
+        cv2.line(image, (ix, 0), (ix, height - 1), axis_color, 1, cv2.LINE_8)
+    if 0 <= axis_y < height:
+        iy = int(round(axis_y))
+        cv2.line(image, (0, iy), (width - 1, iy), axis_color, 1, cv2.LINE_8)
 
 
 def apply_center_magnifier_ppm(payload: bytes, magnification: float, radius_fraction: float = 0.26) -> bytes:
@@ -559,7 +728,7 @@ class GDSCanvasViewer:
         self.geometry_photo: tk.PhotoImage | None = None
         self.last_rendered_shape_count = 0
 
-        self.canvas = tk.Canvas(parent, bg="#05070a", highlightthickness=1, highlightbackground=colors["border"], bd=0, cursor="crosshair")
+        self.canvas = tk.Canvas(parent, bg=KLAYOUT_BACKGROUND_COLOR, highlightthickness=1, highlightbackground=colors["border"], bd=0, cursor="crosshair")
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.canvas.bind("<Configure>", self._on_configure)
         self.canvas.bind("<Motion>", self._on_motion)
@@ -617,6 +786,7 @@ class GDSCanvasViewer:
 
     def draw_message(self, message: str) -> None:
         self.canvas.delete("all")
+        self.canvas.configure(bg=KLAYOUT_BACKGROUND_COLOR)
         self.canvas.create_text(
             max(self.canvas.winfo_width(), 1) / 2,
             max(self.canvas.winfo_height(), 1) / 2,
@@ -642,9 +812,12 @@ class GDSCanvasViewer:
         height = max(self.canvas.winfo_height(), 1)
         if self._draw_geometry_raster(width, height):
             self._draw_labels(width, height)
+            self._draw_scale_bar(width, height)
             self._draw_overlay_items()
             return
 
+        self.canvas.create_rectangle(0, 0, width, height, fill=KLAYOUT_BACKGROUND_COLOR, outline="", tags="gds_background")
+        self._draw_grid_items(width, height)
         for shape in self.model.shapes:
             if not self.layer_visibility.get(shape.layer_key, False):
                 continue
@@ -657,18 +830,19 @@ class GDSCanvasViewer:
             if len(coords) >= 6:
                 color = self._layer_color(shape.layer_key)
                 try:
-                    self.canvas.create_polygon(coords, fill=color, outline=color, width=1, tags="gds_geometry")
+                    self.canvas.create_polygon(coords, fill=color, outline=color, width=1, stipple="gray50", tags="gds_geometry")
                 except tk.TclError:
                     continue
 
         self._draw_labels(width, height)
+        self._draw_scale_bar(width, height)
         self._draw_overlay_items()
 
     def _draw_geometry_raster(self, width: int, height: int) -> bool:
         if self.model is None:
             return False
         layer_colors = {layer: self._layer_color(layer) for layer in self.layer_order}
-        rendered = render_gds_preview_ppm(self.model, self.transform, width, height, self.layer_visibility, layer_colors)
+        rendered = render_gds_preview_ppm(self.model, self.transform, width, height, self.layer_visibility, layer_colors, draw_grid=True)
         if rendered is None:
             return False
         ppm_bytes, rendered_count = rendered
@@ -687,7 +861,93 @@ class GDSCanvasViewer:
         for label in self.model.labels[:300]:
             x, y = self.transform.gds_to_canvas(*label.origin)
             if -40 <= x <= width + 40 and -20 <= y <= height + 20:
-                self.canvas.create_text(x, y, text=label.text, fill="#e5e7eb", anchor="center", font=("Segoe UI", 8), tags="gds_labels")
+                self.canvas.create_text(x, y, text=label.text, fill="#f4f4f5", anchor="center", font=("Segoe UI", 8), tags="gds_labels")
+
+    def _draw_grid_items(self, width: int, height: int) -> None:
+        self.canvas.delete("gds_grid")
+        if width <= 1 or height <= 1 or self.transform.scale <= 0:
+            return
+        minor_step, major_step = choose_canvas_grid_steps(self.transform.scale)
+        min_u, max_v = self.transform.canvas_to_gds(0, 0)
+        max_u, min_v = self.transform.canvas_to_gds(width, height)
+        self._draw_grid_lines(min_u, max_u, min_v, max_v, minor_step, KLAYOUT_GRID_MINOR_COLOR, width=1, tags="gds_grid")
+        self._draw_grid_lines(min_u, max_u, min_v, max_v, major_step, KLAYOUT_GRID_MAJOR_COLOR, width=1, tags="gds_grid")
+        axis_x, axis_y = self.transform.gds_to_canvas(0.0, 0.0)
+        if 0 <= axis_x <= width:
+            self.canvas.create_line(axis_x, 0, axis_x, height, fill=KLAYOUT_AXIS_COLOR, width=1, tags="gds_grid")
+        if 0 <= axis_y <= height:
+            self.canvas.create_line(0, axis_y, width, axis_y, fill=KLAYOUT_AXIS_COLOR, width=1, tags="gds_grid")
+
+    def _draw_grid_lines(
+        self,
+        min_u: float,
+        max_u: float,
+        min_v: float,
+        max_v: float,
+        step_um: float,
+        color: str,
+        *,
+        width: int,
+        tags: str,
+    ) -> None:
+        if step_um <= 0 or step_um * self.transform.scale < 4.0:
+            return
+        start_u = math.floor(min_u / step_um) * step_um
+        end_u = math.ceil(max_u / step_um) * step_um
+        count_u = int(round((end_u - start_u) / step_um)) + 1
+        for index in range(max(count_u, 0)):
+            u = start_u + index * step_um
+            x, _ = self.transform.gds_to_canvas(u, 0.0)
+            self.canvas.create_line(x, 0, x, max(self.canvas.winfo_height(), 1), fill=color, width=width, tags=tags)
+
+        start_v = math.floor(min_v / step_um) * step_um
+        end_v = math.ceil(max_v / step_um) * step_um
+        count_v = int(round((end_v - start_v) / step_um)) + 1
+        for index in range(max(count_v, 0)):
+            v = start_v + index * step_um
+            _, y = self.transform.gds_to_canvas(0.0, v)
+            self.canvas.create_line(0, y, max(self.canvas.winfo_width(), 1), y, fill=color, width=width, tags=tags)
+
+    def _draw_scale_bar(self, width: int, height: int) -> None:
+        self.canvas.delete("gds_scale_bar")
+        if width <= 120 or height <= 80 or self.transform.scale <= 0:
+            return
+        length_um, length_px = choose_scale_bar_length(self.transform.scale)
+        length_px = min(length_px, width * 0.36)
+        x2 = width - 24
+        x1 = x2 - length_px
+        y = height - 28
+        label = f"{self._format_scale_value(length_um)} um"
+        self.canvas.create_line(x1 + 1, y + 1, x2 + 1, y + 1, fill=KLAYOUT_SCALE_BAR_SHADOW, width=4, tags="gds_scale_bar")
+        self.canvas.create_line(x1, y, x2, y, fill=KLAYOUT_SCALE_BAR_COLOR, width=3, tags="gds_scale_bar")
+        self.canvas.create_line(x1, y - 6, x1, y + 6, fill=KLAYOUT_SCALE_BAR_COLOR, width=2, tags="gds_scale_bar")
+        self.canvas.create_line(x2, y - 6, x2, y + 6, fill=KLAYOUT_SCALE_BAR_COLOR, width=2, tags="gds_scale_bar")
+        self.canvas.create_text(
+            (x1 + x2) / 2 + 1,
+            y - 17,
+            text=label,
+            anchor="center",
+            fill=KLAYOUT_SCALE_BAR_SHADOW,
+            font=("Segoe UI Semibold", 8),
+            tags="gds_scale_bar",
+        )
+        self.canvas.create_text(
+            (x1 + x2) / 2,
+            y - 18,
+            text=label,
+            anchor="center",
+            fill=KLAYOUT_SCALE_BAR_COLOR,
+            font=("Segoe UI Semibold", 8),
+            tags="gds_scale_bar",
+        )
+
+    @staticmethod
+    def _format_scale_value(value: float) -> str:
+        if abs(value) >= 100:
+            return f"{value:.0f}"
+        if abs(value) >= 10:
+            return f"{value:.1f}".rstrip("0").rstrip(".")
+        return f"{value:.2f}".rstrip("0").rstrip(".")
 
     def _draw_overlay_items(self) -> None:
         try:
@@ -756,32 +1016,16 @@ class GDSCanvasViewer:
         x, y = self.transform.gds_to_canvas(*point)
         width = max(self.canvas.winfo_width(), 1)
         height = max(self.canvas.winfo_height(), 1)
-        color = "#e0f2fe"
-        self.canvas.create_line(0, y, width, y, fill=color, width=1, dash=(4, 5), tags="gds_cursor")
-        self.canvas.create_line(x, 0, x, height, fill=color, width=1, dash=(4, 5), tags="gds_cursor")
+        color = KLAYOUT_CURSOR_COLOR
+        self.canvas.create_line(0, y, width, y, fill=color, width=1, dash=(3, 5), tags="gds_cursor")
+        self.canvas.create_line(x, 0, x, height, fill=color, width=1, dash=(3, 5), tags="gds_cursor")
         self.canvas.create_oval(x - 4, y - 4, x + 4, y + 4, outline=color, width=1, tags="gds_cursor")
 
     def _shape_visible(self, shape: GDSShape, width: int, height: int) -> bool:
         return shape_visible_in_view(shape, self.transform, width, height)
 
     def _layer_color(self, layer: tuple[int, int]) -> str:
-        palette = (
-            "#60a5fa",
-            "#34d399",
-            "#fbbf24",
-            "#f472b6",
-            "#a78bfa",
-            "#fb7185",
-            "#2dd4bf",
-            "#c084fc",
-            "#f97316",
-            "#93c5fd",
-        )
-        try:
-            index = self.layer_order.index(layer)
-        except ValueError:
-            index = 0
-        return palette[index % len(palette)]
+        return klayout_layer_color(layer, self.layer_order)
 
     def _on_configure(self, _event: tk.Event) -> None:
         if self.configure_job is not None:

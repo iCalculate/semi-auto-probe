@@ -4,6 +4,7 @@ import unittest
 import queue
 import os
 import tempfile
+from unittest import mock
 
 from semi_auto_probe.config import ProbeConfig
 from semi_auto_probe.gds_stage_mapper import (
@@ -14,7 +15,11 @@ from semi_auto_probe.gds_stage_mapper import (
     GDSLayoutModel,
     GDSShape,
     GDSStageMapperPanel,
+    KLAYOUT_BACKGROUND_COLOR,
     LAYOUTBOND_AUTOSAVE_FILENAME,
+    choose_canvas_grid_steps,
+    choose_scale_bar_length,
+    klayout_layer_color,
     layer_grid_position,
     render_gds_preview_ppm,
     snap_gds_point,
@@ -143,6 +148,31 @@ class CanvasTransformTests(unittest.TestCase):
             (1, 1),
         ])
 
+    def test_klayout_named_layer_colors_match_nanodevice_palette(self) -> None:
+        self.assertEqual(klayout_layer_color((3, 0), []), "#5080ff")
+        self.assertEqual(klayout_layer_color((14, 0), []), "#ff8840")
+        self.assertEqual(klayout_layer_color((16, 0), []), "#ffc840")
+        self.assertEqual(klayout_layer_color((41, 0), []), "#00c8ff")
+
+    def test_grid_steps_are_adaptive_and_klayout_like(self) -> None:
+        minor, major = choose_canvas_grid_steps(scale_px_per_um=10.0)
+        self.assertEqual((minor, major), (1.0, 10.0))
+
+        minor, major = choose_canvas_grid_steps(scale_px_per_um=2.0)
+        self.assertEqual((minor, major), (5.0, 50.0))
+
+        minor, major = choose_canvas_grid_steps(scale_px_per_um=120.0)
+        self.assertEqual((minor, major), (0.1, 1.0))
+
+    def test_scale_bar_length_uses_readable_one_two_five_steps(self) -> None:
+        length_um, length_px = choose_scale_bar_length(scale_px_per_um=10.0, target_px=118.0)
+        self.assertEqual(length_um, 10.0)
+        self.assertEqual(length_px, 100.0)
+
+        length_um, length_px = choose_scale_bar_length(scale_px_per_um=2.0, target_px=118.0)
+        self.assertEqual(length_um, 50.0)
+        self.assertEqual(length_px, 100.0)
+
 
 class StageMovePlanTests(unittest.TestCase):
     def test_stage_um_target_converts_to_pulse_deltas(self) -> None:
@@ -235,10 +265,96 @@ class GDSCanvasViewerModelTests(unittest.TestCase):
 
         self.assertEqual(hidden[1], 0)
         self.assertEqual(visible[1], 1)
+        self.assertEqual(hidden[0].split(b"\n", 1)[1][:3], b"\x16\x16\x16")
         pixels = visible[0].split(b"\n", 1)[1]
         pixel_triplets = {pixels[index : index + 3] for index in range(0, len(pixels), 3)}
         self.assertIn(b"\xff\x00\x00", pixel_triplets)
+        self.assertIn(b"\x81\x0c\x0c", pixel_triplets)
         self.assertNotIn(b"\x00\xff\x00", pixel_triplets)
+
+    def test_raster_preview_accepts_klayout_background_color(self) -> None:
+        model = GDSLayoutModel(
+            path=__file__,
+            top_cell_name="TOP",
+            top_cell_names=("TOP",),
+            shapes=[],
+            labels=[],
+            bounds=None,
+        )
+        transform = CanvasTransform(scale=1.0, offset_x=0.0, offset_y=20.0)
+
+        rendered = render_gds_preview_ppm(model, transform, width=2, height=2, layer_visibility={}, layer_colors={})
+        if rendered is None:
+            self.skipTest("OpenCV raster renderer is not available.")
+
+        expected = bytes.fromhex(KLAYOUT_BACKGROUND_COLOR.lstrip("#")) * 4
+        self.assertEqual(rendered[0].split(b"\n", 1)[1], expected)
+
+    def test_raster_preview_batches_alpha_blending_by_layer(self) -> None:
+        try:
+            import cv2  # type: ignore[import-not-found]
+        except Exception:
+            self.skipTest("OpenCV raster renderer is not available.")
+
+        shapes = [
+            GDSShape(points=((1.0, 1.0), (4.0, 1.0), (4.0, 4.0), (1.0, 4.0)), layer=1, datatype=0, bbox=(1.0, 1.0, 4.0, 4.0)),
+            GDSShape(points=((5.0, 1.0), (8.0, 1.0), (8.0, 4.0), (5.0, 4.0)), layer=1, datatype=0, bbox=(5.0, 1.0, 8.0, 4.0)),
+            GDSShape(points=((1.0, 5.0), (4.0, 5.0), (4.0, 8.0), (1.0, 8.0)), layer=1, datatype=0, bbox=(1.0, 5.0, 4.0, 8.0)),
+        ]
+        model = GDSLayoutModel(
+            path=__file__,
+            top_cell_name="TOP",
+            top_cell_names=("TOP",),
+            shapes=shapes,
+            labels=[],
+            bounds=(0.0, 0.0, 10.0, 10.0),
+        )
+        transform = CanvasTransform(scale=1.0, offset_x=0.0, offset_y=10.0)
+
+        with mock.patch.object(cv2, "addWeighted", wraps=cv2.addWeighted) as add_weighted:
+            rendered = render_gds_preview_ppm(
+                model,
+                transform,
+                width=16,
+                height=16,
+                layer_visibility={(1, 0): True},
+                layer_colors={(1, 0): "#ff0000"},
+            )
+
+        self.assertIsNotNone(rendered)
+        self.assertEqual(rendered[1], 3)
+        self.assertEqual(add_weighted.call_count, 1)
+
+    def test_raster_preview_preserves_overlapping_same_layer_fill(self) -> None:
+        model = GDSLayoutModel(
+            path=__file__,
+            top_cell_name="TOP",
+            top_cell_names=("TOP",),
+            shapes=[
+                GDSShape(points=((1.0, 1.0), (7.0, 1.0), (7.0, 7.0), (1.0, 7.0)), layer=1, datatype=0, bbox=(1.0, 1.0, 7.0, 7.0)),
+                GDSShape(points=((4.0, 4.0), (10.0, 4.0), (10.0, 10.0), (4.0, 10.0)), layer=1, datatype=0, bbox=(4.0, 4.0, 10.0, 10.0)),
+            ],
+            labels=[],
+            bounds=(0.0, 0.0, 12.0, 12.0),
+        )
+        transform = CanvasTransform(scale=1.0, offset_x=0.0, offset_y=12.0)
+
+        rendered = render_gds_preview_ppm(
+            model,
+            transform,
+            width=14,
+            height=14,
+            layer_visibility={(1, 0): True},
+            layer_colors={(1, 0): "#ff0000"},
+        )
+        if rendered is None:
+            self.skipTest("OpenCV raster renderer is not available.")
+
+        body = rendered[0].split(b"\n", 1)[1]
+        overlap_canvas_x = 5
+        overlap_canvas_y = 12 - 5
+        pixel_index = (overlap_canvas_y * 14 + overlap_canvas_x) * 3
+        self.assertEqual(body[pixel_index : pixel_index + 3], b"\x81\x0c\x0c")
 
 
 class DummyMapperSerial:
