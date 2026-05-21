@@ -76,6 +76,8 @@ class AgentContext:
     imgstitch_tile_mode: str = ""
     imgstitch_rows: int | None = None
     imgstitch_cols: int | None = None
+    imgstitch_progress_current: int = 0
+    imgstitch_progress_total: int = 0
     focusmap_points: int = 0
     focusmap_valid_points: int = 0
     focusmap_has_plane: bool = False
@@ -110,6 +112,8 @@ class AgentContext:
             "imgstitch_tile_mode": self.imgstitch_tile_mode,
             "imgstitch_rows": self.imgstitch_rows,
             "imgstitch_cols": self.imgstitch_cols,
+            "imgstitch_progress_current": self.imgstitch_progress_current,
+            "imgstitch_progress_total": self.imgstitch_progress_total,
             "focusmap_points": self.focusmap_points,
             "focusmap_valid_points": self.focusmap_valid_points,
             "focusmap_has_plane": self.focusmap_has_plane,

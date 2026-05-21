@@ -112,17 +112,7 @@ class AgentPanel:
         coordinate_card = self._section(left, "Stage XYZ / Layout UV")
         coordinate_card.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
         coordinate_card.rowconfigure(1, weight=1)
-        self.coord_value_labels = self._build_metric_grid(
-            coordinate_card,
-            (
-                ("stage_x", "Stage X"),
-                ("stage_y", "Stage Y"),
-                ("stage_z", "Stage Z"),
-                ("gds_u", "GDS U"),
-                ("gds_v", "GDS V"),
-            ),
-            row=1,
-        )
+        self.coord_value_labels = self._build_coordinate_grid(coordinate_card, row=1)
 
         status_card = self._section(left, "Agent Status")
         status_card.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
@@ -140,6 +130,7 @@ class AgentPanel:
                 ("total_tokens", "Total Tokens"),
             ),
             row=1,
+            columns=2,
         )
 
     def _build_center_column(self, shell: ttk.Frame) -> None:
@@ -250,35 +241,95 @@ class AgentPanel:
         ttk.Label(frame, text=title.upper(), style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 8))
         return frame
 
-    def _build_metric_grid(self, parent: tk.Widget, fields: tuple[tuple[str, str], ...], *, row: int) -> dict[str, tk.Label]:
+    def _build_coordinate_grid(self, parent: tk.Widget, *, row: int) -> dict[str, tk.Label]:
         frame = ttk.Frame(parent, style="Panel.TFrame")
         frame.grid(row=row, column=0, sticky="nsew")
-        frame.columnconfigure(0, weight=1)
-        frame.columnconfigure(1, weight=1)
+        labels: dict[str, tk.Label] = {}
+
+        rows = (
+            (("stage_x", "X"), ("stage_y", "Y"), ("stage_z", "Z")),
+            (("gds_u", "U"), ("gds_v", "V")),
+        )
+        for row_index, fields in enumerate(rows):
+            row_frame = ttk.Frame(frame, style="Panel.TFrame")
+            row_frame.grid(row=row_index, column=0, sticky="ew", pady=(0, 6 if row_index == 0 else 0))
+            for column in range(len(fields)):
+                row_frame.columnconfigure(column, weight=1, uniform=f"coord_row_{row_index}")
+            for column_index, (key, label_text) in enumerate(fields):
+                tile = tk.Frame(
+                    row_frame,
+                    bg=self.colors["surface_2"],
+                    highlightthickness=1,
+                    highlightbackground=self.colors["border"],
+                    bd=0,
+                )
+                tile.grid(row=0, column=column_index, sticky="nsew", padx=(0, 6 if column_index < len(fields) - 1 else 0))
+                tile.columnconfigure(0, weight=1)
+                tk.Label(
+                    tile,
+                    text=label_text,
+                    anchor="w",
+                    padx=8,
+                    pady=2,
+                    bg=self.colors["surface_2"],
+                    fg=self.colors["muted"],
+                    font=("Segoe UI", 8),
+                ).grid(row=0, column=0, sticky="ew", pady=(3, 0))
+                value = tk.Label(
+                    tile,
+                    text="-",
+                    anchor="w",
+                    padx=8,
+                    pady=2,
+                    bg=self.colors["surface_2"],
+                    fg=self.colors["accent"],
+                    font=("Cascadia Mono", 9, "bold"),
+                )
+                value.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+                labels[key] = value
+        return labels
+
+    def _build_metric_grid(self, parent: tk.Widget, fields: tuple[tuple[str, str], ...], *, row: int, columns: int = 2) -> dict[str, tk.Label]:
+        frame = ttk.Frame(parent, style="Panel.TFrame")
+        frame.grid(row=row, column=0, sticky="nsew")
+        columns = max(1, columns)
+        for column in range(columns):
+            frame.columnconfigure(column, weight=1, uniform="metric_cards")
         labels: dict[str, tk.Label] = {}
         for index, (key, label_text) in enumerate(fields):
-            label = tk.Label(
+            row_index = index // columns
+            column_index = index % columns
+            tile = tk.Frame(
                 frame,
+                bg=self.colors["surface_2"],
+                highlightthickness=1,
+                highlightbackground=self.colors["border"],
+                bd=0,
+            )
+            tile.grid(row=row_index, column=column_index, sticky="nsew", pady=(0, 6), padx=(0, 6 if column_index < columns - 1 else 0))
+            tile.columnconfigure(0, weight=1)
+            label = tk.Label(
+                tile,
                 text=label_text,
                 anchor="w",
-                padx=7,
-                pady=4,
-                bg=self.colors["surface"],
+                padx=8,
+                pady=2,
+                bg=self.colors["surface_2"],
                 fg=self.colors["muted"],
                 font=("Segoe UI", 8),
             )
-            label.grid(row=index, column=0, sticky="ew", pady=(0, 4), padx=(0, 4))
+            label.grid(row=0, column=0, sticky="ew", pady=(3, 0))
             value = tk.Label(
-                frame,
+                tile,
                 text="-",
-                anchor="e",
-                padx=7,
-                pady=4,
+                anchor="w",
+                padx=8,
+                pady=2,
                 bg=self.colors["surface_2"],
                 fg=self.colors["accent"],
-                font=("Cascadia Mono", 8),
+                font=("Cascadia Mono", 9, "bold"),
             )
-            value.grid(row=index, column=1, sticky="ew", pady=(0, 4))
+            value.grid(row=1, column=0, sticky="ew", pady=(0, 4))
             labels[key] = value
         return labels
 
@@ -834,17 +885,39 @@ class AgentPanel:
     def _draw_imgstitch_task(self, canvas: tk.Canvas, width: int, height: int, context: AgentContext) -> None:
         self._draw_panel_title(canvas, "ImgStitch / Capture", f"{context.imgstitch_mode or '-'} | {context.imgstitch_tile_mode or '-'}")
         grid_left, grid_top = 30, 76
-        cell = max(22, min((width - 70) // 4, (height - 130) // 3))
-        rows = max(1, min(context.imgstitch_rows or 3, 4))
-        cols = max(1, min(context.imgstitch_cols or 3, 4))
+        rows = max(1, min(context.imgstitch_rows or 3, 6))
+        cols = max(1, min(context.imgstitch_cols or 3, 6))
+        cell = max(18, min((width - 70) // max(cols, 1), (height - 145) // max(rows, 1)))
+        progress_current = max(0, context.imgstitch_progress_current)
+        progress_total = max(0, context.imgstitch_progress_total)
+        if progress_total <= 0 and context.imgstitch_running:
+            progress_total = rows * cols
         for row in range(rows):
             column_range = range(cols) if row % 2 == 0 else range(cols - 1, -1, -1)
             for col in column_range:
+                order = row * cols + col + 1 if row % 2 == 0 else row * cols + (cols - col)
                 x = grid_left + col * (cell + 8)
                 y = grid_top + row * (cell + 8)
-                fill = "#12352d" if (row + col) % 2 == 0 else self.colors["surface_2"]
-                canvas.create_rectangle(x, y, x + cell, y + cell, fill=fill, outline=self.colors["border"])
-        canvas.create_text(14, height - 42, text=f"Last output: {context.last_stitch_path or '-'}", anchor="nw", fill=self.colors["muted"], font=("Segoe UI", 9), width=width - 28)
+                if progress_current and order < progress_current:
+                    fill, outline = "#064e3b", "#34d399"
+                elif progress_current and order == progress_current:
+                    fill, outline = "#0f2f57", "#60a5fa"
+                else:
+                    fill, outline = "#111827", "#64748b"
+                rect_options = {"fill": fill, "outline": outline, "width": 2}
+                if order > progress_current:
+                    rect_options["dash"] = (5, 4)
+                canvas.create_rectangle(x, y, x + cell, y + cell, **rect_options)
+                canvas.create_text(x + cell / 2, y + cell / 2, text=str(order), anchor="center", fill="#dbeafe" if order == progress_current else self.colors["muted"], font=("Segoe UI Semibold", 8))
+        legend_y = max(height - 64, grid_top + rows * (cell + 8) + 10)
+        legend_items = (("pending", "#64748b"), ("running", "#60a5fa"), ("done", "#34d399"))
+        x = 14
+        for label, color in legend_items:
+            canvas.create_rectangle(x, legend_y, x + 10, legend_y + 10, outline=color, fill=color)
+            canvas.create_text(x + 15, legend_y - 2, text=label, anchor="nw", fill=self.colors["muted"], font=("Segoe UI", 8))
+            x += 74
+        progress_text = f"Progress: {progress_current}/{progress_total}" if progress_total else "Progress: -"
+        canvas.create_text(14, height - 42, text=f"{progress_text} | Last output: {context.last_stitch_path or '-'}", anchor="nw", fill=self.colors["muted"], font=("Segoe UI", 9), width=width - 28)
 
     def _draw_focusmap_task(self, canvas: tk.Canvas, width: int, height: int, context: AgentContext) -> None:
         self._draw_panel_title(canvas, "FocusMap", f"{context.focusmap_valid_points}/{context.focusmap_points} measured | plane {'stored' if context.focusmap_has_plane else 'not stored'}")

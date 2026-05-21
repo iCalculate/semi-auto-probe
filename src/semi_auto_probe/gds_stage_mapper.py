@@ -22,6 +22,7 @@ LAYER_TOGGLE_COLUMNS = 5
 GDS_VIEW_MARGIN_PX = 40
 LAYOUTBOND_AUTOSAVE_FILENAME = "last_layoutbond_mapping.json"
 SHIFT_EVENT_MASK = 0x0001
+MatrixOverlay = tuple[list[tuple[float, float]], str] | tuple[list[tuple[float, float]], str, str]
 
 
 class ToggleSwitch(tk.Canvas):
@@ -548,7 +549,7 @@ class GDSCanvasViewer:
         self.cursor_gds: tuple[float, float] | None = None
         self.stage_center_gds: tuple[float, float] | None = None
         self.fov_polygon_gds: list[tuple[float, float]] | None = None
-        self.matrix_fov_polygons_gds: list[tuple[list[tuple[float, float]], str]] = []
+        self.matrix_fov_polygons_gds: list[MatrixOverlay] = []
         self.snap_grid_um = 1.0
         self.require_double_click_pick = False
         self.ignore_next_release = False
@@ -611,7 +612,7 @@ class GDSCanvasViewer:
         self.fov_polygon_gds = fov_polygon_gds
         self._draw_overlay_items()
 
-    def set_matrix_overlay(self, polygons_gds: list[tuple[list[tuple[float, float]], str]]) -> None:
+    def set_matrix_overlay(self, polygons_gds: list[MatrixOverlay]) -> None:
         self.matrix_fov_polygons_gds = polygons_gds
         self._draw_overlay_items()
 
@@ -695,7 +696,8 @@ class GDSCanvasViewer:
             self.canvas.delete("gds_overlay")
             self.canvas.delete("gds_matrix_overlay")
             self.canvas.delete("gds_selection")
-            for polygon_gds, label in self.matrix_fov_polygons_gds:
+            for overlay_item in self.matrix_fov_polygons_gds:
+                polygon_gds, label, state = self._normalize_matrix_overlay_item(overlay_item)
                 if len(polygon_gds) < 3:
                     continue
                 coords: list[float] = []
@@ -704,15 +706,17 @@ class GDSCanvasViewer:
                     x, y = self.transform.gds_to_canvas(u, v)
                     coords.extend((x, y))
                     canvas_points.append((x, y))
-                self.canvas.create_polygon(
-                    coords,
-                    fill="#9ca3af",
-                    outline="#e5e7eb",
-                    width=2,
-                    dash=(7, 5),
-                    stipple="gray25",
-                    tags="gds_matrix_overlay",
-                )
+                outline, fill, dash = self._matrix_overlay_style(state)
+                polygon_options = {
+                    "fill": fill,
+                    "outline": outline,
+                    "width": 2,
+                    "stipple": "gray25",
+                    "tags": "gds_matrix_overlay",
+                }
+                if dash is not None:
+                    polygon_options["dash"] = dash
+                self.canvas.create_polygon(coords, **polygon_options)
                 if label:
                     cx = sum(point[0] for point in canvas_points) / len(canvas_points)
                     cy = sum(point[1] for point in canvas_points) / len(canvas_points)
@@ -720,7 +724,7 @@ class GDSCanvasViewer:
                         cx,
                         cy,
                         text=label,
-                        fill="#f8fafc",
+                        fill=outline,
                         font=("Segoe UI Semibold", 8),
                         tags="gds_matrix_overlay",
                     )
@@ -745,6 +749,23 @@ class GDSCanvasViewer:
                 self._draw_cursor_crosshair(self.cursor_gds)
         except tk.TclError:
             return
+
+    @staticmethod
+    def _normalize_matrix_overlay_item(overlay_item: MatrixOverlay) -> tuple[list[tuple[float, float]], str, str]:
+        if len(overlay_item) >= 3:
+            polygon_gds, label, state = overlay_item
+            return polygon_gds, label, str(state)
+        polygon_gds, label = overlay_item
+        return polygon_gds, label, "pending"
+
+    @staticmethod
+    def _matrix_overlay_style(state: str) -> tuple[str, str, tuple[int, int] | None]:
+        normalized = state.lower().strip()
+        if normalized == "done":
+            return "#34d399", "#064e3b", None
+        if normalized == "running":
+            return "#60a5fa", "#0f2f57", None
+        return "#9ca3af", "#4b5563", (7, 5)
 
     def _draw_cross(self, point: tuple[float, float], color: str, tag: str, radius: int) -> None:
         x, y = self.transform.gds_to_canvas(*point)
@@ -1021,7 +1042,7 @@ class GDSStageMapperPanel:
         controls_outer.columnconfigure(0, weight=1)
         controls_outer.rowconfigure(0, weight=1)
         controls_canvas = tk.Canvas(controls_outer, bg=self.colors["surface"], highlightthickness=0, width=480)
-        scrollbar = ttk.Scrollbar(controls_outer, orient=tk.VERTICAL, command=controls_canvas.yview)
+        scrollbar = ttk.Scrollbar(controls_outer, orient=tk.VERTICAL, command=controls_canvas.yview, style="Slim.Vertical.TScrollbar")
         controls_canvas.configure(yscrollcommand=scrollbar.set)
         controls_canvas.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")

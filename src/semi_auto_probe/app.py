@@ -226,6 +226,11 @@ class ProbeApp(tk.Tk):
         self.imgmatrix_restore_realtime = False
         self.imgmatrix_restore_home_signal = False
         self.latest_stitch_frame = None
+        self.latest_stitch_frame_captured_at = 0.0
+        self.imgstitch_progress_current = 0
+        self.imgstitch_progress_total = 0
+        self.imgmatrix_progress_current = 0
+        self.imgmatrix_progress_total = 0
         self.current_page = "Main"
         self.active_page_name: str | None = None
         self.config_path = Path.cwd() / DEFAULT_CONFIG_FILENAME
@@ -576,6 +581,24 @@ class ProbeApp(tk.Tk):
         )
         style.map("FocusMap.Treeview.Heading", background=[("active", "#293a50")])
         style.configure("Horizontal.TProgressbar", background=self.colors["accent"], troughcolor=self.colors["surface_2"], bordercolor=self.colors["border"])
+        style.configure(
+            "Slim.Vertical.TScrollbar",
+            gripcount=0,
+            background="#334155",
+            troughcolor=self.colors["surface"],
+            bordercolor=self.colors["surface"],
+            arrowcolor="#64748b",
+            lightcolor="#334155",
+            darkcolor="#334155",
+            relief="flat",
+            width=12,
+            arrowsize=10,
+        )
+        style.map(
+            "Slim.Vertical.TScrollbar",
+            background=[("active", "#475569"), ("pressed", "#38bdf8"), ("!disabled", "#334155")],
+            arrowcolor=[("active", self.colors["accent"]), ("!disabled", "#64748b")],
+        )
         style.configure("TCheckbutton", background=self.colors["surface"], foreground=self.colors["text"], indicatorcolor=self.colors["input"], indicatormargin=6, padding=(6, 4), focuscolor=self.colors["border_focus"])
         style.map(
             "TCheckbutton",
@@ -786,7 +809,7 @@ class ProbeApp(tk.Tk):
             "Communication": "🔌 SerialIO",
             "Config": "⚙ Settings",
         }
-        module_tab_labels["ImgMatrix"] = "ImgMatrix"
+        module_tab_labels["ImgMatrix"] = "🔳 ImgMatrix"
         tab_bar = ttk.Frame(content, style="App.TFrame")
         tab_bar.grid(row=0, column=0, sticky="w")
         for col, name in enumerate(("Main", "AutoFocus", "FocusMap", "ImgStitch", "LayoutBond", "ImgMatrix", "AI Agent", "Communication", "Config")):
@@ -989,9 +1012,19 @@ class ProbeApp(tk.Tk):
             get_microscope_preview=self.agent_microscope_preview,
             fov_width_var=self.layoutbond_fov_width_var,
             fov_height_var=self.layoutbond_fov_height_var,
+            tile_acquisition_var=self.imgstitch_tile_acquisition_var,
+            t_stack_frame_count_var=self.t_stack_frame_count_var,
+            t_stack_fusion_var=self.t_stack_fusion_var,
+            t_stack_save_raw_var=self.t_stack_save_raw_var,
+            z_stack_step_um_var=self.z_stack_step_um_var,
+            z_stack_range_um_var=self.z_stack_range_um_var,
+            z_stack_fusion_var=self.z_stack_fusion_var,
+            z_stack_return_var=self.z_stack_return_var,
+            z_stack_save_raw_var=self.z_stack_save_raw_var,
             start_run=self.start_imgmatrix,
             stop_run=self.stop_imgmatrix,
             set_status=self.status_var.set,
+            on_overlay_changed=self._set_layoutbond_matrix_overlay,
         )
         self._sync_imgmatrix_from_layoutbond()
 
@@ -1006,6 +1039,11 @@ class ProbeApp(tk.Tk):
         model = self.gds_stage_mapper_panel.model
         layer_visibility = dict(self.gds_stage_mapper_panel.viewer.layer_visibility)
         self.imgmatrix_panel.set_layout_context(model, layer_visibility)
+
+    def _set_layoutbond_matrix_overlay(self, overlays) -> None:
+        if self.gds_stage_mapper_panel is None:
+            return
+        self.gds_stage_mapper_panel.viewer.set_matrix_overlay(overlays)
 
     def _build_agent_planner(self):
         return build_agent_planner_from_config(
@@ -1094,6 +1132,8 @@ class ProbeApp(tk.Tk):
             imgstitch_tile_mode=self.imgstitch_tile_acquisition_var.get(),
             imgstitch_rows=self._agent_int_var(self.imgstitch_rows_var),
             imgstitch_cols=self._agent_int_var(self.imgstitch_cols_var),
+            imgstitch_progress_current=int(self.__dict__.get("imgstitch_progress_current", 0)),
+            imgstitch_progress_total=int(self.__dict__.get("imgstitch_progress_total", 0)),
             focusmap_points=len(self.af_plane_mesh_points),
             focusmap_valid_points=sum(1 for record in self.af_plane_results if record.get("measured_z") is not None),
             focusmap_has_plane=focusmap_model is not None,
@@ -1224,10 +1264,13 @@ class ProbeApp(tk.Tk):
             import cv2
 
             self._prepare_imgstitch_session_dir()
-            with self.camera_lock:
-                frame = None if self.latest_stitch_frame is None else self.latest_stitch_frame.copy()
-            if frame is None:
-                raise RuntimeError("No current microscope frame is available.")
+            try:
+                frame = self._capture_stitch_frame(stop_event=threading.Event())
+            except RuntimeError:
+                with self.camera_lock:
+                    frame = None if self.latest_stitch_frame is None else self.latest_stitch_frame.copy()
+                if frame is None:
+                    raise
 
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             output_path = Path.cwd() / "last_imgstitch.png"
@@ -3883,6 +3926,7 @@ class ProbeApp(tk.Tk):
         self.status_var.set(f"AutoFocus running on Z axis within +/-{search_range}.")
         self.autofocus_thread = threading.Thread(target=self._autofocus_worker, args=(metric, initial_step, min_step, search_range), daemon=True)
         self.autofocus_thread.start()
+        self._set_agent_status("AutoFocus running.")
 
     def stop_autofocus(self) -> None:
         self.autofocus_stop_event.set()
@@ -5946,6 +5990,8 @@ class ProbeApp(tk.Tk):
         try:
             points = generate_imgmatrix_points(settings, self.gds_stage_mapper_panel.mapper)
             session_dir = self._prepare_imgmatrix_session_dir()
+            tile_acquisition_mode = self.imgstitch_tile_acquisition_var.get()
+            stack_params = self._imgstack_params_from_ui(tile_acquisition_mode if tile_acquisition_mode != "Single Frame" else "")
         except Exception as exc:
             if self.imgmatrix_panel is not None:
                 self.imgmatrix_panel.set_status(f"Invalid ImgMatrix settings: {exc}")
@@ -5959,6 +6005,8 @@ class ProbeApp(tk.Tk):
             self.disable_home_signal_polling()
         self.imgmatrix_running = True
         self.motion_busy = True
+        self.imgmatrix_progress_current = 0
+        self.imgmatrix_progress_total = len(points)
         self.imgmatrix_stop_event.clear()
         if self.imgmatrix_panel is not None:
             self.imgmatrix_panel.set_running(True)
@@ -5967,7 +6015,7 @@ class ProbeApp(tk.Tk):
         self.status_var.set(f"ImgMatrix running: {len(points)} shots.")
         self.imgmatrix_thread = threading.Thread(
             target=self._imgmatrix_worker,
-            args=(settings, points, session_dir),
+            args=(settings, points, session_dir, tile_acquisition_mode, stack_params),
             daemon=True,
         )
         self.imgmatrix_thread.start()
@@ -5977,7 +6025,14 @@ class ProbeApp(tk.Tk):
         if self.imgmatrix_panel is not None:
             self.imgmatrix_panel.set_status("Stopping ImgMatrix.")
 
-    def _imgmatrix_worker(self, settings: ImgMatrixSettings, points: tuple[ImgMatrixPoint, ...], session_dir: Path) -> None:
+    def _imgmatrix_worker(
+        self,
+        settings: ImgMatrixSettings,
+        points: tuple[ImgMatrixPoint, ...],
+        session_dir: Path,
+        tile_acquisition_mode: str,
+        stack_params: dict[str, object],
+    ) -> None:
         assert self.serial_client is not None
         records: list[dict[str, object]] = []
         try:
@@ -5998,7 +6053,7 @@ class ProbeApp(tk.Tk):
                     if focus_z is None:
                         raise RuntimeError("FocusMap Z is enabled, but no FocusMap plane is stored.")
                     target_z = focus_z
-                self.result_queue.put(("imgmatrix_progress", index, total, f"Moving to r{point.row} c{point.col}"))
+                self.result_queue.put(("imgmatrix_progress", index, total, f"Moving to r{point.row} c{point.col}", point.row, point.col, "running"))
                 moved_entries = self._move_absolute_stage(target_x, target_y, target_z, source="imgmatrix")
                 actual_x = self._axis_from_position_entries(moved_entries, Axis.X)
                 actual_y = self._axis_from_position_entries(moved_entries, Axis.Y)
@@ -6006,7 +6061,15 @@ class ProbeApp(tk.Tk):
                 settle_seconds = max(0, self.probe_config.imgstitch_settle_ms) / 1000.0
                 if settle_seconds > 0 and self.imgmatrix_stop_event.wait(settle_seconds):
                     break
-                image = self._capture_imgmatrix_frame()
+                progress_prefix = f"ImgMatrix {index}/{total}"
+                image = self.acquire_tile(
+                    tile_acquisition_mode,
+                    stack_params,
+                    progress_prefix,
+                    preview_updates=False,
+                    stop_event=self.imgmatrix_stop_event,
+                    status_event="imgmatrix_status",
+                )
                 output_path = session_dir / "images" / point.filename
                 cv2.imwrite(str(output_path), image)
                 record = {
@@ -6024,7 +6087,7 @@ class ProbeApp(tk.Tk):
                 }
                 records.append(record)
                 self._write_imgmatrix_manifest(settings, session_dir, records, completed=False)
-                self.result_queue.put(("imgmatrix_progress", index, total, f"Saved {output_path.name}"))
+                self.result_queue.put(("imgmatrix_progress", index, total, f"Saved {output_path.name}", point.row, point.col, "done"))
             self._write_imgmatrix_manifest(settings, session_dir, records, completed=not self.imgmatrix_stop_event.is_set())
             if not self.imgmatrix_stop_event.is_set():
                 self.result_queue.put(("imgmatrix_done", session_dir, len(records)))
@@ -6066,6 +6129,13 @@ class ProbeApp(tk.Tk):
             f"Seams {len(edges)} | G/Y/R {counts['good']}/{counts['warning']}/{counts['bad']} | "
             f"response {avg_response:.3f} | max {max_correction:.2f} um | corrected {corrected}"
         )
+
+    def _update_imgstitch_progress_from_status(self, message: str) -> None:
+        match = re.search(r"\bTile\s+(\d+)\s*/\s*(\d+)\b", message, flags=re.IGNORECASE)
+        if match is None:
+            return
+        self.imgstitch_progress_current = int(match.group(1))
+        self.imgstitch_progress_total = int(match.group(2))
 
     def _imgstitch_displacement_status(self, edges: list[StitchEdgeQuality], correction_enabled: bool | None = None) -> str:
         if not edges:
@@ -6145,27 +6215,38 @@ class ProbeApp(tk.Tk):
             "z_save_raw": self.z_stack_save_raw_var.get(),
         }
 
-    def acquire_single_frame_tile(self, progress_prefix: str = ""):
+    def acquire_single_frame_tile(self, progress_prefix: str = "", *, stop_event: threading.Event | None = None, status_event: str = "imgstitch_status"):
         if progress_prefix:
-            self.result_queue.put(("imgstitch_status", f"{progress_prefix}, single frame"))
-        return self._capture_stitch_frame()
+            self.result_queue.put((status_event, f"{progress_prefix}, single frame"))
+        return self._capture_tile_frame(stop_event)
 
     def _raw_stack_dir(self, stack_name: str, progress_prefix: str) -> Path:
         safe_prefix = re.sub(r"[^A-Za-z0-9_.-]+", "_", progress_prefix.strip()).strip("_") or "single"
         return self.imgstitch_session_dir / "raw_stack" / stack_name / safe_prefix
 
-    def acquire_t_stack_tile(self, frame_count: int, fusion_method: str, save_raw_stack: bool = False, progress_prefix: str = "", preview_updates: bool = True):
+    def acquire_t_stack_tile(
+        self,
+        frame_count: int,
+        fusion_method: str,
+        save_raw_stack: bool = False,
+        progress_prefix: str = "",
+        preview_updates: bool = True,
+        *,
+        stop_event: threading.Event | None = None,
+        status_event: str = "imgstitch_status",
+    ):
         if frame_count <= 0:
             raise ValueError("T-stack frame count must be positive.")
+        stop_event = stop_event or self.imgstitch_stop_event
         frames = []
         raw_dir = self._raw_stack_dir("t_stack", progress_prefix) if save_raw_stack else None
         if raw_dir is not None:
             raw_dir.mkdir(parents=True, exist_ok=True)
         for frame_index in range(1, frame_count + 1):
-            if self.imgstitch_stop_event.is_set():
+            if stop_event.is_set():
                 raise RuntimeError("T-stack acquisition stopped.")
-            self.result_queue.put(("imgstitch_status", f"{progress_prefix}, frame {frame_index}/{frame_count}" if progress_prefix else f"Frame {frame_index}/{frame_count}"))
-            frame = self._capture_stitch_frame()
+            self.result_queue.put((status_event, f"{progress_prefix}, frame {frame_index}/{frame_count}" if progress_prefix else f"Frame {frame_index}/{frame_count}"))
+            frame = self._capture_tile_frame(stop_event)
             frames.append(frame)
             preview = fuse_t_stack(frames, fusion_method)
             if preview_updates:
@@ -6185,8 +6266,12 @@ class ProbeApp(tk.Tk):
         save_raw_stack: bool = False,
         progress_prefix: str = "",
         preview_updates: bool = True,
+        *,
+        stop_event: threading.Event | None = None,
+        status_event: str = "imgstitch_status",
     ):
         assert self.serial_client is not None
+        stop_event = stop_event or self.imgstitch_stop_event
         entries = self.serial_client.read_stable_xyz_positions()
         current_x = self._axis_from_position_entries(entries, Axis.X)
         current_y = self._axis_from_position_entries(entries, Axis.Y)
@@ -6198,12 +6283,12 @@ class ProbeApp(tk.Tk):
             raw_dir.mkdir(parents=True, exist_ok=True)
         try:
             for z_index, target_z in enumerate(positions, start=1):
-                if self.imgstitch_stop_event.is_set():
+                if stop_event.is_set():
                     raise RuntimeError("Z-stack acquisition stopped.")
-                self.result_queue.put(("imgstitch_status", f"{progress_prefix}, Z {z_index}/{len(positions)}" if progress_prefix else f"Z {z_index}/{len(positions)}"))
+                self.result_queue.put((status_event, f"{progress_prefix}, Z {z_index}/{len(positions)}" if progress_prefix else f"Z {z_index}/{len(positions)}"))
                 self._move_absolute_stage(current_x, current_y, target_z)
-                self._wait_after_imgstitch_motion()
-                frame = self._capture_stitch_frame()
+                self._wait_after_acquisition_motion(stop_event)
+                frame = self._capture_tile_frame(stop_event)
                 frames.append(frame)
                 preview = fuse_z_stack(frames, fusion_method)
                 if preview_updates:
@@ -6213,14 +6298,23 @@ class ProbeApp(tk.Tk):
 
                     cv2.imwrite(str(raw_dir / f"z_{z_index:03d}_{target_z}.png"), frame)
         finally:
-            if return_to_original_z and not self.imgstitch_stop_event.is_set():
+            if return_to_original_z and not stop_event.is_set():
                 self._move_absolute_stage(current_x, current_y, center_z)
-                self._wait_after_imgstitch_motion()
+                self._wait_after_acquisition_motion(stop_event)
         return preview
 
-    def acquire_tile(self, tile_mode: str, params: dict[str, object], progress_prefix: str = "", preview_updates: bool = True):
+    def acquire_tile(
+        self,
+        tile_mode: str,
+        params: dict[str, object],
+        progress_prefix: str = "",
+        preview_updates: bool = True,
+        *,
+        stop_event: threading.Event | None = None,
+        status_event: str = "imgstitch_status",
+    ):
         if tile_mode == "Single Frame":
-            return self.acquire_single_frame_tile(progress_prefix)
+            return self.acquire_single_frame_tile(progress_prefix, stop_event=stop_event, status_event=status_event)
         if tile_mode == "T-Stack":
             return self.acquire_t_stack_tile(
                 frame_count=int(params["frame_count"]),
@@ -6228,6 +6322,8 @@ class ProbeApp(tk.Tk):
                 save_raw_stack=bool(params["t_save_raw"]),
                 progress_prefix=progress_prefix,
                 preview_updates=preview_updates,
+                stop_event=stop_event,
+                status_event=status_event,
             )
         if tile_mode == "Z-Stack":
             return self.acquire_z_stack_tile(
@@ -6238,8 +6334,15 @@ class ProbeApp(tk.Tk):
                 save_raw_stack=bool(params["z_save_raw"]),
                 progress_prefix=progress_prefix,
                 preview_updates=preview_updates,
+                stop_event=stop_event,
+                status_event=status_event,
             )
         raise ValueError(f"Unsupported tile acquisition mode: {tile_mode}")
+
+    def _capture_tile_frame(self, stop_event: threading.Event | None = None):
+        if stop_event is None or stop_event is self.imgstitch_stop_event:
+            return self._capture_stitch_frame()
+        return self._capture_stitch_frame(stop_event=stop_event)
 
     def start_imgstitch(self) -> None:
         if self.imgstack_mode_var.get() != "XY Stitch":
@@ -6291,6 +6394,8 @@ class ProbeApp(tk.Tk):
         self.imgstitch_running = True
         self.imgstitch_focus_sampling_required = self.imgstitch_plane_af_var.get()
         self.motion_busy = True
+        self.imgstitch_progress_current = 0
+        self.imgstitch_progress_total = rows * cols
         self.imgstitch_stop_event.clear()
         self.imgstitch_session = None
         self.imgstitch_tile_images = {}
@@ -6347,6 +6452,8 @@ class ProbeApp(tk.Tk):
             self.disable_home_signal_polling()
         self.imgstitch_running = True
         self.motion_busy = True
+        self.imgstitch_progress_current = 0
+        self.imgstitch_progress_total = 1
         self.imgstitch_stop_event.clear()
         self.imgstitch_status_var.set(f"Running {mode}")
         self.status_var.set(f"ImgStitch {mode} running.")
@@ -6613,16 +6720,22 @@ class ProbeApp(tk.Tk):
         return entries
 
     def _wait_after_imgstitch_motion(self) -> None:
+        self._wait_after_acquisition_motion(self.imgstitch_stop_event)
+
+    def _wait_after_acquisition_motion(self, stop_event: threading.Event) -> None:
         settle_seconds = max(0, self.probe_config.imgstitch_settle_ms) / 1000.0
         if settle_seconds > 0:
-            self.imgstitch_stop_event.wait(settle_seconds)
+            stop_event.wait(settle_seconds)
 
-    def _capture_stitch_frame(self):
+    def _capture_stitch_frame(self, *, stop_event: threading.Event | None = None):
+        not_before = time.monotonic()
         deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline and not self.imgstitch_stop_event.is_set():
+        stop_event = stop_event or self.imgstitch_stop_event
+        while time.monotonic() < deadline and not stop_event.is_set():
             with self.camera_lock:
                 frame = self.latest_stitch_frame
-            if frame is not None:
+                captured_at = self.latest_stitch_frame_captured_at
+            if frame is not None and captured_at >= not_before:
                 return frame.copy()
             time.sleep(0.03)
         raise RuntimeError("No camera frame available for stitching.")
@@ -7808,6 +7921,7 @@ class ProbeApp(tk.Tk):
         if event_type == "imgstitch_status":
             _, message = event
             self.imgstitch_status_var.set(str(message))
+            self._update_imgstitch_progress_from_status(str(message))
             self.status_var.set(str(message))
             self._set_agent_status(str(message))
             logger.info("ImgStitch: %s", message)
@@ -7888,9 +8002,17 @@ class ProbeApp(tk.Tk):
             return
 
         if event_type == "imgmatrix_progress":
-            _, current, total, message = event
+            _, current, total, message, *state_payload = event
+            self.imgmatrix_progress_current = int(current)
+            self.imgmatrix_progress_total = int(total)
+            row = col = None
+            state = None
+            if len(state_payload) >= 3:
+                row = int(state_payload[0])
+                col = int(state_payload[1])
+                state = str(state_payload[2])
             if self.imgmatrix_panel is not None:
-                self.imgmatrix_panel.set_progress(int(current), int(total), str(message))
+                self.imgmatrix_panel.set_progress(int(current), int(total), str(message), row=row, col=col, state=state)
             self.status_var.set(str(message))
             logger.info("ImgMatrix: %s (%s/%s)", message, current, total)
             return
@@ -8003,6 +8125,8 @@ class ProbeApp(tk.Tk):
         self._set_camera_index_error(False)
         with self.camera_lock:
             self.latest_camera_frame = None
+            self.latest_stitch_frame = None
+            self.latest_stitch_frame_captured_at = 0.0
         self.camera = UsbCamera(index=index, width=800, height=450, settings=self._camera_settings_from_config())
         self.camera_running = True
         self.camera_rendering = True
@@ -8080,6 +8204,7 @@ class ProbeApp(tk.Tk):
                 self.latest_focus_frame_ppm = frame.ppm_bytes
             with self.camera_lock:
                 self.latest_stitch_frame = frame.image_bgr
+                self.latest_stitch_frame_captured_at = frame.captured_at
             if (self.current_page == "FocusMap" or self.af_plane_running) and hasattr(self, "focusmap_realtime_canvas"):
                 self.focusmap_realtime_bgr = frame.image_bgr.copy()
                 self._draw_focusmap_realtime()

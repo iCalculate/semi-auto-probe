@@ -8,7 +8,7 @@ from pathlib import Path
 from tkinter import ttk
 from typing import Callable
 
-from .gds_stage_mapper import AffineCoordinateMapper, GDSCanvasViewer, GDSLayoutModel
+from .gds_stage_mapper import AffineCoordinateMapper, GDSCanvasViewer, GDSLayoutModel, MatrixOverlay
 
 
 @dataclass(frozen=True)
@@ -154,9 +154,19 @@ class ImgMatrixPanel:
         get_microscope_preview: Callable[[], bytes | None] | None,
         fov_width_var: tk.StringVar,
         fov_height_var: tk.StringVar,
+        tile_acquisition_var: tk.StringVar,
+        t_stack_frame_count_var: tk.StringVar,
+        t_stack_fusion_var: tk.StringVar,
+        t_stack_save_raw_var: tk.BooleanVar,
+        z_stack_step_um_var: tk.StringVar,
+        z_stack_range_um_var: tk.StringVar,
+        z_stack_fusion_var: tk.StringVar,
+        z_stack_return_var: tk.BooleanVar,
+        z_stack_save_raw_var: tk.BooleanVar,
         start_run: Callable[[ImgMatrixSettings], None],
         stop_run: Callable[[], None],
         set_status: Callable[[str], None] | None = None,
+        on_overlay_changed: Callable[[list[MatrixOverlay]], None] | None = None,
     ) -> None:
         self.colors = colors
         self.get_stage_position_um = get_stage_position_um
@@ -164,15 +174,27 @@ class ImgMatrixPanel:
         self.get_microscope_preview = get_microscope_preview
         self.fov_width_var = fov_width_var
         self.fov_height_var = fov_height_var
+        self.tile_acquisition_var = tile_acquisition_var
+        self.t_stack_frame_count_var = t_stack_frame_count_var
+        self.t_stack_fusion_var = t_stack_fusion_var
+        self.t_stack_save_raw_var = t_stack_save_raw_var
+        self.z_stack_step_um_var = z_stack_step_um_var
+        self.z_stack_range_um_var = z_stack_range_um_var
+        self.z_stack_fusion_var = z_stack_fusion_var
+        self.z_stack_return_var = z_stack_return_var
+        self.z_stack_save_raw_var = z_stack_save_raw_var
         self.start_run = start_run
         self.stop_run = stop_run
         self.set_app_status = set_status
+        self.on_overlay_changed = on_overlay_changed
         self.model: GDSLayoutModel | None = None
         self.pending_pick: str | None = None
         self.selected_gds: tuple[float, float] | None = None
         self.microscope_photo: tk.PhotoImage | None = None
         self.status_poll_job: str | None = None
         self.preview_labels: list[ttk.Label] = []
+        self.matrix_overlay_states: dict[tuple[int, int], str] = {}
+        self.last_overlay_items: list[MatrixOverlay] = []
 
         self.origin_u_var = tk.StringVar(value="")
         self.origin_v_var = tk.StringVar(value="")
@@ -252,6 +274,7 @@ class ImgMatrixPanel:
         row = 0
         row = self._build_point_section(parent, row)
         row = self._build_matrix_section(parent, row)
+        row = self._build_acquisition_section(parent, row)
         row = self._build_run_section(parent, row)
         self._bind_preview_updates()
 
@@ -292,6 +315,82 @@ class ImgMatrixPanel:
         ttk.Button(section, text="Preview Matrix", command=self.redraw_matrix_preview).grid(row=2, column=0, columnspan=4, sticky="ew", pady=(10, 0))
         ttk.Label(section, textvariable=self.matrix_summary_var, style="Value.TLabel", padding=8, wraplength=320).grid(row=3, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         return row + 1
+
+    def _build_acquisition_section(self, parent: ttk.Frame, row: int) -> int:
+        section = self._section(parent, "Acquisition", row)
+        section.columnconfigure((0, 1), weight=1)
+        ttk.Label(section, text="Tile Mode", style="Muted.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+        mode_combo = ttk.Combobox(
+            section,
+            textvariable=self.tile_acquisition_var,
+            values=("Single Frame", "T-Stack", "Z-Stack"),
+            state="readonly",
+            width=16,
+        )
+        mode_combo.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+        mode_combo.bind("<<ComboboxSelected>>", lambda _event: self._update_acquisition_fields())
+
+        self.t_stack_widgets: list[tk.Widget] = []
+        self.z_stack_widgets: list[tk.Widget] = []
+        self._add_labeled_entry(section, 2, "T frames", self.t_stack_frame_count_var, self.t_stack_widgets, column=0)
+        self._add_combo(section, 2, "T fusion", self.t_stack_fusion_var, ("average", "registered_average", "sharpness_fusion"), self.t_stack_widgets, column=1)
+        t_raw = ttk.Checkbutton(section, text="Save raw T-stack", variable=self.t_stack_save_raw_var)
+        t_raw.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.t_stack_widgets.append(t_raw)
+
+        self._add_labeled_entry(section, 5, "Z step (um)", self.z_stack_step_um_var, self.z_stack_widgets, column=0)
+        self._add_labeled_entry(section, 5, "Z range +/- (um)", self.z_stack_range_um_var, self.z_stack_widgets, column=1)
+        self._add_combo(section, 7, "Z fusion", self.z_stack_fusion_var, ("laplacian", "tenengrad"), self.z_stack_widgets, column=0, columnspan=2)
+        z_options = ttk.Frame(section, style="Panel.TFrame")
+        z_options.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        z_options.columnconfigure((0, 1), weight=1)
+        ttk.Checkbutton(z_options, text="Return to Z0", variable=self.z_stack_return_var).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(z_options, text="Save raw Z-stack", variable=self.z_stack_save_raw_var).grid(row=0, column=1, sticky="w", padx=(6, 0))
+        self.z_stack_widgets.append(z_options)
+        self._update_acquisition_fields()
+        return row + 1
+
+    def _add_labeled_entry(
+        self,
+        parent: ttk.Frame,
+        row: int,
+        label: str,
+        variable: tk.StringVar,
+        registry: list[tk.Widget],
+        *,
+        column: int,
+        columnspan: int = 1,
+    ) -> None:
+        label_widget = ttk.Label(parent, text=label, style="Muted.TLabel")
+        label_widget.grid(row=row, column=column, columnspan=columnspan, sticky="w", pady=(8, 2), padx=(0, 5) if column == 0 else (5, 0))
+        entry = ttk.Entry(parent, textvariable=variable, width=10)
+        entry.grid(row=row + 1, column=column, columnspan=columnspan, sticky="ew", padx=(0, 5) if column == 0 else (5, 0))
+        registry.extend([label_widget, entry])
+
+    def _add_combo(
+        self,
+        parent: ttk.Frame,
+        row: int,
+        label: str,
+        variable: tk.StringVar,
+        values: tuple[str, ...],
+        registry: list[tk.Widget],
+        *,
+        column: int,
+        columnspan: int = 1,
+    ) -> None:
+        label_widget = ttk.Label(parent, text=label, style="Muted.TLabel")
+        label_widget.grid(row=row, column=column, columnspan=columnspan, sticky="w", pady=(8, 2), padx=(0, 5) if column == 0 else (5, 0))
+        combo = ttk.Combobox(parent, textvariable=variable, values=values, state="readonly", width=16)
+        combo.grid(row=row + 1, column=column, columnspan=columnspan, sticky="ew", padx=(0, 5) if column == 0 else (5, 0))
+        registry.extend([label_widget, combo])
+
+    def _update_acquisition_fields(self) -> None:
+        mode = self.tile_acquisition_var.get()
+        for widget in self.t_stack_widgets:
+            widget.grid() if mode == "T-Stack" else widget.grid_remove()
+        for widget in self.z_stack_widgets:
+            widget.grid() if mode == "Z-Stack" else widget.grid_remove()
 
     def _build_run_section(self, parent: ttk.Frame, row: int) -> int:
         section = self._section(parent, "Execution", row)
@@ -421,21 +520,21 @@ class ImgMatrixPanel:
             return
         mapper = self.get_mapper()
         if mapper is None:
-            self.viewer.set_matrix_overlay([])
+            self._set_matrix_overlays([])
             self.matrix_summary_var.set("Preview: bind LayoutMap mapping first.")
             return
         try:
             settings = self.settings_from_ui()
             points = generate_imgmatrix_points(settings, mapper)
         except Exception as exc:
-            self.viewer.set_matrix_overlay([])
+            self._set_matrix_overlays([])
             self.matrix_summary_var.set(f"Preview unavailable: {exc}")
             return
         overlays = [
-            (list(point.fov_polygon_gds), f"{point.row},{point.col}")
+            (list(point.fov_polygon_gds), f"{point.row},{point.col}", self.matrix_overlay_states.get((point.row, point.col), "pending"))
             for point in points
         ]
-        self.viewer.set_matrix_overlay(overlays)
+        self._set_matrix_overlays(overlays)
         last = points[-1]
         self.matrix_summary_var.set(
             f"Preview: {settings.rows} x {settings.cols} = {len(points)} shots. "
@@ -448,14 +547,19 @@ class ImgMatrixPanel:
         except Exception as exc:
             self.status_var.set(str(exc))
             return
+        self.matrix_overlay_states = {(row, col): "pending" for row in range(settings.rows) for col in range(settings.cols)}
+        self.redraw_matrix_preview()
         self.start_run(settings)
 
     def set_running(self, running: bool) -> None:
         self.run_button.configure(state="disabled" if running else "normal")
         self.stop_button.configure(state="normal" if running else "disabled")
 
-    def set_progress(self, current: int, total: int, message: str) -> None:
+    def set_progress(self, current: int, total: int, message: str, row: int | None = None, col: int | None = None, state: str | None = None) -> None:
         self.status_var.set(f"{message} ({current}/{total})")
+        if row is not None and col is not None and state is not None:
+            self.matrix_overlay_states[(row, col)] = state
+            self.redraw_matrix_preview()
 
     def set_session_path(self, session_dir: Path | None) -> None:
         self.session_var.set(f"Session: {session_dir}" if session_dir else "Session: -")
@@ -464,6 +568,12 @@ class ImgMatrixPanel:
         self.status_var.set(message)
         if self.set_app_status is not None:
             self.set_app_status(message)
+
+    def _set_matrix_overlays(self, overlays: list[MatrixOverlay]) -> None:
+        self.last_overlay_items = overlays
+        self.viewer.set_matrix_overlay(overlays)
+        if self.on_overlay_changed is not None:
+            self.on_overlay_changed(overlays)
 
     def _schedule_status_poll(self) -> None:
         try:

@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import tempfile
 import threading
+import os
+import queue
 import unittest
 from pathlib import Path
+
+import numpy as np
 
 from semi_auto_probe.agent import (
     AGENT_ACTION_AUTOFOCUS,
@@ -31,6 +35,9 @@ class FakeVar:
 
     def get(self) -> str:
         return self.value
+
+    def set(self, value: str) -> None:
+        self.value = value
 
 
 def context(**overrides: object) -> AgentContext:
@@ -266,6 +273,31 @@ class AgentPlannerTests(unittest.TestCase):
         agent_context = ProbeApp.agent_context(app)
 
         self.assertTrue(agent_context.camera_frame_available)
+
+    def test_agent_single_capture_falls_back_to_current_stitch_frame(self) -> None:
+        app = ProbeApp.__new__(ProbeApp)
+        app.camera_running = True
+        app.camera_lock = threading.Lock()
+        app.latest_stitch_frame = np.zeros((8, 8, 3), dtype=np.uint8)
+        app.status_var = FakeVar("")
+        app.result_queue = queue.Queue()
+        app.agent_panel = None
+
+        def stale_frame_only(*, stop_event=None):
+            raise RuntimeError("No camera frame available for stitching.")
+
+        app._capture_stitch_frame = stale_frame_only
+        old_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                os.chdir(directory)
+                app.imgstitch_session_dir = Path("imgstitch_session")
+
+                message = ProbeApp.capture_agent_single_frame(app)
+            finally:
+                os.chdir(old_cwd)
+
+        self.assertIn("Agent captured one frame", message)
 
 
 if __name__ == "__main__":
